@@ -41,8 +41,8 @@ class Tool(ABC):
     # arbitrary host code from running unattended under mode-c / --yolo.
     runs_on_host: bool = False
     # False for tools with no external side effect and no host code execution —
-    # purely local bookkeeping/reads (notes scratchpad, reading a Burp XML
-    # export). These bypass the ApprovalGate entirely: prompting for them is
+    # purely local reads (e.g. reading a Burp XML export). These bypass the
+    # ApprovalGate entirely: prompting for them is
     # pure friction. Network/target-touching and code-executing tools keep this
     # True and are gated normally.
     requires_approval: bool = True

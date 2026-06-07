@@ -54,16 +54,36 @@ _FINAL_FIELDS = {"type", "answer"}
 def parse_envelope(text: str) -> Envelope:
     """Parse a single envelope from `text`. Raises EnvelopeError on failure.
 
+    Every failure embeds the model's literal output (`| raw: …`) so the audit log
+    shows WHAT the model actually emitted, not just a parser column number — that
+    is the only way to debug a model that stops emitting valid envelopes.
+
     Tolerant of TRAILING DATA after the first JSON object: models sometimes emit
     a valid envelope followed by extra content (a second object, stray prose, a
     concatenated payload). We decode the first JSON value and ignore the rest
-    rather than failing the whole turn with a "Extra data" JSONDecodeError — that
-    failure used to kill a subagent and lose its findings."""
+    rather than failing the whole turn with a "Extra data" JSONDecodeError."""
+    try:
+        return _parse_envelope_inner(text)
+    except EnvelopeError as e:
+        msg = str(e)
+        if "| raw:" in msg:
+            raise
+        raise EnvelopeError(f"{msg} | raw: {text[:500]!r}") from e
+
+
+def _parse_envelope_inner(text: str) -> Envelope:
     raw = _extract_json(text)
     try:
         obj, _end = json.JSONDecoder().raw_decode(raw)
-    except json.JSONDecodeError as e:
-        raise EnvelopeError(f"not valid JSON: {e}") from e
+    except json.JSONDecodeError:
+        # One light repair pass for the most common LLM JSON slips (a trailing
+        # comma before } or ], Python literals) before giving up — a single
+        # stray comma shouldn't kill the whole turn.
+        repaired = _repair_json(raw)
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(repaired)
+        except json.JSONDecodeError as e:
+            raise EnvelopeError(f"not valid JSON: {e}") from e
     if not isinstance(obj, dict):
         raise EnvelopeError("envelope must be a JSON object")
     t = obj.get("type")
@@ -130,6 +150,51 @@ def _strict_fields(obj: dict, allowed: set[str], required: set[str]) -> None:
         raise EnvelopeError(f"missing required fields: {sorted(missing)}")
 
 
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+_PY_LITERAL_RE = re.compile(r"\b(True|False|None)\b")
+_PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
+
+
+def _repair_json(raw: str) -> str:
+    """Best-effort repair of the most common, unambiguous LLM JSON mistakes:
+    a trailing comma before a closing `}`/`]` (the usual cause of "Expecting
+    property name enclosed in double quotes"), and Python literals used in place
+    of JSON ones. Conservative: only touches text OUTSIDE of string literals, so
+    apostrophes / the words inside strings are never rewritten."""
+    # Rebuild the text, applying the regex repairs only to runs OUTSIDE string
+    # literals (tracked by a tiny scanner that respects `\"` escapes).
+    result: list[str] = []
+    buf: list[str] = []
+    in_str = False
+    esc = False
+
+    def _flush_outside() -> None:
+        seg = "".join(buf)
+        seg = _TRAILING_COMMA_RE.sub(r"\1", seg)
+        seg = _PY_LITERAL_RE.sub(lambda m: _PY_LITERALS[m.group(1)], seg)
+        result.append(seg)
+        buf.clear()
+
+    for ch in raw:
+        if in_str:
+            result.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            _flush_outside()
+            result.append(ch)
+            in_str = True
+        else:
+            buf.append(ch)
+    _flush_outside()
+    return "".join(result)
+
+
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
@@ -174,6 +239,11 @@ def _extract_json(text: str) -> str:
 
 
 RETRY_REMINDER = (
-    "Your previous response was not a valid envelope. Reply ONLY with one JSON object of"
-    " type 'action', 'ask_user', or 'final'. No prose, no markdown fence."
+    "Your previous response was not a valid envelope. Reply with EXACTLY ONE JSON object and"
+    " NOTHING ELSE — no prose before or after, no markdown fence, no comments, no trailing"
+    " comma. It must be one of these three shapes:\n"
+    '{"type": "action", "tool": "<tool name>", "args": {<json args>}, "thought": "<why>"}\n'
+    '{"type": "ask_user", "question": "<question>"}\n'
+    '{"type": "final", "answer": "<answer>"}\n'
+    "Output the JSON object now, starting with the character '{'."
 )

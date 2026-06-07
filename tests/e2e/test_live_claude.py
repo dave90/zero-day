@@ -32,6 +32,7 @@ from zero.llm.envelope import (
 
 
 pytestmark = [
+    pytest.mark.live,          # token-spending live run — excluded from the default suite
     pytest.mark.live_claude,
     pytest.mark.skipif(
         shutil.which("claude") is None,
@@ -81,16 +82,16 @@ async def test_claude_uses_tool_when_available():
     claude should emit an `action` envelope referencing it."""
     tools = [
         {
-            "name": "notes",
-            "description": "append a note or read all notes",
+            "name": "web_search",
+            "description": "search the public web for a query",
             "risk_level": "safe",
             "schema": {
                 "type": "object",
                 "properties": {
-                    "action": {"enum": ["append", "read"]},
-                    "text": {"type": "string"},
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
                 },
-                "required": ["action"],
+                "required": ["query"],
             },
         }
     ]
@@ -101,8 +102,8 @@ async def test_claude_uses_tool_when_available():
             Message(
                 role="user",
                 content=(
-                    "Write 'investigation started' to my notes."
-                    " Use the `notes` tool with action='append'."
+                    "Find recent writeups about CVE-2021-44228 (Log4Shell)."
+                    " Use the `web_search` tool."
                 ),
             )
         ],
@@ -110,8 +111,8 @@ async def test_claude_uses_tool_when_available():
     )
     env = parse_envelope(resp.text)
     assert isinstance(env, ActionEnvelope), f"got {type(env).__name__}: {resp.text!r}"
-    assert env.tool == "notes", f"expected notes tool, got: {env.tool}"
-    assert env.args.get("action") == "append"
+    assert env.tool == "web_search", f"expected web_search tool, got: {env.tool}"
+    assert env.args.get("query")
 
 
 async def test_disallowed_builtins_prevent_max_turns_error():

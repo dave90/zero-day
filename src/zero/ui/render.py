@@ -5,6 +5,7 @@ import json
 from typing import Iterable
 
 from zero.ui.events import (
+    ActivityLine,
     AgentTextDelta,
     AgentTextEnd,
     AskUser,
@@ -28,6 +29,9 @@ from zero.ui.events import (
 def render_event(ev: UIEvent) -> Iterable[str]:
     """Return zero or more scrollback lines for an event."""
     if isinstance(ev, AgentTextDelta):
+        if ev.text:
+            yield ev.text
+    elif isinstance(ev, ActivityLine):
         if ev.text:
             yield ev.text
     elif isinstance(ev, AgentTextEnd):
@@ -208,11 +212,6 @@ def summarize_tool_call(tool: str, args: dict) -> str:
         return f"action={a.get('action', '')} " + _short(
             json.dumps({k: v for k, v in a.items() if k != "action"}), 120
         )
-    if tool == "notes":
-        action = a.get("action", "")
-        if action == "append":
-            return f"append {_short(a.get('text', ''), 80)!r}"
-        return action
     if tool == "python_exec":
         return f"code={_short(a.get('code', ''), 120)!r}"
     if tool == "finding_submit":
@@ -236,6 +235,20 @@ def _short(s: str, n: int) -> str:
     if len(s) <= n:
         return s
     return s[:n] + f" … ({len(s) - n} more chars)"
+
+
+def short_reason(reason: str, limit: int = 200) -> str:
+    """Condense a free-form agent thought to a single clean line — the first
+    sentence, whitespace-collapsed and clipped. Used for the approval prompt's
+    `why:` and for the condensed in-chat thought."""
+    if not reason:
+        return ""
+    text = " ".join(reason.strip().split())
+    for sep in (". ", "; "):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+            break
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def _compact_observation(

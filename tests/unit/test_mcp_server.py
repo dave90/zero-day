@@ -6,7 +6,7 @@ def test_build_server_exposes_catalog_tools_and_ask_user():
     from zero.llm.mcp_server import build_server
 
     catalog = [
-        {"name": "notes", "description": "notes tool", "risk_level": "safe", "schema": {}},
+        {"name": "web_search", "description": "web search", "risk_level": "safe", "schema": {}},
         {"name": "sqlmap", "description": "sqli", "risk_level": "exploit", "schema": {}},
     ]
     app = build_server(catalog)
@@ -17,6 +17,6 @@ def test_build_server_exposes_catalog_tools_and_ask_user():
 
     tools = asyncio.run(app.list_tools())
     names = {t.name for t in tools}
-    assert "notes" in names
+    assert "web_search" in names
     assert "sqlmap" in names
     assert "ask_user" in names

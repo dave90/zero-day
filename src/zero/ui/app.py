@@ -31,6 +31,7 @@ from prompt_toolkit.shortcuts import clear
 from zero.orchestrator.approval import Decision
 from zero.ui.commands import build_default_registry
 from zero.ui.events import (
+    ActivityLine,
     ApprovalPrompt,
     AskUser,
     SessionEnd,
@@ -42,7 +43,7 @@ from zero.ui.events import (
     ToolObservation,
     ToolProposal,
 )
-from zero.ui.render import render_event, status_line
+from zero.ui.render import render_event, short_reason, status_line
 
 if TYPE_CHECKING:
     from zero.orchestrator.orchestrator import Orchestrator
@@ -424,12 +425,21 @@ class ZeroUI:
 
             self._flush_stream(stream_buf)
 
-            # Subagent traffic + lifecycle never hit the chat — the live
-            # bottom toolbar shows what's running with each goal.
-            if isinstance(ev, (SubagentStarted, SubagentProgress, SubagentFinished)):
+            # Subagent start + per-turn progress stay out of the chat (the live
+            # bottom toolbar shows what's running). A subagent FINISHING does
+            # reach the chat as a concise "✓ …" line so the operator sees results
+            # land; the dispatch ActivityLine already served as the "started" cue.
+            if isinstance(ev, (SubagentStarted, SubagentProgress)):
                 self._invalidate()
                 continue
+            if isinstance(ev, SubagentFinished):
+                self._invalidate()
+                self._emit_chat(list(render_event(ev)))
+                continue
             if isinstance(ev, (ToolProposal, ToolObservation)) and ev.label:
+                continue
+            # Subagent recon activity is labelled and stays out of the chat.
+            if isinstance(ev, ActivityLine) and ev.label:
                 continue
 
             if isinstance(ev, Status):
@@ -480,25 +490,12 @@ def _approval_lines(ev: ApprovalPrompt) -> list[str]:
         "",
         f"  → approve tool call?{who}  tool: {ev.tool}  risk: {ev.risk_level}",
     ]
-    why = _short_reason(ev.reason)
+    why = short_reason(ev.reason)
     if why:
         lines.append(f"    why: {why}")
     lines.append(f"    args: {ev.args}")
     lines.append("    [y] yes   [n] no   [a] always-this-tool   (or type + Enter; Esc denies)")
     return lines
-
-
-def _short_reason(reason: str, limit: int = 200) -> str:
-    """Condense the agent's thought to a one-line purpose for the prompt."""
-    if not reason:
-        return ""
-    # First sentence/line, collapsed to a single line and clipped.
-    text = " ".join(reason.strip().split())
-    for sep in (". ", "; "):
-        if sep in text:
-            text = text.split(sep, 1)[0]
-            break
-    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 # Public entry point ----------------------------------------------------------

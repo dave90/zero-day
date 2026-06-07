@@ -87,6 +87,29 @@ def test_mode_a_argv_no_disallow_when_empty():
     assert "--disallowedTools" not in argv
 
 
+def test_mode_a_argv_neutralizes_nul_in_prompt():
+    """Regression (Blueprint_Heist): a NUL byte in the prompt (from a binary tool
+    observation flowing into the transcript) raises `ValueError: embedded null
+    byte` at `create_subprocess_exec`. The argv builder must neutralize it so the
+    spawn can't crash — while keeping a visible marker of where it was."""
+    prompt = "decoded body:\x00\x00 GET /x" + "\x00"
+    argv = build_mode_a_argv(
+        binary="claude", prompt=prompt, max_turns=5, disallowed_tools=()
+    )
+    assert all("\x00" not in a for a in argv), argv
+    p = argv[argv.index("-p") + 1]
+    assert "decoded body:" in p          # surrounding content preserved
+    assert "[NUL*2]" in p and "[NUL*1]" in p  # the null runs are marked, with counts
+
+
+def test_neutralize_nul_helper():
+    from zero.llm.claude_code import neutralize_nul
+
+    assert neutralize_nul("a\x00b\x00") == "a[NUL*1]b[NUL*1]"
+    assert neutralize_nul("x\x00\x00\x00y") == "x[NUL*3]y"   # runs collapse, count kept
+    assert neutralize_nul("clean") == "clean"
+
+
 # --- error parsing ----------------------------------------------------------
 
 

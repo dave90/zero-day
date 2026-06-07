@@ -48,7 +48,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Default run = unit (offline, free) + docker sandbox tests (free, need the built
+# image). Token-spending LIVE runs are excluded by default; opt in with
+# `-m live` (a command-line `-m` overrides this). See README / CLAUDE.md.
+addopts = "-m 'not live'"
 markers = [
+    "live: real token-spending run against a live LLM (claude). Opt-in: `pytest -m live`.",
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
     "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + claude)",

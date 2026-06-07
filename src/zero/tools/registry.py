@@ -62,7 +62,6 @@ def default_registry() -> ToolRegistry:
     from zero.tools.httpx_tool import HttpxTool
     from zero.tools.jwt_tool import JwtTool
     from zero.tools.nmap import NmapTool
-    from zero.tools.notes import NotesTool
     from zero.tools.nuclei import NucleiTool
     from zero.tools.python_exec import PythonExecTool
     from zero.tools.sqlmap import SqlmapTool
@@ -71,7 +70,6 @@ def default_registry() -> ToolRegistry:
 
     reg = ToolRegistry()
     # M2 host-safe tools
-    reg.register(NotesTool())
     reg.register(WebSearchTool())
     reg.register(WebFetchTool())
     reg.register(PythonExecTool())

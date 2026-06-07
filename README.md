@@ -29,8 +29,9 @@ This repository tracks the implementation of `zero` as described in
   - **Bounded subagents:** each subagent is capped so one attack idea can't run
     away — `--pentester-max-turns` (default **14**, *not* inherited from the
     orchestrator's `--max-turns`), `--subagent-deadline` (default **1200s** total
-    wall-clock per subagent, checked between turns), and `--subagent-timeout`
-    (default **900s** per `claude -p` call).
+    wall-clock per subagent, checked between turns), and `--llm-timeout`
+    (default **900s** per `claude -p` call — the **same** timeout the orchestrator
+    uses for its own turns).
   - **Interject while subagents run:** typing a message while the orchestrator is
     blocked in `await_subagents` returns control early (the running subagents keep
     going), so you can chat / redirect mid-batch instead of waiting for it to
@@ -54,7 +55,7 @@ This repository tracks the implementation of `zero` as described in
   **not** exploit), and `--i-understand` compose into a decision matrix;
   destructive always prompts; host-executing tools never auto-approve unless
   `--allow-host-exec` is set.
-- **Tools**: `notes`, `web_search` (DuckDuckGo, no API key), `web_fetch`
+- **Tools**: `web_search` (DuckDuckGo, no API key), `web_fetch`
   (scope-aware), `python_exec`, a pure-Python `http_replay`, binary wrappers for
   `sqlmap`, `nmap`, `ffuf`, `nuclei`, `httpx_tool`, `jwt_tool`, `curl_raw`, and
   `burp_traffic` (parse Burp Suite XML exports: list_hosts / search / get).
@@ -155,9 +156,9 @@ orchestrator and every subagent (`thinking.log`).
 | `--max-subagents <n>` | Max concurrently-running subagents in mode `c` (default **10**). |
 | `--validator-max-turns <n>` | Validator investigation steps, separate from `--max-turns` (default **40**). |
 | `--validator-claude-max-turns <n>` | Per-call `claude -p --max-turns` for the Validator backend (default **60**). |
-| `--subagent-timeout <secs>` | Per-call `claude -p` wall-clock timeout for pentester/validator subagents (default **900**). Raise it for heavy iterative exploitation; the orchestrator's own backend keeps the standard 300s. |
+| `--llm-timeout <secs>` | Per-call `claude -p` wall-clock timeout (default **900**), shared by the orchestrator **and** the pentester/validator subagents — one value for all. Raise it for heavy iterative exploitation / large-context turns. |
 | `--pentester-max-turns <n>` | Per-pentester turn budget (default **14**). Pentesters no longer inherit `--max-turns`, so one attack idea can't run 40+ turns. |
-| `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--subagent-timeout` only bounds a single `claude -p` call. |
+| `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--llm-timeout` only bounds a single `claude -p` call. |
 | `--container` / `--no-container` | Run tool calls inside the Docker sandbox. **On by default**; falls back to host execution if Docker is unavailable. |
 | `--container-image <tag>` | Sandbox image tag (default `zero-sandbox:latest`). |
 | `--host-network` | Use the host network — needed for Burp listening on 127.0.0.1. |
@@ -195,18 +196,27 @@ Slash commands (handled by the UI, never sent to the LLM):
 
 ## Development
 
-Run the test suite:
+The suite is split in two:
+
+- **`tests/unit/`** — offline & free: pure logic plus the orchestrator/subagent
+  flow tests driven by a scripted/echo fake backend (no network, no `claude`),
+  asserting on the JSONL audit log.
+- **`tests/e2e/`** — the *real* tests: the Docker sandbox tests (every tool is
+  actually run inside the `zero-sandbox` container — free, just need the built
+  image) and the **live** runs that shell out to `claude` and **cost tokens**.
 
 ```bash
-uv run pytest -q
+uv run pytest -q          # DEFAULT: unit + docker sandbox tests — free, no tokens
+                          # (docker tests skip with a hint if the image isn't built)
+uv run pytest -m live     # opt-in: the token-spending live LLM runs (claude + gruyere)
+uv run pytest tests/unit -q   # only the offline unit tests (no Docker needed)
 ```
 
-The offline suite runs in a few seconds: network-touching tools are mocked and
-the orchestrator/subagent e2e drives the loops with the test-only scripted fake
-backend, asserting on the JSONL audit log. Live tests that need real
-prerequisites are marker-gated and skip cleanly without them — the Docker
-sandbox e2e (`-m docker`) and the real end-to-end run against Google Gruyere
-(`-m gruyere`, needs `claude` + the built image; costs tokens).
+Token-spending live runs are **excluded by default** (`addopts = -m 'not live'`),
+so a plain `pytest` never costs tokens; `-m live` overrides that filter to run
+them. Every registered tool has a sandbox test
+(`tests/e2e/test_tools_in_sandbox.py`), and a registry-driven guard fails if a
+new tool is added without one.
 
 Lint:
 
@@ -252,10 +262,11 @@ The RPC server listens on TCP port 7333 inside the container; Docker
 publishes it on `127.0.0.1:<ephemeral>` on the host. With `--host-network`
 the in-container port is reachable directly at `127.0.0.1:7333`.
 
-Run the real Docker e2e once the image is built:
+Once the image is built, the Docker sandbox tests run as part of the default
+`uv run pytest`. To run just them (every tool exercised in the container):
 
 ```bash
-uv run pytest -q -m docker tests/e2e/test_container_real.py
+uv run pytest -q -m docker tests/e2e
 ```
 
 

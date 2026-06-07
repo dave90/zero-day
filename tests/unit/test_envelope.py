@@ -114,6 +114,40 @@ def test_rejects_non_json():
         parse_envelope("hello world")
 
 
+def test_repairs_trailing_comma():
+    # The exact slip that made real runs fail every turn: a trailing comma
+    # ("Expecting property name enclosed in double quotes"). The repair pass
+    # recovers it instead of killing the turn.
+    e = parse_envelope('{"type": "action", "tool": "curl_raw", "args": {"url": "x"},}')
+    assert isinstance(e, ActionEnvelope)
+    assert e.tool == "curl_raw"
+    e2 = parse_envelope('{"type": "final", "answer": "done",}')
+    assert isinstance(e2, FinalEnvelope)
+
+
+def test_repairs_python_literals():
+    e = parse_envelope(
+        '{"type": "action", "tool": "x", "args": {"follow": True, "n": None}}'
+    )
+    assert isinstance(e, ActionEnvelope)
+    assert e.args == {"follow": True, "n": None}
+
+
+def test_repair_leaves_string_contents_untouched():
+    # A trailing-comma-looking sequence or Python word INSIDE a string value must
+    # survive verbatim — the repair only touches structure outside strings.
+    e = parse_envelope(json.dumps({"type": "final", "answer": "True, None,]"}))
+    assert isinstance(e, FinalEnvelope)
+    assert e.answer == "True, None,]"
+
+
+def test_unrepairable_json_includes_raw_in_error():
+    # Balanced braces (so _extract_json accepts it) but invalid JSON the repair
+    # pass can't fix (missing comma) — the error must quote the raw text.
+    with pytest.raises(EnvelopeError, match="raw:"):
+        parse_envelope('{"type": "action" "tool": "x", "args": {}}')
+
+
 def test_strips_code_fence():
     body = json.dumps({"type": "final", "answer": "x"})
     e = parse_envelope(f"```json\n{body}\n```")

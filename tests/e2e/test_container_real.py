@@ -81,14 +81,16 @@ async def test_bind_mount_round_trip(tmp_path: Path):
     await mgr.start()
     try:
         async with ContainerRPC(mgr.rpc_base_url()) as rpc:
+            # python_exec runs inside the sandbox; writing under cwd must land on
+            # the host through the /work bind mount.
             r = await rpc.call(
-                "notes",
-                {"action": "append", "text": "from-container"},
+                "python_exec",
+                {"code": "open('round_trip.txt', 'w').write('from-container')"},
             )
             assert r.ok, r.output
-        host_notes = tmp_path / ".pentest" / "notes.md"
-        assert host_notes.exists()
-        assert "from-container" in host_notes.read_text()
+        host_file = tmp_path / "round_trip.txt"
+        assert host_file.exists()
+        assert "from-container" in host_file.read_text()
     finally:
         await mgr.stop()
 
@@ -117,12 +119,64 @@ async def test_kali_security_tools_on_path(tmp_path: Path):
         async with ContainerRPC(mgr.rpc_base_url()) as rpc:
             code = (
                 "import shutil\n"
-                "for b in ['sqlmap','nmap','ffuf','nuclei','curl','jq']:\n"
+                "for b in ['sqlmap','nmap','ffuf','nuclei','httpx','jwt_tool','curl','jq']:\n"
                 "    print(b, '=', shutil.which(b))\n"
             )
             r = await rpc.call("python_exec", {"code": code})
             assert r.ok, r.output
-            for required in ("sqlmap", "nmap", "ffuf", "curl"):
+            for required in ("sqlmap", "nmap", "ffuf", "curl", "httpx", "jwt_tool"):
                 assert f"{required} = /" in r.output, r.output
+    finally:
+        await mgr.stop()
+
+
+async def test_jwt_tool_decodes_on_first_call(tmp_path: Path):
+    """Regression (Blueprint_Heist): jwt_tool wasn't installed at all (not an apt
+    package), so every call returned 'not on PATH'. After installing ticarpi
+    jwt_tool from source AND seeding its config in the image, the FIRST call must
+    actually DECODE the token — not just run one-time config setup."""
+    spec = ContainerSpec(cwd=tmp_path, image="zero-sandbox:latest")
+    mgr = ContainerManager(spec)
+    await mgr.start()
+    try:
+        # A throwaway, well-formed HS256 token ({"role":"user","iat":...}); the
+        # signature must be valid base64url or jwt_tool refuses to decode it.
+        tok = (
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+            "eyJyb2xlIjoidXNlciIsImlhdCI6MTc4MDcyODk4Nn0."
+            "M-p9n8ba6W-wEEDj3ozMdfeaCivlp252Es6LJyTcToQ"
+        )
+        async with ContainerRPC(mgr.rpc_base_url()) as rpc:
+            code = (
+                "import subprocess\n"
+                f"p = subprocess.run(['jwt_tool', {tok!r}], capture_output=True, text=True)\n"
+                "print(p.stdout)\n"
+            )
+            r = await rpc.call("python_exec", {"code": code})
+            assert r.ok, r.output
+            # Decoded the payload on the FIRST call (config already seeded),
+            # rather than only printing the "Running config setup" notice.
+            assert "role" in r.output and "user" in r.output, r.output
+            assert "config setup" not in r.output, r.output
+    finally:
+        await mgr.stop()
+
+
+async def test_httpx_is_projectdiscovery_not_python_cli(tmp_path: Path):
+    """Regression: the pip `httpx` library's console script used to shadow the
+    ProjectDiscovery `httpx` probe on PATH, so `httpx_tool` invoked the wrong
+    program ("pip install 'httpx[cli]'") and every probe failed. `httpx` must
+    resolve to the PD binary inside the sandbox."""
+    spec = ContainerSpec(cwd=tmp_path, image="zero-sandbox:latest")
+    mgr = ContainerManager(spec)
+    await mgr.start()
+    try:
+        async with ContainerRPC(mgr.rpc_base_url()) as rpc:
+            # The real tool path: run httpx_tool against a throwaway target and
+            # confirm it did NOT hit the Python-httpx-CLI error.
+            r = await rpc.call("httpx_tool", {"target": "http://127.0.0.1:1"})
+            assert "httpx[cli]" not in r.output, (
+                f"httpx resolved to the Python httpx CLI, not the PD probe:\n{r.output}"
+            )
     finally:
         await mgr.stop()

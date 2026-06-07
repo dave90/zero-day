@@ -35,7 +35,7 @@ from zero.orchestrator.audit import AuditLog
 from zero.orchestrator.thinking import ThinkingLog
 from zero.orchestrator.context import project_context_for
 from zero.orchestrator.rate_limit import RateLimiter
-from zero.orchestrator.subagents import SubagentManager, SubagentResult
+from zero.orchestrator.subagents import SUMMARY_MAX_CHARS, SubagentManager, SubagentResult
 from zero.tools.base import Tool, ToolResult
 from zero.tools.registry import ToolRegistry, default_registry
 from zero.tools.finding_submit import args_to_finding, is_finding_submit
@@ -54,6 +54,7 @@ from zero.findings.dedup import dedup_hash
 from zero.findings.report import write_report
 from zero.orchestrator.router import AgentRouter, default_validator_driver
 from zero.ui.events import (
+    ActivityLine,
     AgentTextDelta,
     AgentTextEnd,
     ApprovalPrompt,
@@ -70,6 +71,13 @@ from zero.ui.events import (
     TurnStart,
     UIEvent,
 )
+
+
+# How many consecutive failed turns (invalid-JSON envelope, backend error) the
+# agent loop tolerates — feeding the error back and retrying — before it gives up
+# and waits for the operator. Lets a transient model glitch self-heal instead of
+# reading as a crashed/idle session.
+_MAX_CONSECUTIVE_TURN_ERRORS = 3
 
 
 def _orchestrator_turn_note(turns_done: int, max_turns: int) -> str:
@@ -109,11 +117,12 @@ class OrchestratorConfig:
     # not be capped at the pentest agent's per-call limit.
     validator_max_turns: int = 40          # Validator AgentLoop investigation steps
     validator_claude_max_turns: int = 60   # per-call `claude -p --max-turns`
-    # Per-call `claude -p` wall-clock timeout for SUBAGENTS (pentester +
-    # validator). Heavy iterative exploitation can exceed the default 300s and
-    # would otherwise kill the subagent, forcing the orchestrator to do the work
-    # itself. The orchestrator's own backend keeps the standard 300s.
-    subagent_timeout_seconds: int = 900
+    # Per-call `claude -p` wall-clock timeout shared by ALL agent backends — the
+    # orchestrator's own turns AND the pentester/validator subagents — so they
+    # are always the same value. Heavy iterative exploitation (and the
+    # orchestrator's large-context turns) can exceed the bare 300s default, so we
+    # use a single generous, CLI-configurable budget (`--llm-timeout`).
+    llm_timeout_seconds: int = 900
     # Per-subagent turn budget for PENTESTERS. Previously pentesters inherited
     # the orchestrator's (large) max_turns, so a single attack idea could run
     # 40+ turns and burn an hour looping on the same failure. Cap them on their
@@ -140,6 +149,12 @@ class OrchestratorConfig:
     rate_limit: str = "100/min"
     replay_audit_path: Path | None = None
     execution_mode: str = "c"   # c=orchestrated (default), a=single agent, b=MCP
+    # How much of the agent's free-form `thought` reaches the chat. The full
+    # thought is always recorded in thinking.log; this only controls the UI.
+    #   "condensed" (default) — first sentence, one clean line
+    #   "full"               — stream the whole thought (legacy behavior)
+    #   "off"                — show nothing (rely on the ▸ activity lines)
+    thought_display: str = "condensed"
 
 
 class Orchestrator:
@@ -232,9 +247,12 @@ class Orchestrator:
 
             return EchoBackend()
         if self.cfg.backend == "claude":
-            from zero.llm.claude_code import ClaudeCodeBackend
+            from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
 
-            return ClaudeCodeBackend()
+            # Same per-call timeout as the subagents (`--llm-timeout`).
+            return ClaudeCodeBackend(
+                ClaudeCodeConfig(timeout_seconds=self.cfg.llm_timeout_seconds)
+            )
         if self.cfg.backend == "replay":
             from zero.llm.replay import ReplayBackend
 
@@ -244,29 +262,29 @@ class Orchestrator:
         raise ValueError(f"unknown backend: {self.cfg.backend!r}")
 
     def _build_subagent_backend(self) -> LLMBackend:
-        """Backend for pentester subagents: a higher per-call wall-clock timeout
-        (--subagent-timeout) so a long iterative exploitation step isn't killed
-        mid-run. echo/replay backends are stateless and shared."""
+        """Backend for pentester subagents — same per-call wall-clock timeout
+        (`--llm-timeout`) as the orchestrator so a long iterative exploitation
+        step isn't killed mid-run. echo/replay backends are stateless and shared."""
         if self.cfg.backend == "claude":
             from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
 
             return ClaudeCodeBackend(
-                ClaudeCodeConfig(timeout_seconds=self.cfg.subagent_timeout_seconds)
+                ClaudeCodeConfig(timeout_seconds=self.cfg.llm_timeout_seconds)
             )
         return self.backend
 
     def _build_validator_backend(self) -> LLMBackend:
         """A separate backend for the Validator with a much higher per-call
         turn cap (so its from-scratch investigation isn't capped at the pentest
-        agent's `--max-turns`) and the subagent per-call timeout. echo/replay
-        backends are stateless and shared with the pentest loop."""
+        agent's `--max-turns`) and the shared per-call timeout (`--llm-timeout`).
+        echo/replay backends are stateless and shared with the pentest loop."""
         if self.cfg.backend == "claude":
             from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
 
             return ClaudeCodeBackend(
                 ClaudeCodeConfig(
                     max_turns=self.cfg.validator_claude_max_turns,
-                    timeout_seconds=self.cfg.subagent_timeout_seconds,
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
                 )
             )
         return self.backend
@@ -596,6 +614,7 @@ class Orchestrator:
         # Tracks whether the agent just produced a final and we should
         # wait for a new user message before running any more turns.
         needs_user_input = self.cfg.goal is None
+        consecutive_turn_errors = 0
 
         try:
             while True:
@@ -638,20 +657,43 @@ class Orchestrator:
                     needs_user_input = True
                     continue
                 except Exception as e:  # noqa: BLE001
-                    # Don't let a backend error silently kill the agent task and
-                    # leave the UI frozen; surface it and wait for the next prompt.
-                    self.audit.write("turn_error", error=f"{type(e).__name__}: {e}")
-                    await self._emit(AgentTextDelta(
-                        text=f"\n[turn error] {type(e).__name__}: {e}\n   Type a message to continue, or /exit.\n"
-                    ))
-                    await self._emit(AgentTextEnd())
-                    loop.add_observation(
-                        tool="(system)", ok=False, output=f"previous turn failed: {e}"
+                    # Don't let a backend error / invalid-JSON envelope silently
+                    # kill the agent task. Feed it back and retry; only surrender
+                    # to the operator after several consecutive failures.
+                    consecutive_turn_errors += 1
+                    self.audit.write(
+                        "turn_error",
+                        error=f"{type(e).__name__}: {e}",
+                        consecutive=consecutive_turn_errors,
                     )
-                    needs_user_input = True
+                    loop.add_observation(
+                        tool="(system)", ok=False,
+                        output=(
+                            f"your previous turn failed: {e}. "
+                            "Reply with EXACTLY ONE valid JSON envelope (action / ask_user / "
+                            "final) — no prose, no markdown fence, no trailing data."
+                        ),
+                    )
+                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                        await self._emit(AgentTextDelta(
+                            text=(
+                                f"\n[turn error ×{consecutive_turn_errors}] "
+                                f"{type(e).__name__}: {e}\n   Type a message to continue, or /exit.\n"
+                            )
+                        ))
+                        await self._emit(AgentTextEnd())
+                        consecutive_turn_errors = 0
+                        needs_user_input = True
+                    else:
+                        await self._emit(AgentTextDelta(
+                            text=f"\n[turn error] {type(e).__name__}: {e} — retrying…\n"
+                        ))
+                        await self._emit(AgentTextEnd())
                     continue
                 finally:
                     self._current_turn_task = None
+                # Turn succeeded — reset the failure streak.
+                consecutive_turn_errors = 0
 
                 if isinstance(env, FinalEnvelope):
                     await self._emit(AgentTextDelta(text=f"\n[final] {env.answer}\n"))
@@ -702,10 +744,14 @@ class Orchestrator:
         await self._emit(TurnStart(agent=agent, turn=loop.turn + 1))
         step = await loop.step()
         env = step.envelope
+        # The FULL thought is always written to thinking.log here, regardless of
+        # how much (if any) of it we show in the chat.
         self._log_thinking(agent, loop.turn, env)
         if isinstance(env, ActionEnvelope) and env.thought:
-            await self._emit(AgentTextDelta(text=env.thought))
-            await self._emit(AgentTextEnd())
+            shown = self._thought_for_chat(env.thought)
+            if shown:
+                await self._emit(AgentTextDelta(text=shown))
+                await self._emit(AgentTextEnd())
         await self._emit_status(turn=loop.turn, mode=mode)
         self.audit.write(
             "agent_step",
@@ -716,6 +762,18 @@ class Orchestrator:
             usage=step.usage,
         )
         return env
+
+    def _thought_for_chat(self, thought: str) -> str:
+        """How much of the agent's free-form thought to show in the chat, per
+        `--thought-display`. The full thought is always in thinking.log."""
+        from zero.ui.render import short_reason
+
+        mode = self.cfg.thought_display
+        if mode == "off":
+            return ""
+        if mode == "full":
+            return thought
+        return short_reason(thought)  # "condensed" (default): first sentence
 
     async def _do_action(self, loop, env: ActionEnvelope) -> None:
         # finding_submit is orchestrator-intercepted (M6).
@@ -774,7 +832,7 @@ class Orchestrator:
         )
 
         if not getattr(tool, "requires_approval", True):
-            # Local, no-side-effect tools (notes, burp_traffic) bypass the gate.
+            # Local, no-side-effect tools (burp_traffic) bypass the gate.
             allowed = True
         else:
             req = ApprovalRequest(
@@ -844,6 +902,10 @@ class Orchestrator:
 
         await self._emit_status(turn=0, mode="c")
         needs_user_input = self.cfg.goal is None
+        # A single bad turn (e.g. the model emitted invalid JSON) shouldn't make
+        # the orchestrator surrender to the operator — feed the error back and let
+        # it retry. Only after several consecutive failures do we go idle.
+        consecutive_turn_errors = 0
 
         try:
             while True:
@@ -883,27 +945,49 @@ class Orchestrator:
                     needs_user_input = True
                     continue
                 except Exception as e:  # noqa: BLE001
-                    # A backend timeout / `claude -p` failure / parse error must
-                    # NOT silently kill the orchestrator task — that leaves the UI
-                    # alive but inert, which reads as a frozen/"blocked" session
-                    # (the gruyere hang). Surface it and go idle for the next
-                    # prompt; the engagement stays open.
-                    self.audit.write("turn_error", error=f"{type(e).__name__}: {e}")
-                    await self._emit(AgentTextDelta(
-                        text=(
-                            f"\n[turn error] {type(e).__name__}: {e}\n"
-                            "   The engagement is still open — type a message to continue,"
-                            " or /exit to quit.\n"
-                        )
-                    ))
-                    await self._emit(AgentTextEnd())
-                    loop.add_observation(
-                        tool="(system)", ok=False, output=f"previous turn failed: {e}"
+                    # A backend timeout / `claude -p` failure / invalid-JSON
+                    # envelope must NOT silently kill the orchestrator task (that
+                    # leaves the UI alive but inert — the gruyere hang). Feed the
+                    # error back as an observation and let the model RETRY on its
+                    # own; only surrender to the operator after several consecutive
+                    # failures so a transient JSON glitch self-heals instead of
+                    # looking like a crash.
+                    consecutive_turn_errors += 1
+                    self.audit.write(
+                        "turn_error",
+                        error=f"{type(e).__name__}: {e}",
+                        consecutive=consecutive_turn_errors,
                     )
-                    needs_user_input = True
+                    loop.add_observation(
+                        tool="(system)", ok=False,
+                        output=(
+                            f"your previous turn failed: {e}. "
+                            "Reply with EXACTLY ONE valid JSON envelope (action / ask_user / "
+                            "final) — no prose, no markdown fence, no trailing data."
+                        ),
+                    )
+                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                        await self._emit(AgentTextDelta(
+                            text=(
+                                f"\n[turn error ×{consecutive_turn_errors}] "
+                                f"{type(e).__name__}: {e}\n"
+                                "   Giving up this line — type a message to continue,"
+                                " or /exit to quit.\n"
+                            )
+                        ))
+                        await self._emit(AgentTextEnd())
+                        consecutive_turn_errors = 0
+                        needs_user_input = True
+                    else:
+                        await self._emit(AgentTextDelta(
+                            text=f"\n[turn error] {type(e).__name__}: {e} — retrying…\n"
+                        ))
+                        await self._emit(AgentTextEnd())
                     continue
                 finally:
                     self._current_turn_task = None
+                # A turn completed without raising — reset the failure streak.
+                consecutive_turn_errors = 0
 
                 if isinstance(env, FinalEnvelope):
                     if loop.turn >= loop.max_turns:
@@ -990,6 +1074,9 @@ class Orchestrator:
                 context=a.context, max_turns=a.max_turns,
             )
             self.audit.write("dispatch_pentester", subagent_id=sid, target=a.target, idea=a.attack_idea)
+            await self._emit(ActivityLine(
+                text=f'  ▸ pentester {sid} → "{a.attack_idea}" @ {a.target}'
+            ))
             await self._emit_status()
             return (
                 f'dispatched pentester {sid} on "{a.target}" — idea: {a.attack_idea}. '
@@ -1022,6 +1109,9 @@ class Orchestrator:
                 "dispatch_validator", subagent_id=sid, title=finding.title,
                 source=a.source_subagent,
             )
+            await self._emit(ActivityLine(
+                text=f'  ▸ validating {sid} → "{finding.title}"'
+            ))
             await self._emit_status()
             return (
                 f'dispatched validator {sid} for finding "{finding.title}" '
@@ -1034,6 +1124,9 @@ class Orchestrator:
                 a = AwaitSubagentsArgs(**args)
             except Exception as e:  # noqa: BLE001
                 return f"bad await_subagents args: {e}"
+            await self._emit(ActivityLine(
+                text=f"  ▸ waiting for subagents ({self.subagents.running_summary()})"
+            ))
             # Act as soon as ONE subagent finishes — don't block for the whole
             # batch. Return the first completion(s) so the orchestrator can react
             # and dispatch follow-ups while the rest keep running. (finalize
@@ -1063,6 +1156,7 @@ class Orchestrator:
             return obs
 
         if tool == "list_subagents":
+            await self._emit(ActivityLine(text="  ▸ listing subagents"))
             return self.subagents.format_snapshot()
 
         if tool == "finalize":
@@ -1081,6 +1175,7 @@ class Orchestrator:
                     "recon/login checks do not count as validation. Call `dispatch_validator` "
                     "for each real candidate, await the verdict, THEN finalize."
                 )
+            await self._emit(ActivityLine(text="  ▸ finalizing — writing report"))
             report_path = await self._emit_report(loop, summary=a.summary)
             self._go_idle = True  # show report, then wait for the next prompt
             return (
@@ -1163,7 +1258,21 @@ class Orchestrator:
             '{"status": "EXPLOITED" | "NO_FINDING", "summary": "...", '
             '"candidate_findings": [{"title":..., "summary":..., "endpoint":..., "method":..., '
             '"cwe":..., "severity_hint":..., "evidence":..., "payload_shape":...}], '
-            '"discovered": ["creds/tokens/notes to chain"]}.'
+            '"discovered": ["creds/tokens/notes to chain"]}.\n'
+            "The `summary` is the ONLY thing the orchestrator reads to decide what to do next, so "
+            "make it useful:\n"
+            "- If you EXPLOITED something, summarize the bug and how you proved it.\n"
+            "- If status is NO_FINDING, do NOT just say 'nothing found'. Explain WHAT YOU TESTED "
+            "(the concrete payloads / endpoints / parameters you tried) and WHY each did not work "
+            "(the response/observation that ruled it out). If ANY payload looked PROMISING or got "
+            "close — a partial success, an interesting error, a reflection that was almost "
+            "exploitable, an auth check that nearly passed — include the EXACT payload (or the full "
+            "request / exploit script) VERBATIM in the summary so the orchestrator can refine and "
+            "retry it. Do NOT paraphrase or shorten a promising payload: paste it as-is. This lets "
+            "the orchestrator improve a near-miss instead of blindly re-dispatching the same idea.\n"
+            f"The `summary` budget is large (up to {SUMMARY_MAX_CHARS} characters) — use it: paste "
+            "full promising payloads, raw request/response snippets, or a working/partial exploit "
+            "script verbatim rather than truncating them."
         )
         loop.add_user_message(brief)
         label = f"pentester[{rec.id} {rec.target}]"
@@ -1508,16 +1617,39 @@ class Orchestrator:
         return str(candidate)
 
     async def _invoke_tool(self, tool: Tool, args: dict):
+        from zero.tools.base import ToolResult
+
         try:
             parsed = tool.Args(**args)
         except ValidationError as e:
-            from zero.tools.base import ToolResult
-
             return ToolResult(ok=False, output=f"args validation error: {e}")
         host = _extract_target_host(args)
         if host and not self.rate_limiter.disabled():
             await self.rate_limiter.acquire(host)
-        return await tool.run(parsed)
+        try:
+            result = await tool.run(parsed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # A tool that raises (e.g. a NUL in a payload → subprocess "embedded
+            # null byte" ValueError) must NOT crash the caller — for a subagent
+            # that would silently kill the whole investigation. Return a clean
+            # failed observation so the agent sees the error and can adapt.
+            self.audit.write("tool_exception", tool=tool.name, error=f"{type(e).__name__}: {e}")
+            return ToolResult(ok=False, output=f"tool error: {type(e).__name__}: {e}")
+        # Neutralize NUL bytes in tool output BEFORE it enters the transcript. A
+        # binary HTTP body / font dumped by python_exec or curl_raw can contain
+        # `\x00`; left in, it flows into the next turn's `claude -p <prompt>` argv
+        # and raises "embedded null byte" at spawn, killing the subagent. We
+        # replace each run with a visible `[NUL*N]` marker (not silent deletion —
+        # the presence of null bytes can itself be the finding) so the
+        # transcript/audit/UI stay clean and informative. The backend applies the
+        # same guard at the spawn boundary as a backstop.
+        if result.output and "\x00" in result.output:
+            from zero.llm.claude_code import neutralize_nul
+
+            result.output = neutralize_nul(result.output)
+        return result
 
     async def _do_ask_user(self, env: AskUserEnvelope, *, agent: str = "pentest") -> str:
         decision = self.ask_governor.evaluate(agent, env)

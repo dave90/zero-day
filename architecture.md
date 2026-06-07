@@ -377,7 +377,7 @@ capability. Tools declare a Pydantic `Args` model, a `RiskLevel`, and flags.
 `active` (touches the target — probes/fuzz/scans), `exploit` (proves an exploit
 — SQLi, IDOR write), `destructive` (writes/deletes target data). Tools also carry
 `runs_on_host` (executes on the host even after the container swap) and
-`requires_approval` (local no-side-effect tools like `notes`/`burp_traffic`
+`requires_approval` (local no-side-effect tools like `burp_traffic`
 bypass the gate).
 
 **Catalog (registered in `default_registry`):**
@@ -396,7 +396,6 @@ bypass the gate).
 | `python_exec` | sandboxed python | active | Run a short Python snippet (craft payloads, decode blobs). |
 | `web_search` | DuckDuckGo (`ddgs`) | safe | Search the public web. |
 | `web_fetch` | `httpx` | safe | Fetch a public URL (scope-host blocklist applies). |
-| `notes` | local file | safe (no prompt) | Append to the scratch notebook. |
 | `finding_submit` | internal | safe | Submit a candidate finding (orchestrator-intercepted). |
 
 Plus the **orchestrator-only dispatch tools** (§3.3), added to the orchestrator's
@@ -478,7 +477,7 @@ Every tool call from every agent flows through `ApprovalGate`
 
 | Risk | Behavior |
 |---|---|
-| `safe` | Prompt, unless `--yolo` or `--auto-approve safe`. Local no-side-effect tools (`notes`, `burp_traffic`) skip the gate entirely. |
+| `safe` | Prompt, unless `--yolo` or `--auto-approve safe`. Local no-side-effect tools (`burp_traffic`) skip the gate entirely. |
 | `active` | Prompt, unless `--yolo` or `--auto-approve active`. |
 | `exploit` | Prompt, unless `--auto-approve exploit` **and** `--i-understand`. |
 | `destructive` | **Always prompts** — no flag (`--yolo` included) skips it. |
@@ -582,7 +581,7 @@ attempted but HTTP is used because UDS-in-shared-volume is unreliable on Docker
 Desktop / macOS.)
 
 **Mounts:**
-- `./` (project dir) → `/work` read-write — `pentest.md`, findings, notes.
+- `./` (project dir) → `/work` read-write — `pentest.md`, findings, logs.
 - `~/.claude/` → `/root/.claude` read-only — so an in-container `claude` could use
   host auth (opt-in).
 - `--burp-dir` → `/work/burp` read-only.
@@ -606,7 +605,7 @@ limits compose:
 
 | Knob (CLI flag) | Default | What it bounds |
 |---|---|---|
-| `--subagent-timeout` | 900 s | Wall-clock for **one** `claude -p` call inside a subagent. |
+| `--llm-timeout` | 900 s | Wall-clock for **one** `claude -p` call — shared by the orchestrator's own turns **and** the pentester/validator subagents (one value for all). |
 | `--pentester-max-turns` | 14 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
 | `--subagent-deadline` | 1200 s | **Total** wall-clock per subagent, checked between turns (pentesters and validators). |
 | `--validator-max-turns` | 40 | Validator investigation steps. |
@@ -615,7 +614,7 @@ limits compose:
 | `--max-turns` | 10 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
 
 Because the deadline is checked *between* turns, a subagent's absolute worst-case
-wall-clock is `--subagent-deadline` plus one in-flight call (≤ `--subagent-timeout`)
+wall-clock is `--subagent-deadline` plus one in-flight call (≤ `--llm-timeout`)
 — roughly 35 min by default. A subagent that blows the deadline returns a clean
 `ERROR`/`pending` result instead of running forever. (This bounds the historical
 case where pentesters inherited the orchestrator's large turn budget and looped
@@ -729,6 +728,6 @@ User goal: *"Find access-control bugs in the orders API."*
    per-step auditability), Pentester wants Mode B (exploration, native tool
    calling). Needs paired evals on a benchmark of intentionally-vulnerable targets
    before we pick defaults.
-4. The right default for `--subagent-deadline` vs `--subagent-timeout` — should a
+4. The right default for `--subagent-deadline` vs `--llm-timeout` — should a
    stuck in-flight call be hard-killed at the deadline (risking cutting off a
    legitimate long exploitation step), or left to finish as it is today?

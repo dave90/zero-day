@@ -6,8 +6,9 @@ from pathlib import Path
 
 from zero.orchestrator.approval import Decision
 from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
-from zero.ui.app import _approval_lines, _short_reason
+from zero.ui.app import _approval_lines
 from zero.ui.events import ApprovalPrompt
+from zero.ui.render import short_reason
 
 
 async def test_reason_reaches_the_gate(tmp_path: Path, monkeypatch):
@@ -34,9 +35,9 @@ async def test_reason_reaches_the_gate(tmp_path: Path, monkeypatch):
 
 def test_short_reason_condenses_to_one_clause():
     long = "Confirm reflected XSS in the uid param.  Then I will weaponize it against Carlos."
-    assert _short_reason(long) == "Confirm reflected XSS in the uid param"
-    assert _short_reason("") == ""
-    assert _short_reason("x" * 500).endswith("…")
+    assert short_reason(long) == "Confirm reflected XSS in the uid param"
+    assert short_reason("") == ""
+    assert short_reason("x" * 500).endswith("…")
 
 
 def test_approval_lines_show_why():
@@ -52,5 +53,5 @@ def test_approval_lines_show_why():
 
 
 def test_approval_lines_omit_why_when_no_reason():
-    lines = _approval_lines(ApprovalPrompt(tool="notes", risk_level="safe"))
+    lines = _approval_lines(ApprovalPrompt(tool="web_fetch", risk_level="safe"))
     assert not any("why:" in ln for ln in lines)

@@ -20,6 +20,15 @@ from typing import Any, Awaitable, Callable, Literal
 
 from zero.ui.events import SubagentFinished, SubagentStarted, UIEvent
 
+# How many characters of a subagent's `summary` reach the orchestrator via
+# `format_results`. Deliberately LARGE: a pentester that didn't fully solve it
+# should be able to hand back the exact promising payloads — even a full
+# exploit script — verbatim, so the orchestrator can refine a near-miss instead
+# of re-deriving it from a one-liner. The pentester brief quotes this same number,
+# so keep the two in sync by importing this constant rather than hard-coding it.
+# (~50k chars ≈ 12k tokens per returned result — generous, and tunable here.)
+SUMMARY_MAX_CHARS = 50_000
+
 
 @dataclass
 class SubagentResult:
@@ -238,7 +247,7 @@ class SubagentManager:
             lines = [
                 f"\n{r.kind} {r.subagent_id}  target {r.target!r}  status={r.status}"
                 f"  (turns {r.turns}, {r.duration:.0f}s)",
-                f"summary: {r.summary.strip()[:600]}",
+                f"summary: {r.summary.strip()[:SUMMARY_MAX_CHARS]}",
             ]
             if r.candidate_findings:
                 lines.append(f"candidate findings: {len(r.candidate_findings)}")

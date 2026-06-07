@@ -156,6 +156,20 @@ class TurnStart:
 
 
 @dataclass
+class ActivityLine:
+    """A clean, one-line description of what the orchestrator is doing right now
+    (e.g. dispatching a pentester, awaiting subagents, finalizing). Deterministic
+    — built from the action, not from the model's free-form thought — so the user
+    can follow along even when the chat would otherwise be silent."""
+
+    kind: Literal["activity_line"] = "activity_line"
+    text: str = ""
+    # Non-empty when the line belongs to a subagent; the UI hides labelled
+    # activity from the chat (consistent with labelled tool traffic).
+    label: str = ""
+
+
+@dataclass
 class GoalBanner:
     """The current top-level goal, emitted once at session start."""
 
@@ -225,6 +239,7 @@ UIEvent = (
     | SessionSummary
     | Status
     | TurnStart
+    | ActivityLine
     | GoalBanner
     | TurnCancelled
     | SubagentStarted

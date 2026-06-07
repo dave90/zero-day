@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -63,6 +64,25 @@ class ClaudeCodeConfig:
     max_turns_retry_bonus: int = 20
 
 
+_NUL_RUN = re.compile("\x00+")
+
+
+def neutralize_nul(s: str) -> str:
+    """Replace raw NUL bytes with a visible, count-preserving marker `[NUL*N]`.
+
+    A string containing `\\x00` raises `ValueError: embedded null byte` the moment
+    it's passed to `create_subprocess_exec` (argv elements are NUL-terminated C
+    strings — a raw NUL can never be carried there regardless). Tool output can
+    contain NULs (binary HTTP bodies, fonts, null-byte reflections) and those flow
+    into the next turn's prompt via the transcript, crashing the spawn before the
+    turn starts. We don't silently drop them: the marker keeps the *information
+    that N null bytes appeared here* — which is itself security-relevant — without
+    the raw byte that breaks the spawn."""
+    if "\x00" not in s:
+        return s
+    return _NUL_RUN.sub(lambda m: f"[NUL*{len(m.group())}]", s)
+
+
 def build_mode_a_argv(
     *,
     binary: str,
@@ -73,7 +93,7 @@ def build_mode_a_argv(
     """Pure-function argv assembly — easy to unit test."""
     argv = [
         binary,
-        "-p", prompt,
+        "-p", neutralize_nul(prompt),
         "--output-format", "json",
         "--max-turns", str(max_turns),
     ]
@@ -284,7 +304,7 @@ def build_mode_b_argv(
     """Pure-function assembly of the Mode B `claude` argv."""
     argv = [
         binary,
-        "-p", prompt,
+        "-p", neutralize_nul(prompt),
         "--output-format", "json",
         "--mcp-config", str(mcp_config_path),
     ]

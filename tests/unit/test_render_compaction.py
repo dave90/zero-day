@@ -1,5 +1,11 @@
-from zero.ui.events import ToolObservation
+from zero.ui.events import ActivityLine, ToolObservation
 from zero.ui.render import _compact_observation, render_event
+
+
+def test_activity_line_renders_text_verbatim():
+    assert list(render_event(ActivityLine(text='  ▸ pentester #3 → "XSS" @ /x'))) == [
+        '  ▸ pentester #3 → "XSS" @ /x'
+    ]
 
 
 def test_short_output_passes_through():
@@ -40,7 +46,10 @@ def test_render_observation_emits_compact_block_with_hint():
 
 
 def test_render_short_output_has_no_truncation_hint():
-    ev = ToolObservation(tool="notes", call_id="c1", ok=True, output="ok\n")
+    # `notes` observations are intentionally suppressed (the note text is shown at
+    # proposal time), so use a regular tool here to exercise the compaction path.
+    ev = ToolObservation(tool="httpx_tool", call_id="c1", ok=True, output="ok\n")
     lines = list(render_event(ev))
+    assert lines  # the observation actually renders
     assert not any("more lines" in l for l in lines)
     assert not any("more chars" in l for l in lines)

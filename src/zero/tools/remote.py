@@ -39,7 +39,7 @@ class RemoteTool(Tool):
         self._rpc = rpc
         # Preserve the local tool's approval policy. A remoted tool runs in the
         # sandbox (runs_on_host stays False), but a no-approval local tool
-        # (notes, burp_traffic) must STILL bypass the gate once remoted.
+        # (burp_traffic) must STILL bypass the gate once remoted.
         self.requires_approval = requires_approval
 
     async def run(self, args: BaseModel) -> ToolResult:

@@ -21,9 +21,9 @@ from zero.llm.backend import LLMBackend, LLMResponse, Message
 DEFAULT_SCRIPT: list[dict[str, Any]] = [
     {
         "type": "action",
-        "tool": "notes",
-        "args": {"action": "append", "text": "starting exploration"},
-        "thought": "Let me record what I'm about to do.",
+        "tool": "web_search",
+        "args": {"query": "target recon: common web app entry points", "max_results": 3},
+        "thought": "Let me orient before I attack.",
     },
     {
         "type": "ask_user",
@@ -40,7 +40,7 @@ DEFAULT_SCRIPT: list[dict[str, Any]] = [
     },
     {
         "type": "final",
-        "answer": "Demo complete. The EchoBackend ran through a notes append, an"
+        "answer": "Demo complete. The EchoBackend ran through a web_search, an"
                   " ask_user, and a web_search to exercise the UI surface.",
     },
 ]

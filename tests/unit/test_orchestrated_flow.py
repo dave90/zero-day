@@ -19,6 +19,7 @@ from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
 from zero.orchestrator.router import AgentRouter
 from zero.orchestrator.subagents import SubagentManager, SubagentRecord, SubagentResult
 from zero.ui.events import (
+    ActivityLine,
     AgentTextDelta,
     ApprovalPrompt,
     AskUser,
@@ -452,18 +453,39 @@ async def test_pentester_stops_at_wall_clock_deadline(tmp_path: Path, monkeypatc
     assert backend.calls == 0  # tripped before the first LLM call
 
 
-async def test_turn_error_does_not_kill_orchestrator(tmp_path: Path, monkeypatch):
-    """Regression (gruyere 'blocked' hang): a backend error on a turn used to
-    escape _orchestrator_main and silently kill the agent task, leaving the UI
-    alive but inert. It must instead surface the error and go idle for the next
-    prompt — the engagement stays open and recovers."""
+async def test_turn_error_auto_recovers_without_user_input(tmp_path: Path, monkeypatch):
+    """Regression (gruyere): the orchestrator's turn produced INVALID JSON (twice,
+    so `step()`'s own retry also failed → EnvelopeError). It used to either kill
+    the task (silent hang) or give up to the operator (looked crashed). It must now
+    feed the error back and RETRY on its own — no user input — and recover."""
     monkeypatch.chdir(tmp_path)
     orchestrator_backend = ScriptedBackend(
         [
-            RuntimeError("claude -p exit 1: boom"),          # turn 1 blows up
-            _action("finalize", {"summary": "recovered"}),   # after the operator re-prompts
+            "this is not json {",                            # turn 1, attempt 1
+            "still not valid json",                          # turn 1, step() retry → EnvelopeError
+            _action("finalize", {"summary": "recovered"}),   # turn 2, auto-retried (no user input)
         ]
     )
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
+    orch = Orchestrator(cfg)
+    orch.backend = orchestrator_backend
+
+    capture: list = []
+    # _run_orchestrated answers prompts but NEVER submits user text, so reaching
+    # `finalize` proves the orchestrator recovered on its own.
+    await _run_orchestrated(orch, ScriptedBackend([]), capture)
+
+    kinds = [r["kind"] for r in read_audit(tmp_path / ".pentest" / "audit.jsonl")]
+    assert "turn_error" in kinds
+    assert any(isinstance(e, SessionSummary) for e in capture)  # recovered → finalized
+
+
+async def test_gives_up_after_max_consecutive_turn_errors(tmp_path: Path, monkeypatch):
+    """After too many consecutive failed turns the orchestrator stops auto-retrying
+    and surrenders to the operator (rather than burning turns/tokens forever)."""
+    monkeypatch.chdir(tmp_path)
+    # 3 failed turns × (attempt + step() retry) = 6 invalid responses → 3 turn_errors.
+    orchestrator_backend = ScriptedBackend(["definitely not json {"] * 6)
     cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
     orch = Orchestrator(cfg)
     orch.backend = orchestrator_backend
@@ -473,18 +495,14 @@ async def test_turn_error_does_not_kill_orchestrator(tmp_path: Path, monkeypatch
         tools=orch.registry.catalog(), project_context=None,
     )
 
-    capture: list = []
-    saw_error = False
+    gave_up = False
 
     async def drive() -> None:
-        nonlocal saw_error
+        nonlocal gave_up
         while True:
             ev = await asyncio.wait_for(orch.ui_queue.get(), timeout=10)
-            capture.append(ev)
-            if isinstance(ev, AgentTextDelta) and "[turn error]" in ev.text:
-                saw_error = True
-                orch.submit_user_text("try again")  # re-prompt to continue
-            elif isinstance(ev, SessionSummary):
+            if isinstance(ev, AgentTextDelta) and "Giving up" in ev.text:
+                gave_up = True
                 return
 
     orch.audit.write("session_start", cwd=str(tmp_path), backend="echo", goal="g")
@@ -499,11 +517,109 @@ async def test_turn_error_does_not_kill_orchestrator(tmp_path: Path, monkeypatch
             pass
         orch.audit.close()
 
-    assert saw_error, "the backend error should have surfaced as a [turn error] line"
+    assert gave_up, "should surrender to the operator after repeated failures"
     kinds = [r["kind"] for r in read_audit(tmp_path / ".pentest" / "audit.jsonl")]
-    assert "turn_error" in kinds
-    # The loop survived and ran the next turn (finalize) instead of dying.
-    assert any(isinstance(e, SessionSummary) for e in capture)
+    assert kinds.count("turn_error") == 3
+
+
+async def test_dispatch_emits_activity_lines(tmp_path: Path, monkeypatch):
+    """Dispatch/await/validate/finalize used to emit NOTHING to the chat (they go
+    through _handle_dispatch, which never emits a ToolProposal). They must now each
+    surface a concise `▸ …` ActivityLine so the chat isn't silent during waits."""
+    monkeypatch.chdir(tmp_path)
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("dispatch_pentester", {"attack_idea": "XSS in uid", "target": "/snippets"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("dispatch_validator", {**_FINDING, "source_subagent": "#1"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("finalize", {"summary": "one confirmed XSS"}),
+        ]
+    )
+    validator_backend = ScriptedBackend([_validator_final("confirmed")])
+    orch = _make_orch(tmp_path, orchestrator_backend, _pentester_final)
+
+    capture: list = []
+    await _run_orchestrated(orch, validator_backend, capture)
+
+    activity = [e.text for e in capture if isinstance(e, ActivityLine)]
+    assert any("▸ pentester" in t for t in activity)
+    assert any("▸ waiting for subagents" in t for t in activity)
+    assert any("▸ validating" in t for t in activity)
+    assert any("▸ finalizing" in t for t in activity)
+    # A subagent FINISHING now reaches the chat path (was suppressed before).
+    assert any(isinstance(e, SubagentFinished) for e in capture)
+
+
+async def test_subagent_survives_a_crashing_tool_call(tmp_path: Path, monkeypatch):
+    """Regression (Blueprint_Heist): a tool that raises (a NUL payload →
+    'embedded null byte') used to crash the whole pentester subagent (status
+    ERROR), losing the investigation. It must instead return a failed observation
+    so the subagent keeps going and finishes normally."""
+    from pydantic import BaseModel
+
+    from zero.tools.base import RiskLevel, Tool, ToolResult
+
+    class _Empty(BaseModel):
+        pass
+
+    class _NulTool(Tool):
+        name = "boom"
+        description = "raises embedded null byte"
+        risk_level = RiskLevel.ACTIVE
+        Args = _Empty
+
+        async def run(self, args) -> ToolResult:
+            raise ValueError("embedded null byte")
+
+    monkeypatch.chdir(tmp_path)
+
+    def pentester_script():
+        return ScriptedBackend(
+            [
+                _action("boom", {}),           # crashes inside the tool…
+                _pentester_noop_final(),        # …but the subagent must continue
+            ]
+        )
+
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("dispatch_pentester", {"attack_idea": "x", "target": "/t"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
+    orch = Orchestrator(cfg)
+    orch.backend = orchestrator_backend
+    orch._subagent_backend_factory = lambda rec: pentester_script()
+    orch.registry.register(_NulTool())
+    orch.validator_backend = ScriptedBackend([])
+    orch.router = AgentRouter(
+        store=orch.findings_store, backend=orch.validator_backend,
+        tools=orch.registry.catalog(), project_context=None,
+    )
+
+    capture: list = []
+    await _run_orchestrated(orch, orch.validator_backend, capture)
+
+    finished = [e for e in capture if isinstance(e, SubagentFinished)]
+    assert finished, "the subagent should have finished, not vanished"
+    # Survived the crashing tool call → reached its own NO_FINDING final,
+    # NOT killed with status ERROR.
+    assert finished[0].status == "NO_FINDING"
+
+
+def test_thought_display_gating(tmp_path: Path):
+    """`thought_display` controls how much of the thought reaches the chat; the
+    full thought always goes to thinking.log (unaffected by this knob)."""
+    thought = "uid reflects unescaped. Then I weaponize it against carlos."
+    cond = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="echo", thought_display="condensed"))
+    assert cond._thought_for_chat(thought) == "uid reflects unescaped"
+    off = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="echo", thought_display="off"))
+    assert off._thought_for_chat(thought) == ""
+    full = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="echo", thought_display="full"))
+    assert full._thought_for_chat(thought) == thought
 
 
 def test_default_execution_mode_is_orchestrated():
@@ -511,21 +627,22 @@ def test_default_execution_mode_is_orchestrated():
     assert cfg.execution_mode == "c"
     assert cfg.max_concurrent_subagents == 10
     assert cfg.max_turns == 10  # orchestrator turn budget (turn awareness)
-    assert cfg.subagent_timeout_seconds == 900  # higher per-call timeout for subagents
+    assert cfg.llm_timeout_seconds == 900  # shared per-call timeout (orchestrator + subagents)
     assert cfg.pentester_max_turns == 14   # pentesters don't inherit the big max_turns
     assert cfg.subagent_deadline_seconds == 1200  # total wall-clock cap per subagent
+    assert cfg.thought_display == "condensed"  # one-line thought in chat by default
 
 
-def test_subagent_timeout_applies_to_subagent_backends_not_orchestrator(tmp_path: Path):
-    """--subagent-timeout sets the per-call claude timeout on the pentester +
-    validator backends, while the orchestrator's own backend keeps the default."""
+def test_llm_timeout_is_shared_by_orchestrator_and_subagents(tmp_path: Path):
+    """`--llm-timeout` sets the SAME per-call claude timeout on the orchestrator's
+    own backend AND the pentester/validator subagent backends — one value for all."""
     cfg = OrchestratorConfig(
-        cwd=tmp_path, backend="claude", execution_mode="c", subagent_timeout_seconds=1234,
+        cwd=tmp_path, backend="claude", execution_mode="c", llm_timeout_seconds=1234,
     )
     orch = Orchestrator(cfg)
+    assert orch.backend.cfg.timeout_seconds == 1234            # orchestrator's own
     assert orch.subagent_backend.cfg.timeout_seconds == 1234   # pentester subagents
     assert orch.validator_backend.cfg.timeout_seconds == 1234  # validator subagents
-    assert orch.backend.cfg.timeout_seconds == 300             # orchestrator's own (default)
 
 
 async def test_turn_limit_ends_after_waiting_for_running_subagent(tmp_path: Path, monkeypatch):

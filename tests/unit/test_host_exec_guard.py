@@ -62,17 +62,15 @@ async def test_mode_c_default_does_not_auto_run_python_exec_on_host(tmp_path: Pa
 
 
 def test_local_tools_do_not_require_approval():
-    from zero.tools.notes import NotesTool
     from zero.tools.burp_traffic import BurpTrafficTool
 
-    assert NotesTool().requires_approval is False
     assert BurpTrafficTool().requires_approval is False
     assert WebFetchTool().requires_approval is True  # network tool still gated
 
 
-async def test_notes_and_burp_traffic_bypass_the_gate(tmp_path: Path, monkeypatch):
-    """notes + burp_traffic are local/no-side-effect — they must NEVER prompt,
-    even with no auto-approve policy and a denying prompter. A network tool
+async def test_burp_traffic_bypasses_the_gate(tmp_path: Path, monkeypatch):
+    """burp_traffic is a local/no-side-effect read — it must NEVER prompt, even
+    with no auto-approve policy and a denying prompter. A network tool
     (web_fetch) still prompts."""
     monkeypatch.chdir(tmp_path)
     cfg = OrchestratorConfig(cwd=tmp_path, backend="echo", execution_mode="c")  # no policy
@@ -87,10 +85,11 @@ async def test_notes_and_burp_traffic_bypass_the_gate(tmp_path: Path, monkeypatc
 
     orch.gate._prompter = fake_prompter
 
-    r_notes = await orch._run_one_tool("notes", {"action": "read"})
-    await orch._run_one_tool("burp_traffic", {"action": "list_hosts"})
-    assert prompted == []          # neither local tool prompted
-    assert r_notes.ok is True      # notes ran despite the deny-everything prompter
+    r_burp = await orch._run_one_tool("burp_traffic", {"action": "list_hosts"})
+    assert prompted == []          # the local tool did not prompt
+    # It actually ran (bypassed the deny-everything prompter) rather than being
+    # blocked — the output is the tool's own result, not a denial.
+    assert r_burp.output != "user denied the tool call"
 
     await orch._run_one_tool("web_fetch", {"url": "https://example.com/"})
     assert "web_fetch" in prompted  # network tool is still gated

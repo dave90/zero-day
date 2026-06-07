@@ -103,13 +103,13 @@ def main() -> None:
     help="Per-call `claude -p --max-turns` for the Validator backend.",
 )
 @click.option(
-    "--subagent-timeout",
+    "--llm-timeout",
     type=int,
     default=900,
     show_default=True,
-    help="Per-call `claude -p` wall-clock timeout (seconds) for pentester/validator"
-    " subagents. Raise it for heavy iterative exploitation; the orchestrator's own"
-    " backend keeps the standard 300s.",
+    help="Per-call `claude -p` wall-clock timeout (seconds), shared by the"
+    " orchestrator AND the pentester/validator subagents (one value for all)."
+    " Raise it for heavy iterative exploitation / large-context turns.",
 )
 @click.option(
     "--pentester-max-turns",
@@ -125,7 +125,7 @@ def main() -> None:
     default=1200,
     show_default=True,
     help="Hard wall-clock ceiling (seconds) for ONE subagent's whole run, checked"
-    " between turns. --subagent-timeout only bounds a single `claude -p` call.",
+    " between turns. --llm-timeout only bounds a single `claude -p` call.",
 )
 @click.option(
     "--max-subagents",
@@ -189,6 +189,14 @@ def main() -> None:
     show_default=True,
     help="Per-host rate cap, '<int>/sec' or '<int>/min'. Set to '0/sec' to disable.",
 )
+@click.option(
+    "--thought-display",
+    type=click.Choice(["condensed", "full", "off"]),
+    default="condensed",
+    show_default=True,
+    help="How much of the agent's reasoning shows in the chat: condensed (one"
+    " line), full, or off. The complete thought is always kept in thinking.log.",
+)
 def run(
     goal: str | None,
     backend: str,
@@ -201,7 +209,7 @@ def run(
     max_turns: int,
     validator_max_turns: int,
     validator_claude_max_turns: int,
-    subagent_timeout: int,
+    llm_timeout: int,
     pentester_max_turns: int,
     subagent_deadline: int,
     max_subagents: int,
@@ -213,6 +221,7 @@ def run(
     container_memory: str,
     remote_all_tools: bool,
     rate_limit: str,
+    thought_display: str,
 ) -> None:
     """Run an interactive pentest session."""
     from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
@@ -234,7 +243,7 @@ def run(
         max_turns=max_turns,
         validator_max_turns=validator_max_turns,
         validator_claude_max_turns=validator_claude_max_turns,
-        subagent_timeout_seconds=subagent_timeout,
+        llm_timeout_seconds=llm_timeout,
         pentester_max_turns=pentester_max_turns,
         subagent_deadline_seconds=subagent_deadline,
         max_concurrent_subagents=max_subagents,
@@ -247,6 +256,7 @@ def run(
         remote_all_tools=remote_all_tools,
         rate_limit=rate_limit,
         execution_mode=execution_mode,
+        thought_display=thought_display,
     )
     orch = Orchestrator(cfg)
     asyncio.run(orch.run_interactive())

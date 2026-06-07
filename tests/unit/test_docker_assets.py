@@ -32,8 +32,10 @@ def test_dockerfile_present_and_uses_kali():
     text = df.read_text(encoding="utf-8")
     assert "kalilinux/kali-rolling" in text
     assert "ENTRYPOINT" in text
-    # Names that should be baked in per plan §M4.
-    for tool in ("sqlmap", "nmap", "ffuf", "nuclei", "jwt-tool"):
+    # Names that should be baked in per plan §M4. (jwt_tool is installed from
+    # source — ticarpi — since it isn't an apt package; httpx-toolkit provides
+    # the ProjectDiscovery probe.)
+    for tool in ("sqlmap", "nmap", "ffuf", "nuclei", "jwt_tool", "httpx-toolkit"):
         assert tool in text
 
 

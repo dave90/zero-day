@@ -28,11 +28,11 @@ class ScriptedBackend(LLMBackend):
         return LLMResponse(text=self._responses.pop(0))
 
 
-async def test_echo_first_step_is_notes_action():
+async def test_echo_first_step_is_web_search_action():
     loop = AgentLoop(EchoBackend(), system_prompt="sys", tools=[])
     step = await loop.step()
     assert isinstance(step.envelope, ActionEnvelope)
-    assert step.envelope.tool == "notes"
+    assert step.envelope.tool == "web_search"
 
 
 async def test_loop_walks_through_echo_script_until_final():

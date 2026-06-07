@@ -1,7 +1,11 @@
 """SubagentManager (M8): semaphore concurrency cap, await semantics, tracking."""
 import asyncio
 
-from zero.orchestrator.subagents import SubagentManager, SubagentResult
+from zero.orchestrator.subagents import (
+    SUMMARY_MAX_CHARS,
+    SubagentManager,
+    SubagentResult,
+)
 from zero.ui.events import SubagentFinished, SubagentStarted
 
 
@@ -130,3 +134,22 @@ async def test_snapshot_and_format_shapes():
     results = await mgr.await_("all", timeout=2)
     text = mgr.format_results(results)
     assert "EXPLOITED" in text and "cookie=abc" in text
+
+
+async def test_format_results_truncates_summary_at_limit():
+    """A long NO_FINDING summary (what-I-tested / why-it-failed) reaches the
+    orchestrator up to SUMMARY_MAX_CHARS, then is clipped — so the brief's quoted
+    budget and the actual truncation stay in sync."""
+    async def runner(rec):
+        return _result(rec, status="NO_FINDING", summary="x" * (SUMMARY_MAX_CHARS + 500))
+
+    async def emit(e):
+        pass
+
+    mgr = SubagentManager(max_concurrent=2, runner=runner, emit=emit)
+    mgr.spawn("pentester", target="/t", idea="i")
+    results = await mgr.await_("all", timeout=2)
+    text = mgr.format_results(results)
+    # The new budget is well above the old 600-char cap...
+    assert SUMMARY_MAX_CHARS > 600
+    assert text.count("x") == SUMMARY_MAX_CHARS  # clipped at the limit, not before

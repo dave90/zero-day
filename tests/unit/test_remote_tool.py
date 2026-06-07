@@ -45,14 +45,12 @@ async def test_wrap_with_remote_preserves_metadata(tmp_path: Path):
 
 
 def test_wrap_with_remote_preserves_requires_approval():
-    """A no-approval local tool (notes/burp_traffic) must keep bypassing the
-    gate after it is remoted into the sandbox — wrap_with_remote must carry the
-    flag, not reset it to the default True."""
-    from zero.tools.notes import NotesTool
+    """A no-approval local tool (burp_traffic) must keep bypassing the gate after
+    it is remoted into the sandbox — wrap_with_remote must carry the flag, not
+    reset it to the default True."""
     from zero.tools.burp_traffic import BurpTrafficTool
 
     rpc = ContainerRPC(base_url="http://_/")
-    assert wrap_with_remote(NotesTool(), rpc).requires_approval is False
     assert wrap_with_remote(BurpTrafficTool(), rpc).requires_approval is False
     # A normal tool stays gated.
     assert wrap_with_remote(PythonExecTool(), rpc).requires_approval is True

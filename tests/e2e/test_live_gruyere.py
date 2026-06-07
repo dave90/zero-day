@@ -60,6 +60,7 @@ def _image_exists(tag: str) -> bool:
 
 
 pytestmark = [
+    pytest.mark.live,          # token-spending live run — excluded from the default suite
     pytest.mark.gruyere,
     pytest.mark.skipif(
         shutil.which("claude") is None,
