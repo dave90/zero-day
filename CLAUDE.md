@@ -107,6 +107,47 @@ sandbox test in `tests/e2e/test_tools_in_sandbox.py`; a registry-driven guard
 
 ## Gotchas
 
+- **`python_exec` is stateful per actor.** Each agent (orchestrator, each
+  pentester/validator subagent) gets its own **persistent** interpreter keyed by a
+  `session_id` the orchestrator injects in `_invoke_tool` (the LLM never sets it) —
+  globals/imports persist across that actor's calls; concurrent subagents are
+  isolated. No per-call timeout (bounded by `--subagent-deadline`). Workers live in
+  the sandbox (die with it) or on the host (reaped by `_close_tool_sessions` on
+  exit). Changing the tool means rebuilding the image (it's baked in). To add a
+  library, agents use the **`pip_install`** tool (non-interactive, hard-timeout,
+  spec-sanitized) — NOT `pip` inside `python_exec` (that would hang the no-timeout
+  session). Common libs (pdfminer.six, pypdf, bs4, cryptography) are pre-baked.
+- **Anything that serves/listens goes through `python_bg`, not `python_exec`.**
+  `python_exec` has no per-call timeout, so a `serve_forever()` / blocking
+  `accept()` there hangs the turn forever. `python_bg` runs detached
+  `python -u -c <code>` in the background (`start`→`job_id`, `logs`, `stop`,
+  `list`), drains stdout/stderr into a bounded ring buffer, and **auto-closes after
+  `ttl_seconds`** — the general out-of-band primitive (the agent writes whatever
+  listener it needs; no hardcoded OOB API). Jobs run wherever the tool runs (sandbox
+  by default, host under `--no-container`) and are killed by `aclose()` on teardown.
+  A bound port is reachable by a remote target only with `--host-network`.
+- **Read-only filesystem exploration uses `list_dir` / `grep` / `read_file`, not
+  `python_exec`.** They're `safe` + `requires_approval=False` (never prompt) and are
+  **hard-jailed** to the files root — `--files-root` (default `./zero_files`,
+  resolved against cwd, auto-created), bind-mounted at `/zero_files` in the sandbox
+  and read from the `ZERO_FILES_ROOT` env by the shared `tools/_fsroot.py` helper.
+  `resolve_in_root` rejects any path escaping the root (`..`, absolute, symlink), so
+  these tools can NEVER read the wider host filesystem. This is a deliberate hard
+  boundary (unlike the advisory `--scope-host`). Adding a tool that reads files? Route
+  it through `_fsroot.resolve_in_root`.
+- **Per-agent memory is host-side and keyed by `session_id`.** Every actor
+  (orchestrator + each subagent) maintains a bounded, self-overwritten scratchpad via
+  the `memory_read` / `memory_write` tools (in `default_registry`). The file is chosen
+  purely from the `session_id` the orchestrator injects in `_invoke_tool` (same trick
+  as `python_exec`; the LLM never names it), so a subagent can only touch **its own**
+  memory — `.pentest/memory/<session_id>.md` (`tools/_memroot.py`, `ZERO_MEMORY_ROOT`).
+  These two tools are **excluded from sandbox remoting** (they must write on the host,
+  where the store lives — never mounted into the container), so they don't need sandbox
+  coverage (`HOST_ONLY` in the e2e guard). The orchestrator reads ANY subagent's memory
+  via the orchestrator-only, intercepted `read_subagent_memory` / `list_memories`
+  (`tools/dispatch.py`, like the dispatch tools — never `run()`/remoted). Agents are
+  seeded with their own memory at the start of a run; usage is steered by the `## Memory`
+  prompt sections, not enforced.
 - **`--yolo` is NOT "approve everything."** It auto-approves only `safe`+`active`;
   `exploit` still needs `--auto-approve exploit --i-understand`, `destructive`
   always prompts, host-exec needs `--allow-host-exec`.

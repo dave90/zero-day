@@ -15,6 +15,7 @@ Cross-agent isolation: nothing leaks except the structured `Finding` and
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from zero.findings.dedup import dedup_hash
 from zero.findings.schema import Finding, FindingRecord, Validation, Verdict
 from zero.findings.store import FindingsStore, new_finding_id
 from zero.llm.backend import LLMBackend
-from zero.llm.envelope import ActionEnvelope, AskUserEnvelope, FinalEnvelope
+from zero.llm.envelope import ActionEnvelope, ActionsEnvelope, AskUserEnvelope, FinalEnvelope
 
 
 @dataclass
@@ -67,6 +68,7 @@ class AgentRouter:
         finding: Finding,
         *,
         drive_validator: "ValidatorDriver",
+        extra_user_message: str | None = None,
     ) -> HandoffResult:
         h = dedup_hash(finding)
         prior = self.store.lookup_by_hash(h)
@@ -96,6 +98,10 @@ class AgentRouter:
             loop.add_user_message(
                 f"ENGAGEMENT GOAL (from the operator, for the base URL/host): {self.goal}"
             )
+        # The validator's own working memory from earlier in this run (if any), so a
+        # re-driven validator picks up where it left off.
+        if extra_user_message:
+            loop.add_user_message(extra_user_message)
         validation: Validation | None = None
         validator_error: str | None = None
         try:
@@ -215,10 +221,31 @@ async def default_validator_driver(
     (checked between turns) the driver gives up and returns None, so the
     finding is parked as pending rather than letting the validator run
     unbounded."""
+    # A single backend error (claude error_max_turns / transient failure) must not
+    # kill the validator and park the finding as pending — feed it back and retry,
+    # giving up only after several consecutive failures.
+    consecutive_errors = 0
     while True:
         if deadline is not None and time.monotonic() > deadline:
             return None
-        step = await loop.step()
+        try:
+            step = await loop.step()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — a backend glitch must not kill validation
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                # Persistent failure: re-raise so handle_finding_submit captures the
+                # actual error in the finding's notes (parked pending WITH the reason),
+                # instead of a blind "no Validation".
+                raise
+            loop.add_observation(
+                "(system)", False,
+                f"your previous turn failed: {e}. Reply with EXACTLY ONE JSON envelope "
+                "AS TEXT — do NOT make a native tool call.",
+            )
+            continue
+        consecutive_errors = 0
         env = step.envelope
         if on_step is not None:
             on_step(loop.turn, env)
@@ -231,4 +258,11 @@ async def default_validator_driver(
         if isinstance(env, ActionEnvelope):
             obs = await action_handler(env)
             loop.add_observation(env.tool, ok=True, output=obs)
+            continue
+        if isinstance(env, ActionsEnvelope):
+            # Batch: run each call (sequentially — validator tool calls go through
+            # the approval gate) and append one observation per call. One LLM turn.
+            for call in env.calls:
+                obs = await action_handler(call)
+                loop.add_observation(call.tool, ok=True, output=obs)
             continue

@@ -1,10 +1,24 @@
-from zero.ui.events import ActivityLine, ToolObservation
+from zero.ui.events import ActivityLine, ReasoningSummary, ToolObservation
 from zero.ui.render import _compact_observation, render_event
 
 
 def test_activity_line_renders_text_verbatim():
     assert list(render_event(ActivityLine(text='  ▸ pentester #3 → "XSS" @ /x'))) == [
         '  ▸ pentester #3 → "XSS" @ /x'
+    ]
+
+
+def test_reasoning_summary_single_line():
+    assert list(render_event(ReasoningSummary(text="Mapping the login flow"))) == [
+        "  ↳ Mapping the login flow"
+    ]
+
+
+def test_reasoning_summary_multiline_indents_remainder():
+    ev = ReasoningSummary(text="Mapping the login flow\nWill probe /login next\n")
+    assert list(render_event(ev)) == [
+        "  ↳ Mapping the login flow",
+        "    Will probe /login next",
     ]
 
 

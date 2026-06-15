@@ -4,8 +4,11 @@
 
 This repository tracks the implementation of `zero` as described in
 [`architecture.md`](architecture.md). The build is milestoned in
-[`plan.md`](plan.md); this checkout currently ships **all of Phase 1**
-(M1 → M8).
+[`plan.md`](plan.md); this checkout ships **all of Phase 1** (M1 → M8) plus
+post-M8 hardening: **per-agent working memory + plan**, **parallel multi-tool
+turns**, **model pinning** (Opus-1M by default), a hardened `claude` CLI **tool
+lock-down**, **per-agent context-window display**, and **subagent error
+recovery**.
 
 ## What works today
 
@@ -39,27 +42,56 @@ This repository tracks the implementation of `zero` as described in
     `[turn error]` and goes idle for your next prompt.
 - **Interactive Claude-Code-style shell** (`prompt_toolkit`, **inline** — renders
   in normal terminal scrollback, no alternate screen): input line usable while the
-  agent is mid-turn, streaming output, inline tool approvals and `ask_user`
-  prompts (in the same stream, not overlays), a live footer (turn / mode /
-  approvals waiting / findings), a live panel of running subagents with their
-  targets, and slash commands. Single `Ctrl+C` cancels the current turn; double
-  `Ctrl+C` within 2 s exits.
-- **One-step-per-turn JSON envelope protocol** (`action` / `ask_user` / `final`)
-  with one-shot retry on malformed output. The parser tolerates trailing data
-  after the first JSON object (a stray second object no longer kills a subagent).
+  agent is mid-turn, streaming output, a **concise reasoning summary** per turn
+  (Codex/Claude-Code style), inline tool approvals and `ask_user` prompts (in the
+  same stream, not overlays), a live footer (turn / mode / approvals waiting /
+  findings / **context-window usage**), a live panel of running subagents with
+  their targets / elapsed / context usage, the orchestrator's **todo checklist**,
+  and slash commands. A startup banner prints the effective backend config
+  (model · tool lock-down · context window). Single `Ctrl+C` cancels the current
+  turn; double `Ctrl+C` within 2 s exits.
+- **JSON envelope protocol** — `action` (one tool), **`actions`** (a batch of
+  independent tool calls run in ONE turn), `ask_user`, or `final` — with one-shot
+  retry on malformed output. The parser tolerates trailing data after the first
+  JSON object (a stray second object no longer kills a subagent).
 - **LLM backend**: a `ClaudeCodeBackend` that shells out to the authenticated
-  `claude` CLI. (An internal scripted fake backend exists for the offline test
-  suite only; it is not user-selectable.)
+  `claude` CLI. It **pins the model** (`--model`, default `claude-opus-4-8[1m]`)
+  and **locks the CLI down to zero real tools** (`--allowedTools ""` +
+  `--strict-mcp-config` + `--disable-slash-commands` + a denylist) and replaces
+  Claude Code's own identity (`--system-prompt`, `--setting-sources user`) so the
+  subagent acts purely as our envelope-driven pentester and never drifts into
+  calling a native CLI tool. (An internal scripted fake backend exists for the
+  offline test suite only; it is not user-selectable.)
 - **ApprovalGate** — every tool call is gated (including the orchestrator's own).
   `--auto-approve {safe,active,exploit}` (repeatable), `--yolo` (safe + active,
   **not** exploit), and `--i-understand` compose into a decision matrix;
   destructive always prompts; host-executing tools never auto-approve unless
   `--allow-host-exec` is set.
 - **Tools**: `web_search` (DuckDuckGo, no API key), `web_fetch`
-  (scope-aware), `python_exec`, a pure-Python `http_replay`, binary wrappers for
-  `sqlmap`, `nmap`, `ffuf`, `nuclei`, `httpx_tool`, `jwt_tool`, `curl_raw`, and
-  `burp_traffic` (parse Burp Suite XML exports: list_hosts / search / get).
-  Per-host token-bucket rate limiter (`--rate-limit 100/min` default).
+  (scope-aware), `python_exec` (**persistent per-agent interpreter** — state
+  survives across calls, isolated per subagent; **no hard kill timeout** — a call
+  slower than `wait_seconds` keeps running in the background and the tool returns
+  "still running" + output so far, so the agent can `action="poll"` to wait more or
+  `action="cancel"` to stop it), `python_bg`
+  (**detachable background jobs** — run a listener/server/long-poller, read its
+  logs, stop it, auto-close after a TTL; the general OOB primitive — pair with
+  `--host-network` so a target can reach a bound port), `pip_install`
+  (install packages into the sandbox so `python_exec` can import them),
+  `list_dir` / `grep` / `read_file` (**read-only filesystem tools** — list a
+  folder, regex-search it, read a file; never prompt, and **hard-jailed to
+  `--files-root`** / default `zero_files`, never the host filesystem),
+  `memory_read` / `memory_write` and `todo_read` / `todo_write` (**per-agent
+  working state** — a bounded scratchpad and a checklist each actor keeps under
+  `.pentest/memory|todo/<id>`, host-side; the orchestrator can read any subagent's
+  memory), a pure-Python `http_replay`, binary wrappers for `sqlmap`, `nmap`,
+  `ffuf`, `nuclei`, `httpx_tool`, `jwt_tool`, `curl_raw`, and `burp_traffic` (parse
+  Burp Suite XML exports: list_hosts / search / get). Per-host token-bucket rate
+  limiter (`--rate-limit 100/min` default).
+- **Per-agent memory & plan**: every actor (orchestrator + each subagent) gets a
+  bounded **memory** file it overwrites and a **todo** checklist, seeded back on a
+  later turn/session. The harness also **auto-writes** each subagent's end-state to
+  its memory, so the orchestrator can recover a subagent's progress (via
+  `read_subagent_memory` / `list_memories`) even if it crashed or ran out of turns.
 - **Findings store + report**: confirmed/rejected/pending markdown under
   `.pentest/findings/{verdict}/`, scored with **CVSS 4.0**, deduped by
   `(normalized_endpoint, cwe, payload_shape, method)`. `finalize` (or hitting the
@@ -85,6 +117,8 @@ This repository tracks the implementation of `zero` as described in
     question / answer it produced.
   - `report.md` — the final report. `findings/{confirmed,rejected,pending}/` —
     per-finding markdown.
+  - `memory/<id>.md` and `todo/<id>.json` — each agent's working memory + plan
+    (`<id>` = `orchestrator` or a subagent id like `gino_2`).
 - **`pentest.md`** is read raw and prepended to the agent's system prompt under a
   `<project_context>` delimiter (Claude Code's `CLAUDE.md` model — no parser, no
   schema). Keep run mechanics out of it; it is engagement scope/creds/goal only.
@@ -146,6 +180,7 @@ orchestrator and every subagent (`thinking.log`).
 |---|---|
 | `--goal <text>` | One-shot goal seeded as the first user message. |
 | `--backend {claude}` | LLM backend (Claude Code CLI). Default `claude`. |
+| `--model <id>` | Model for **every** `claude -p` call (orchestrator + subagents + validators). Alias (`opus`/`sonnet`) or full id; default **`claude-opus-4-8[1m]`** (Opus, 1M context). Pass `''` for your account default. |
 | `--execution-mode {a,b,c}` | `c` orchestrated (**default**), `a` single agent, `b` MCP delegated. |
 | `--auto-approve {safe,active,exploit}` | Auto-approve tools at this risk class. Repeatable. |
 | `--yolo` | Auto-approve `safe` + `active`. Does **not** cover `exploit` (use `--auto-approve exploit --i-understand`) or `destructive` (always prompts). |
@@ -155,7 +190,8 @@ orchestrator and every subagent (`thinking.log`).
 | `--max-turns <n>` | Orchestrator turn budget (default **10**). It is told its turns-remaining, stops opening new attack ideas as it runs low, then finalizes (auto-finalizes at the limit). |
 | `--max-subagents <n>` | Max concurrently-running subagents in mode `c` (default **10**). |
 | `--validator-max-turns <n>` | Validator investigation steps, separate from `--max-turns` (default **40**). |
-| `--validator-claude-max-turns <n>` | Per-call `claude -p --max-turns` for the Validator backend (default **60**). |
+| `--validator-claude-max-turns <n>` | claude's INTERNAL per-call `--max-turns` for the Validator (default **1** — NOT its investigation budget, which is `--validator-max-turns`; we drive the loop, so a high value only lets the model drift into a native tool call). |
+| `--context-window <n>` | Model context-window size for the UI's per-agent `ctx used/window (%)` display (default inferred from `--model`: 1M for a `[1m]` model, else 200k). |
 | `--llm-timeout <secs>` | Per-call `claude -p` wall-clock timeout (default **900**), shared by the orchestrator **and** the pentester/validator subagents — one value for all. Raise it for heavy iterative exploitation / large-context turns. |
 | `--pentester-max-turns <n>` | Per-pentester turn budget (default **14**). Pentesters no longer inherit `--max-turns`, so one attack idea can't run 40+ turns. |
 | `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--llm-timeout` only bounds a single `claude -p` call. |

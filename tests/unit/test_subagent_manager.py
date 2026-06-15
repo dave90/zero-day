@@ -2,11 +2,26 @@
 import asyncio
 
 from zero.orchestrator.subagents import (
+    _FUNNY_NAMES,
     SUMMARY_MAX_CHARS,
     SubagentManager,
     SubagentResult,
 )
 from zero.ui.events import SubagentFinished, SubagentStarted
+
+
+async def test_ids_are_funny_name_plus_serial():
+    """Spawn ids read like `gino_2`: a random funny Italian name + the serial
+    counter (1,2,3…), the trailing number staying unique and sequential."""
+    async def runner(rec):
+        return _result(rec)
+
+    mgr = SubagentManager(max_concurrent=10, runner=runner, emit=lambda e: asyncio.sleep(0))
+    ids = [mgr.spawn("pentester", target="/t", idea="i") for _ in range(5)]
+    for n, sid in enumerate(ids, start=1):
+        name, _, serial = sid.rpartition("_")
+        assert serial == str(n), sid          # serial counter preserved
+        assert name in _FUNNY_NAMES, sid        # prefix is a known funny name
 
 
 def _result(rec, status="NO_FINDING", **kw):

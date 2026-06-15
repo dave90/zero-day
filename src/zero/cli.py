@@ -98,9 +98,11 @@ def main() -> None:
 @click.option(
     "--validator-claude-max-turns",
     type=int,
-    default=60,
+    default=1,
     show_default=True,
-    help="Per-call `claude -p --max-turns` for the Validator backend.",
+    help="claude's INTERNAL per-call --max-turns for the Validator (NOT its"
+    " investigation budget — that's --validator-max-turns). Keep 1: we drive the"
+    " loop, and a higher value lets the model drift into a native tool call.",
 )
 @click.option(
     "--llm-timeout",
@@ -162,6 +164,14 @@ def main() -> None:
     help="Host directory mounted ro at /work/burp inside the sandbox.",
 )
 @click.option(
+    "--files-root",
+    type=click.Path(path_type=Path),
+    default="zero_files",
+    show_default=True,
+    help="Root folder the read-only fs tools (list_dir/grep/read_file) are jailed to; "
+    "resolved against cwd, created if missing, mounted at /zero_files in the sandbox.",
+)
+@click.option(
     "--container-cpus",
     type=float,
     default=4.0,
@@ -197,6 +207,21 @@ def main() -> None:
     help="How much of the agent's reasoning shows in the chat: condensed (one"
     " line), full, or off. The complete thought is always kept in thinking.log.",
 )
+@click.option(
+    "--model",
+    default="claude-opus-4-8[1m]",
+    show_default=True,
+    help="Model for every claude call (orchestrator + subagents + validators). An"
+    " alias ('opus', 'sonnet') or full id; 'claude-opus-4-8[1m]' is Opus with the"
+    " 1M-context window. Pass '' to use your account default.",
+)
+@click.option(
+    "--context-window",
+    type=int,
+    default=None,
+    help="Context-window size for the UI's per-agent 'ctx used/window (%)' display."
+    " Default: inferred from --model (1M for a '[1m]' model, else 200k).",
+)
 def run(
     goal: str | None,
     backend: str,
@@ -217,14 +242,23 @@ def run(
     container_image: str,
     host_network: bool,
     burp_dir: Path | None,
+    files_root: Path,
     container_cpus: float,
     container_memory: str,
     remote_all_tools: bool,
     rate_limit: str,
     thought_display: str,
+    model: str,
+    context_window: int | None,
 ) -> None:
     """Run an interactive pentest session."""
     from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
+
+    # `--model ''` ⇒ account default. Infer the context-window denominator from the
+    # model when not given (1M for a '[1m]' variant, else the standard 200k).
+    model_or_none = model or None
+    if context_window is None:
+        context_window = 1_000_000 if (model and "[1m]" in model) else 200_000
 
     # No implicit auto-approve policy: every tool call (orchestrator's own and
     # its subagents') goes through the ApprovalGate and prompts unless the user
@@ -251,12 +285,15 @@ def run(
         container_image=container_image,
         host_network=host_network,
         burp_dir=burp_dir,
+        files_root=files_root,
         container_cpus=container_cpus,
         container_memory=container_memory,
         remote_all_tools=remote_all_tools,
         rate_limit=rate_limit,
         execution_mode=execution_mode,
         thought_display=thought_display,
+        model=model_or_none,
+        context_window=context_window,
     )
     orch = Orchestrator(cfg)
     asyncio.run(orch.run_interactive())
@@ -274,7 +311,7 @@ def init() -> None:
         click.echo(f"wrote {pentest_md}")
 
     pdir = cwd / ".pentest"
-    for sub in ("findings/confirmed", "findings/rejected", "findings/pending", "traffic"):
+    for sub in ("findings/confirmed", "findings/rejected", "findings/pending", "traffic", "memory"):
         (pdir / sub).mkdir(parents=True, exist_ok=True)
     click.echo(f"scaffolded {pdir}/")
 

@@ -36,6 +36,23 @@ RUN apt-get update && for pkg in sqlmap nmap ffuf nuclei httpx-toolkit; do \
         apt-get install -y --no-install-recommends "$pkg" || echo "WARN: $pkg not available"; \
     done && rm -rf /var/lib/apt/lists/*
 
+# Wordlists: ffuf/sqlmap/hydra all need them and real runs failed with
+# "/usr/share/wordlists/... not found" (ffuf then dumps usage and the agent stalls).
+#   - `wordlists` provides /usr/share/wordlists/ (+ rockyou.txt.gz, symlinks to dirb)
+#   - `dirb`/`dirbuster` provide /usr/share/wordlists/dirb/common.txt etc.
+#   - `seclists` provides /usr/share/seclists (large but the standard go-to)
+# rockyou ships gzipped; gunzip it so /usr/share/wordlists/rockyou.txt exists.
+# `seclists` is big, so a repo hiccup must not fail the build — install per-pkg.
+RUN apt-get update && for pkg in wordlists dirb dirbuster seclists; do \
+        apt-get install -y --no-install-recommends "$pkg" || echo "WARN: $pkg not available"; \
+    done && rm -rf /var/lib/apt/lists/* \
+    && if [ -f /usr/share/wordlists/rockyou.txt.gz ]; then \
+           gunzip -kf /usr/share/wordlists/rockyou.txt.gz \
+           && echo "OK: rockyou.txt unpacked"; \
+       else echo "WARN: rockyou.txt.gz not present"; fi \
+    && echo "wordlists present:" \
+    && ls -la /usr/share/wordlists/ 2>/dev/null | head -40 || true
+
 # jwt_tool (ticarpi) is NOT an apt package — install it from source and expose a
 # `jwt_tool` launcher on PATH (the JwtTool wrapper invokes `jwt_tool <token> <mode>`).
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool \
@@ -59,7 +76,10 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
         "fastapi>=0.110" "uvicorn[standard]>=0.27" \
         "httpx>=0.27" "pydantic>=2.6" \
-        "requests" "pyjwt" "trafilatura" "ddgs"
+        "requests" "pyjwt" "trafilatura" "ddgs" \
+        # Common libs agents reach for, pre-installed so they don't have to
+        # pip_install them at runtime (the pdfminer-install hang from real runs):
+        "pdfminer.six" "pypdf" "beautifulsoup4" "cryptography" "pycryptodome"
 
 # Resolve the `httpx` name collision. The pip `httpx` LIBRARY ships a console
 # script ALSO named `httpx` (lands in /usr/local/bin) that shadows the

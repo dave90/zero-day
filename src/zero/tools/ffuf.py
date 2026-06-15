@@ -9,7 +9,11 @@ from zero.tools.binary import BinaryTool
 
 class FfufArgs(BaseModel):
     url: str = Field(description="target with FUZZ placeholder, e.g. http://host/FUZZ")
-    wordlist: str = Field(description="path to wordlist (in-container)")
+    wordlist: str = Field(
+        default="/usr/share/wordlists/dirb/common.txt",
+        description="path to wordlist in the sandbox (default: dirb common.txt; other"
+        " baked options: /usr/share/wordlists/rockyou.txt, /usr/share/seclists/...)",
+    )
     method: str = "GET"
     data: str | None = None
     headers: list[str] = Field(default_factory=list, description="extra headers, 'k: v'")

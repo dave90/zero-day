@@ -14,9 +14,11 @@ from zero.ui.events import (
     AgentTextDelta,
     AgentTextEnd,
     Finding,
+    ReasoningSummary,
     SessionEnd,
     SessionSummary,
     SubagentStarted,
+    TodoUpdate,
     ToolObservation,
     ToolProposal,
 )
@@ -40,6 +42,10 @@ async def test_chat_routing_shows_orchestrator_hides_subagents(tmp_path: Path):
     for ev in [
         AgentTextDelta(text="I'll test SQLi on /api/orders", agent="orchestrator"),
         AgentTextEnd(),
+        ReasoningSummary(text="Mapping auth + endpoints", agent="orchestrator"),
+        ReasoningSummary(text="probing sqli", label="pentester[#3 /api/orders]"),
+        TodoUpdate(items=[{"step": "map endpoints", "status": "in_progress"}]),
+        TodoUpdate(items=[{"step": "hidden subagent step"}], label="pentester[#3 /api/orders]"),
         ToolProposal(tool="sqlmap", risk_level="exploit", label="pentester[#3 /api/orders]"),
         ToolObservation(tool="sqlmap", ok=True, output="dumped", label="pentester[#3 /api/orders]"),
         SubagentStarted(subagent_id="#3", subkind="pentester", target="/api/orders", idea="SQLi"),
@@ -55,6 +61,10 @@ async def test_chat_routing_shows_orchestrator_hides_subagents(tmp_path: Path):
 
     # orchestrator thinking + its own recon are shown
     assert "I'll test SQLi on /api/orders" in blob
+    assert "Mapping auth + endpoints" in blob   # orchestrator reasoning summary shown
+    assert "probing sqli" not in blob           # subagent (labelled) reasoning hidden
+    assert "map endpoints" in blob              # orchestrator todo shown
+    assert "hidden subagent step" not in blob   # subagent (labelled) todo hidden
     assert "web_fetch" in blob
     # finding card is shown (it's a result, not a log)
     assert "SQLi in orders" in blob

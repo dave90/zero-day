@@ -62,6 +62,57 @@ async def test_python_exec_runs_in_kali(tmp_path: Path):
         await mgr.stop()
 
 
+async def test_wordlists_present_in_sandbox(tmp_path: Path):
+    """The image must ship the wordlists ffuf/sqlmap/hydra need — real runs failed
+    with '/usr/share/wordlists/... not found' (ffuf dumped usage and stalled).
+    Checks dirb common.txt, rockyou.txt (unpacked), and seclists."""
+    spec = ContainerSpec(cwd=tmp_path, image="zero-sandbox:latest")
+    mgr = ContainerManager(spec)
+    await mgr.start()
+    try:
+        async with ContainerRPC(mgr.rpc_base_url()) as rpc:
+            r = await rpc.call(
+                "python_exec",
+                {
+                    "code": (
+                        "import os\n"
+                        "for p in ['/usr/share/wordlists/dirb/common.txt',\n"
+                        "          '/usr/share/wordlists/rockyou.txt',\n"
+                        "          '/usr/share/seclists']:\n"
+                        "    print(p, os.path.exists(p))\n"
+                    )
+                },
+            )
+            assert r.ok, r.output
+            assert "/usr/share/wordlists/dirb/common.txt True" in r.output, r.output
+            assert "/usr/share/wordlists/rockyou.txt True" in r.output, r.output
+            assert "/usr/share/seclists True" in r.output, r.output
+    finally:
+        await mgr.stop()
+
+
+async def test_python_exec_yields_then_polls_in_sandbox(tmp_path: Path):
+    """In-container: a call slower than wait_seconds yields 'still running' and a
+    later poll returns the result (the no-hard-timeout / look-and-decide model)."""
+    spec = ContainerSpec(cwd=tmp_path, image="zero-sandbox:latest")
+    mgr = ContainerManager(spec)
+    await mgr.start()
+    try:
+        async with ContainerRPC(mgr.rpc_base_url()) as rpc:
+            r = await rpc.call(
+                "python_exec",
+                {"code": "import time; print('go', flush=True); time.sleep(3)",
+                 "wait_seconds": 1, "session_id": "s"},
+            )
+            assert "STILL RUNNING" in r.output and "go" in r.output, r.output
+            done = await rpc.call(
+                "python_exec", {"action": "poll", "wait_seconds": 6, "session_id": "s"},
+            )
+            assert done.ok, done.output
+    finally:
+        await mgr.stop()
+
+
 async def test_unknown_tool_returns_rpc_error(tmp_path: Path):
     spec = ContainerSpec(cwd=tmp_path, image="zero-sandbox:latest")
     mgr = ContainerManager(spec)

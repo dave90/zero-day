@@ -22,6 +22,7 @@ from pathlib import Path
 
 DEFAULT_IMAGE = "zero-sandbox:latest"
 DEFAULT_WORK_MOUNT = "/work"
+FILES_ROOT_IN_CONTAINER = "/zero_files"  # jail root for the read-only fs tools
 DEFAULT_SOCK_NAME = "zero.sock"  # kept for back-compat; no longer the wire
 RPC_PORT_IN_CONTAINER = 7333
 
@@ -35,6 +36,10 @@ class ContainerSpec:
     cwd: Path = field(default_factory=Path.cwd)
     claude_dir_host: Path | None = None  # auto: ~/.claude
     burp_dir_host: Path | None = None  # if present, mounted ro at /work/burp
+    # Jail root for the read-only filesystem tools. Bind-mounted rw at /zero_files
+    # and advertised via ZERO_FILES_ROOT so those tools confine to it. Must be an
+    # ABSOLUTE host path (a relative -v source is a named volume, not a bind mount).
+    files_root: Path = field(default_factory=lambda: Path.cwd() / "zero_files")
 
     # Resource caps.
     cpus: float = 4.0
@@ -66,6 +71,10 @@ def build_run_args(spec: ContainerSpec, *, name: str) -> list[str]:
         f"--memory={spec.memory}",
         "-v", f"{spec.cwd}:{DEFAULT_WORK_MOUNT}:rw",
         "-w", DEFAULT_WORK_MOUNT,
+        # Jail root for the read-only fs tools (list_dir/grep/read_file): mounted at
+        # a fixed in-container path they're confined to via ZERO_FILES_ROOT.
+        "-v", f"{spec.files_root.resolve()}:{FILES_ROOT_IN_CONTAINER}:rw",
+        "-e", f"ZERO_FILES_ROOT={FILES_ROOT_IN_CONTAINER}",
     ]
     claude_dir = spec.resolved_claude_dir()
     if claude_dir is not None:

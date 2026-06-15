@@ -3,12 +3,51 @@ import json
 import pytest
 
 from zero.llm.envelope import (
+    MAX_BATCH_CALLS,
     ActionEnvelope,
+    ActionsEnvelope,
     AskUserEnvelope,
     EnvelopeError,
     FinalEnvelope,
     parse_envelope,
 )
+
+
+def test_actions_envelope_batch():
+    e = parse_envelope(json.dumps({
+        "type": "actions",
+        "thought": "fire two independent probes",
+        "calls": [
+            {"tool": "curl_raw", "args": {"url": "http://x/"}},
+            {"tool": "httpx_tool", "args": {"target": "http://x"}},
+        ],
+    }))
+    assert isinstance(e, ActionsEnvelope)
+    assert e.thought == "fire two independent probes"
+    assert [c.tool for c in e.calls] == ["curl_raw", "httpx_tool"]
+    assert all(isinstance(c, ActionEnvelope) for c in e.calls)
+
+
+def test_actions_envelope_rejects_empty_calls():
+    with pytest.raises(EnvelopeError):
+        parse_envelope(json.dumps({"type": "actions", "calls": []}))
+
+
+def test_actions_envelope_rejects_too_many():
+    calls = [{"tool": "curl_raw", "args": {}} for _ in range(MAX_BATCH_CALLS + 1)]
+    with pytest.raises(EnvelopeError):
+        parse_envelope(json.dumps({"type": "actions", "calls": calls}))
+
+
+def test_actions_envelope_rejects_bad_call():
+    with pytest.raises(EnvelopeError):
+        parse_envelope(json.dumps({"type": "actions", "calls": [{"args": {}}]}))
+
+
+def test_single_action_still_parses_unchanged():
+    # Back-compat: the singular form is untouched.
+    e = parse_envelope(json.dumps({"type": "action", "tool": "x", "args": {"a": 1}}))
+    assert isinstance(e, ActionEnvelope) and e.tool == "x" and e.args == {"a": 1}
 
 
 def test_action_envelope_minimal():

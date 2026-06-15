@@ -74,3 +74,23 @@ async def test_tool_output_nul_is_neutralized(tmp_path: Path, monkeypatch):
     assert "\x00" not in result.output          # no raw NUL (would crash the next spawn)
     assert "[NUL*2]" in result.output           # the \x00\x00 run is marked with its count
     assert "font-bytes" in result.output         # surrounding content preserved
+
+
+async def test_invoke_tool_injects_session_and_isolates_actors(tmp_path: Path, monkeypatch):
+    """The orchestrator injects a per-actor `session_id` into python_exec (the LLM
+    never sets it), and different actors get isolated persistent interpreters —
+    so concurrent subagents can't see each other's state."""
+    monkeypatch.chdir(tmp_path)
+    orch = Orchestrator(
+        OrchestratorConfig(cwd=tmp_path, backend="echo", execution_mode="c", use_container=False)
+    )
+    py = orch.registry.get("python_exec")
+    try:
+        # LLM-facing args carry NO session_id; the orchestrator injects it.
+        await orch._invoke_tool(py, {"code": "v = 99"}, session_id="pentester-1")
+        same = await orch._invoke_tool(py, {"code": "print(v)"}, session_id="pentester-1")
+        other = await orch._invoke_tool(py, {"code": "print(v)"}, session_id="pentester-2")
+        assert same.ok and "99" in same.output          # state persists within an actor
+        assert other.ok is False and "NameError" in other.output  # isolated from the other
+    finally:
+        await py.aclose()

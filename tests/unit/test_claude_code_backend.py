@@ -8,8 +8,92 @@ from zero.llm.claude_code import (
     _extract_claude_error,
     build_mode_a_argv,
     build_prompt,
+    build_user_prompt,
     parse_claude_json,
 )
+
+
+def _argval(argv, flag):
+    return argv[argv.index(flag) + 1]
+
+
+def test_mode_a_argv_sets_system_prompt_and_setting_sources():
+    """Identity fix: our agent prompt must go to --system-prompt (replacing Claude
+    Code's own identity), and --setting-sources must drop the repo CLAUDE.md."""
+    argv = build_mode_a_argv(
+        binary="claude", prompt="BODY", max_turns=5, disallowed_tools=(),
+        system_prompt="You are the Pentest agent.", setting_sources="user",
+    )
+    assert "--system-prompt" in argv
+    assert _argval(argv, "--system-prompt") == "You are the Pentest agent."
+    assert _argval(argv, "--setting-sources") == "user"
+
+
+def test_mode_a_argv_omits_identity_flags_when_unset():
+    argv = build_mode_a_argv(binary="claude", prompt="x", max_turns=5, disallowed_tools=())
+    assert "--system-prompt" not in argv
+    assert "--setting-sources" not in argv
+
+
+def test_build_user_prompt_excludes_system_prompt():
+    tools = [{"name": "t", "description": "d", "risk_level": "safe", "schema": {"type": "object"}}]
+    p = build_user_prompt([Message(role="user", content="hi")], tools)
+    assert "## Available tools" in p and "[user] hi" in p
+    assert "envelope JSON object" in p
+
+
+def test_backend_config_defaults_to_user_setting_source():
+    from zero.llm.claude_code import ClaudeCodeConfig
+
+    assert ClaudeCodeConfig().setting_sources == "user"  # no project/local CLAUDE.md leak
+
+
+def test_backend_locks_down_all_real_tools_by_default():
+    """The envelope protocol breaks if the model can call real tools (it tries the
+    harness/MCP tools, finds our pentest tools 'not wired', and gives up). Lock-down
+    must strip built-ins, MCP, and skills so only envelope text is possible."""
+    from zero.llm.claude_code import ClaudeCodeConfig
+
+    assert ClaudeCodeConfig().lock_down_tools is True
+    argv = build_mode_a_argv(
+        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        lock_down_tools=True,
+    )
+    # An EMPTY WHITELIST `--allowedTools ""` is what actually grants zero tools.
+    # `--tools ""` does NOT work (greedy variadic; the empty value leaves Claude
+    # Code's defaults — incl. LSP — enabled), so it must NOT be the disable we rely on.
+    assert "--allowedTools" in argv and argv[argv.index("--allowedTools") + 1] == ""
+    assert "--tools" not in argv                # the ineffective flag must not be used
+    assert "--strict-mcp-config" in argv      # no MCP servers (Google, etc.)
+    assert "--disable-slash-commands" in argv  # no skills
+
+
+def test_lock_down_omitted_when_disabled():
+    argv = build_mode_a_argv(
+        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        lock_down_tools=False,
+    )
+    assert "--allowedTools" not in argv and "--strict-mcp-config" not in argv
+
+
+def test_mode_a_argv_pins_model():
+    argv = build_mode_a_argv(
+        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        model="claude-opus-4-8[1m]",
+    )
+    assert _argval(argv, "--model") == "claude-opus-4-8[1m]"
+
+
+def test_mode_a_argv_no_model_flag_when_empty():
+    argv = build_mode_a_argv(binary="claude", prompt="x", max_turns=5, disallowed_tools=())
+    assert "--model" not in argv
+
+
+def test_orchestrator_config_defaults_to_opus_1m():
+    from zero.orchestrator.orchestrator import OrchestratorConfig
+    from pathlib import Path
+
+    assert OrchestratorConfig(cwd=Path(".")).model == "claude-opus-4-8[1m]"
 
 
 def test_parse_result_field():
@@ -66,18 +150,27 @@ def test_mode_a_argv_includes_disallowed_builtins():
     i = argv.index("--disallowedTools")
     spec = argv[i + 1]
     # The big offenders that previously caused error_max_turns must be present.
-    for required in ("Bash", "Read", "Write", "WebFetch", "WebSearch"):
+    # `LSP`/`ToolSearch`/`Monitor` are the newer built-ins the original list MISSED —
+    # `LSP` is the one a subagent fell back to and called (the live-reproduced Guild
+    # bug), so guard them explicitly to stop the recurrence.
+    for required in (
+        "Bash", "Read", "Write", "WebFetch", "WebSearch",
+        "LSP", "ToolSearch", "Monitor",
+    ):
         assert required in spec, f"{required} missing from disallowed list"
 
 
-def test_mode_a_argv_max_turns_default_above_one():
-    # 1 is too tight — claude's internal accounting hits error_max_turns
-    # even when our envelope-only protocol wouldn't need a second turn.
+def test_mode_a_internal_max_turns_has_small_headroom():
+    # claude's INTERNAL per-call --max-turns is a SMALL budget (not 1): we drive the
+    # multi-turn loop ourselves (one envelope per call), but under lock-down a stray
+    # native tool_use attempt at --max-turns 1 instantly trips error_max_turns and
+    # fails the whole call (the live-reproduced Guild bug). A few turns of headroom let
+    # that rare attempt fail harmlessly and the model recover to text. Must stay small
+    # so it can't run a real internal agentic loop.
     from zero.llm.claude_code import ClaudeCodeConfig
 
-    assert ClaudeCodeConfig.max_turns >= 3, (
-        "max_turns=1 caused real-world error_max_turns crashes; keep > 1"
-    )
+    assert 2 <= ClaudeCodeConfig.max_turns <= 6
+    assert ClaudeCodeConfig.lock_down_tools is True  # the precondition that makes it safe
 
 
 def test_mode_a_argv_no_disallow_when_empty():
@@ -223,7 +316,8 @@ async def test_run_raises_after_retry_exhausted(monkeypatch):
     from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
 
     caps = _patch_exec(monkeypatch, [(_ERR_MAX_TURNS, 1), (_ERR_MAX_TURNS, 1)])
-    backend = ClaudeCodeBackend(ClaudeCodeConfig(max_turns=10))
+    # explicit bonus so the test is independent of the (now small) default.
+    backend = ClaudeCodeBackend(ClaudeCodeConfig(max_turns=10, max_turns_retry_bonus=20))
     with pytest.raises(RuntimeError) as exc:
         await backend.run("sys", [Message(role="user", content="hi")], [])
     assert "error_max_turns" in str(exc.value)

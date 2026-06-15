@@ -29,6 +29,34 @@ class AgentTextEnd:
 
 
 @dataclass
+class TodoUpdate:
+    """The agent updated its task plan (Claude-Code TodoWrite). Rendered as a
+    checklist. `label` is set for subagents so the UI keeps them out of the main
+    chat (like the other labelled events); empty for the orchestrator."""
+
+    kind: Literal["todo_update"] = "todo_update"
+    items: list[dict] = field(default_factory=list)
+    label: str = ""
+
+
+@dataclass
+class ReasoningSummary:
+    """A concise summary of the agent's reasoning for ONE step — the Codex /
+    Claude-Code style 'thinking' headline shown live in the chat. How much shows
+    is controlled by `--thought-display` (condensed = the headline; full = the
+    whole thought); the complete thought always goes to thinking.log.
+
+    `label` is set for subagents so the UI keeps them out of the main chat (like
+    the other labelled events); empty for the orchestrator / top-level agent."""
+
+    kind: Literal["reasoning_summary"] = "reasoning_summary"
+    agent: str = "pentest"
+    turn: int = 0
+    text: str = ""
+    label: str = ""
+
+
+@dataclass
 class UserText:
     """User input submitted from the input pane."""
 
@@ -134,7 +162,10 @@ class Status:
     kind: Literal["status"] = "status"
     agent: str = "pentest"
     turn: int = 0
-    tokens: int = 0
+    # Orchestrator context-window usage: tokens in the window as of its last call,
+    # and the window size (for the % display). 0/0 ⇒ not shown.
+    context_tokens: int = 0
+    context_window: int = 0
     mode: str = "a"
     pending_approvals: int = 0
     # Background validation counters (M6 async validation).

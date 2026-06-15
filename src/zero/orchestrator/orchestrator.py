@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from zero.agents.orchestrator_agent import build_orchestrator_loop, parse_pentes
 from zero.llm.backend import LLMBackend
 from zero.llm.envelope import (
     ActionEnvelope,
+    ActionsEnvelope,
     AskUserEnvelope,
     FinalEnvelope,
 )
@@ -44,9 +46,14 @@ from zero.tools.dispatch import (
     DispatchPentesterArgs,
     DispatchValidatorArgs,
     FinalizeArgs,
+    ReadSubagentMemoryArgs,
     dispatch_tools,
+    inspect_tools,
     is_dispatch_tool,
+    is_inspect_tool,
 )
+from zero.tools._memroot import memory_root
+from zero.tools.memory import read_memory, write_memory
 from zero.tools.web_fetch import WebFetchTool
 from zero.findings.store import FindingsStore
 from zero.findings.schema import Finding as FindingModel
@@ -61,10 +68,12 @@ from zero.ui.events import (
     AskUser,
     Finding as FindingEvent,
     GoalBanner,
+    ReasoningSummary,
     SessionEnd,
     SessionSummary,
     Status,
     SubagentProgress,
+    TodoUpdate,
     ToolObservation,
     ToolProposal,
     TurnCancelled,
@@ -78,6 +87,11 @@ from zero.ui.events import (
 # and waits for the operator. Lets a transient model glitch self-heal instead of
 # reading as a crashed/idle session.
 _MAX_CONSECUTIVE_TURN_ERRORS = 3
+
+# Tools that mutate the actor's ONE persistent interpreter/env — within an `actions`
+# batch these must run sequentially (never concurrently) to avoid interleaving the
+# shared python_exec session. Everything else in a batch can run concurrently.
+_SERIAL_BATCH_TOOLS = {"python_exec", "pip_install"}
 
 
 def _orchestrator_turn_note(turns_done: int, max_turns: int) -> str:
@@ -115,8 +129,14 @@ class OrchestratorConfig:
     # Validator gets its own, generous turn budget — it investigates a
     # finding from scratch (fetch, analyze, re-fetch, conclude) and must
     # not be capped at the pentest agent's per-call limit.
-    validator_max_turns: int = 40          # Validator AgentLoop investigation steps
-    validator_claude_max_turns: int = 60   # per-call `claude -p --max-turns`
+    validator_max_turns: int = 40          # Validator AgentLoop investigation steps (OUR loop)
+    # claude's INTERNAL per-call --max-turns for the validator. Was 60 on the mistaken
+    # belief the validator's investigation needs many claude turns — but those are OUR
+    # loop turns (validator_max_turns). claude needs ~one turn to emit one envelope.
+    # Keep it SMALL but not 1: under lock-down no tool is callable, yet a stray native
+    # tool_use attempt at --max-turns 1 instantly trips error_max_turns; a little
+    # headroom lets it fail harmlessly and recover to text (see ClaudeCodeConfig.max_turns).
+    validator_claude_max_turns: int = 4    # per-call `claude -p --max-turns`
     # Per-call `claude -p` wall-clock timeout shared by ALL agent backends — the
     # orchestrator's own turns AND the pentester/validator subagents — so they
     # are always the same value. Heavy iterative exploitation (and the
@@ -143,6 +163,10 @@ class OrchestratorConfig:
     container_image: str = "zero-sandbox:latest"
     host_network: bool = False
     burp_dir: Path | None = None
+    # Root folder the read-only filesystem tools (list_dir/grep/read_file) are
+    # JAILED to — they can never read outside it. Resolved against cwd; mounted at
+    # /zero_files in the sandbox. Default ./zero_files under the engagement cwd.
+    files_root: Path = Path("zero_files")
     container_cpus: float = 4.0
     container_memory: str = "4g"
     remote_all_tools: bool = True
@@ -155,11 +179,33 @@ class OrchestratorConfig:
     #   "full"               — stream the whole thought (legacy behavior)
     #   "off"                — show nothing (rely on the ▸ activity lines)
     thought_display: str = "condensed"
+    # Model for every `claude -p` call (orchestrator + subagents + validators). Default
+    # is Opus with the 1M-context variant for max capability; override with --model
+    # (alias like 'sonnet', or a full id). None ⇒ account default.
+    model: str | None = "claude-opus-4-8[1m]"
+    # Model context-window size used ONLY for the UI's "ctx used/window (%)" display
+    # (per agent). We can't detect the window the `claude -p` model actually uses, so
+    # this is configurable: 200k (Sonnet, default) or 1_000_000 for Opus-1M.
+    context_window: int = 200_000
 
 
 class Orchestrator:
     def __init__(self, cfg: OrchestratorConfig) -> None:
         self.cfg = cfg
+        # Resolve the read-only-fs jail root to an absolute host path (relative to
+        # cwd) and create it, so the mount target exists and the agent has a place
+        # to drop loot. Export it so HOST-side tool instances jail to it too; in the
+        # sandbox the container env (-e ZERO_FILES_ROOT=/zero_files) takes over.
+        self._files_root_abs = (cfg.cwd / cfg.files_root).resolve()
+        self._files_root_abs.mkdir(parents=True, exist_ok=True)
+        os.environ["ZERO_FILES_ROOT"] = str(self._files_root_abs)
+        # Per-agent working memory lives on the HOST under .pentest/memory and is
+        # NEVER mounted into the sandbox (the memory tools are excluded from
+        # remoting), so the orchestrator can read any subagent's memory. Export the
+        # root so the host-side memory tool instances resolve to it.
+        self._memory_root_abs = (cfg.cwd / ".pentest" / "memory").resolve()
+        self._memory_root_abs.mkdir(parents=True, exist_ok=True)
+        os.environ["ZERO_MEMORY_ROOT"] = str(self._memory_root_abs)
         self.audit = AuditLog(cfg.cwd / ".pentest" / "audit.jsonl")
         # Readable reasoning log for the orchestrator + every subagent.
         self.thinking = ThinkingLog(cfg.cwd / ".pentest" / "thinking.log")
@@ -220,6 +266,9 @@ class Orchestrator:
         # (e.g. a validation finishing) keep the rest of the line stable.
         self._status_turn = 0
         self._status_mode = "a"
+        # The top-level agent loop (orchestrator in mode c, pentest agent in mode a),
+        # so _emit_status can report its context-window usage. Set when built.
+        self._active_loop = None
         # Orchestrated mode (M8): the subagent manager, project context, an
         # optional per-subagent backend factory (tests inject scripted backends),
         # and the finalize latch.
@@ -251,7 +300,10 @@ class Orchestrator:
 
             # Same per-call timeout as the subagents (`--llm-timeout`).
             return ClaudeCodeBackend(
-                ClaudeCodeConfig(timeout_seconds=self.cfg.llm_timeout_seconds)
+                ClaudeCodeConfig(
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
+                )
             )
         if self.cfg.backend == "replay":
             from zero.llm.replay import ReplayBackend
@@ -269,7 +321,10 @@ class Orchestrator:
             from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
 
             return ClaudeCodeBackend(
-                ClaudeCodeConfig(timeout_seconds=self.cfg.llm_timeout_seconds)
+                ClaudeCodeConfig(
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
+                )
             )
         return self.backend
 
@@ -285,6 +340,7 @@ class Orchestrator:
                 ClaudeCodeConfig(
                     max_turns=self.cfg.validator_claude_max_turns,
                     timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
                 )
             )
         return self.backend
@@ -304,7 +360,25 @@ class Orchestrator:
             has_project_context=project_ctx is not None,
             use_container=self.cfg.use_container,
             execution_mode=self.cfg.execution_mode,
+            model=self.cfg.model,
+            context_window=self.cfg.context_window,
         )
+
+        # Startup banner: print the EFFECTIVE backend config the running process
+        # actually loaded. A long-running interactive session started before a code
+        # change keeps the old in-memory code (Python doesn't hot-reload), which is
+        # the #1 cause of "subagents can't use tools" after a fix — this makes it
+        # obvious whether the fix is live (model / tool lock-down / context window).
+        be_cfg = getattr(self.backend, "cfg", None)
+        model = getattr(be_cfg, "model", None) or "account-default"
+        locked = "locked-down" if getattr(be_cfg, "lock_down_tools", False) else "default"
+        await self._emit(AgentTextDelta(
+            text=(
+                f"zero · mode {self.cfg.execution_mode} · backend {self.cfg.backend}"
+                f" · model {model} · tools {locked} · ctx-window {self.cfg.context_window:,}\n"
+            )
+        ))
+        await self._emit(AgentTextEnd())
 
         if self.cfg.use_container:
             try:
@@ -324,6 +398,7 @@ class Orchestrator:
                 self._rpc = None
 
         await self._warn_host_exec()
+        await self._announce_files_root()
 
         # Router needs the (possibly remote-swapped) registry + project ctx.
         # The Validator runs on its own backend with a generous turn budget.
@@ -354,10 +429,24 @@ class Orchestrator:
                 await agent_task
             except (asyncio.CancelledError, Exception):
                 pass
+            await self._close_tool_sessions()
             await self._teardown_container()
             self.audit.write("session_end")
             self.audit.close()
             self.thinking.close()
+
+    async def _close_tool_sessions(self) -> None:
+        """Tear down any persistent tool state (python_exec interpreter workers).
+        In `--container` mode the workers live in the sandbox and die with it; in
+        host mode they're our child processes and must be reaped here."""
+        for name in self.registry.names():
+            tool = self.registry.get(name)
+            aclose = getattr(tool, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _warn_host_exec(self) -> None:
         """Surface the host-execution posture at startup. After any container
@@ -392,6 +481,33 @@ class Orchestrator:
             await self._emit(AgentTextDelta(text=ln + "\n"))
         await self._emit(AgentTextEnd())
 
+    async def _announce_files_root(self) -> None:
+        """Tell the operator whether the files-root folder has data the agent can
+        read with list_dir/grep/read_file — so it's obvious at a glance whether the
+        intended folder was actually loaded/mounted (vs. an empty default)."""
+        root = self._files_root_abs
+        try:
+            entries = [p for p in root.rglob("*") if p.is_file()]
+        except OSError:
+            entries = []
+        n = len(entries)
+        mount = "/zero_files" if self.cfg.use_container else str(root)
+        if n:
+            sample = ", ".join(sorted(p.name for p in entries)[:5])
+            more = f", +{n - 5} more" if n > 5 else ""
+            line = (
+                f"📂 files root: {root} → {mount}  —  LOADED: {n} file(s) available to "
+                f"list_dir/grep/read_file ({sample}{more})."
+            )
+        else:
+            line = (
+                f"📂 files root: {root} → {mount}  —  EMPTY: no files loaded. Drop files "
+                f"in {root} (or pass --files-root) for the agent to read."
+            )
+        self.audit.write("files_root_status", root=str(root), mount=mount, file_count=n)
+        await self._emit(AgentTextDelta(text="\n" + line + "\n"))
+        await self._emit(AgentTextEnd())
+
     async def _start_container_and_swap_tools(self) -> None:
         from zero.container.manager import ContainerManager, ContainerSpec
         from zero.container.rpc import ContainerRPC
@@ -401,6 +517,7 @@ class Orchestrator:
             image=self.cfg.container_image,
             cwd=self.cfg.cwd,
             burp_dir_host=self.cfg.burp_dir,
+            files_root=self._files_root_abs,
             cpus=self.cfg.container_cpus,
             memory=self.cfg.container_memory,
             host_network=self.cfg.host_network,
@@ -418,10 +535,16 @@ class Orchestrator:
 
         # Always proxy python_exec (the M4 acceptance test). With
         # --remote-all-tools, proxy the whole registry so every call lands in
-        # the sandbox.
+        # the sandbox — EXCEPT the memory tools, which must run on the host so
+        # they write to .pentest/memory (the memory store is never mounted into
+        # the container; the orchestrator reads it host-side).
         names_to_remote = (
             self.registry.names() if self.cfg.remote_all_tools else ["python_exec"]
         )
+        names_to_remote = [
+            n for n in names_to_remote
+            if n not in ("memory_read", "memory_write", "todo_read", "todo_write")
+        ]
         for name in names_to_remote:
             local = self.registry.get(name)
             self.registry.replace(wrap_with_remote(local, self._rpc))
@@ -517,7 +640,7 @@ class Orchestrator:
                     tool=name, call_id=call_id, ok=False, output=obs,
                 ))
                 return {"ok": False, "output": obs}
-            result: ToolResult = await self._invoke_tool(tool, args)
+            result: ToolResult = await self._invoke_tool(tool, args, session_id="modeb")
             await self._emit(ToolObservation(
                 tool=name, call_id=call_id, ok=result.ok,
                 output=result.output, truncated=result.truncated,
@@ -567,7 +690,9 @@ class Orchestrator:
         prompt = "\n\n".join(prompt_pieces)
 
         try:
-            be = ClaudeCodeBackendModeB()
+            from zero.llm.claude_code import ModeBConfig
+
+            be = ClaudeCodeBackendModeB(ModeBConfig(model=self.cfg.model))
             result_text = await be.run_session(
                 prompt=prompt,
                 bridge_url=bridge.base_url,
@@ -604,6 +729,7 @@ class Orchestrator:
             project_context=project_ctx,
             max_turns=self.cfg.max_turns,
         )
+        self._active_loop = loop  # for the status bar's context-window usage
         if self.cfg.goal:
             loop.add_user_message(self.cfg.goal)
             self.audit.write("user_message", text=self.cfg.goal, source="cli")
@@ -708,7 +834,7 @@ class Orchestrator:
                         "ask_user_answered", question=env.question, answer=answer
                     )
                     continue
-                if isinstance(env, ActionEnvelope):
+                if isinstance(env, (ActionEnvelope, ActionsEnvelope)):
                     await self._do_action(loop, env)
                     continue
         except asyncio.CancelledError:
@@ -747,11 +873,12 @@ class Orchestrator:
         # The FULL thought is always written to thinking.log here, regardless of
         # how much (if any) of it we show in the chat.
         self._log_thinking(agent, loop.turn, env)
-        if isinstance(env, ActionEnvelope) and env.thought:
+        if isinstance(env, (ActionEnvelope, ActionsEnvelope)) and env.thought:
             shown = self._thought_for_chat(env.thought)
             if shown:
-                await self._emit(AgentTextDelta(text=shown))
-                await self._emit(AgentTextEnd())
+                # A concise reasoning summary for this step (Codex/Claude-Code
+                # style). The full thought is always in thinking.log.
+                await self._emit(ReasoningSummary(agent=agent, turn=loop.turn, text=shown))
         await self._emit_status(turn=loop.turn, mode=mode)
         self.audit.write(
             "agent_step",
@@ -773,15 +900,30 @@ class Orchestrator:
             return ""
         if mode == "full":
             return thought
-        return short_reason(thought)  # "condensed" (default): first sentence
+        # "condensed" (default): the agent's reasoning headline. Take the first
+        # line (agents are told to lead `thought` with a short headline), then
+        # short_reason trims it to one clean sentence — so it works whether the
+        # model separates the headline with a newline or a period.
+        first_line = thought.strip().splitlines()[0] if thought.strip() else ""
+        return short_reason(first_line)
 
-    async def _do_action(self, loop, env: ActionEnvelope) -> None:
+    async def _handle_one_agent_call(self, loop, call: ActionEnvelope) -> None:
         # finding_submit is orchestrator-intercepted (M6).
-        if is_finding_submit(env.tool):
-            await self._handle_finding_submit(loop, env, uuid.uuid4().hex[:8])
+        if is_finding_submit(call.tool):
+            await self._handle_finding_submit(loop, call, uuid.uuid4().hex[:8])
             return
-        result = await self._run_one_tool(env.tool, env.args, reason=env.thought)
-        loop.add_observation(env.tool, result.ok, result.output)
+        result = await self._run_one_tool(
+            call.tool, call.args, reason=call.thought, session_id="agent"
+        )
+        loop.add_observation(call.tool, result.ok, result.output)
+
+    async def _do_action(self, loop, env) -> None:
+        if isinstance(env, ActionsEnvelope):
+            # finding_submit mutates shared state — run the batch sequentially.
+            for call in env.calls:
+                await self._handle_one_agent_call(loop, call)
+            return
+        await self._handle_one_agent_call(loop, env)
 
     def _log_thinking(self, agent: str, turn: int, env: Any) -> None:
         """Append one readable reasoning entry for an agent step (orchestrator
@@ -794,6 +936,9 @@ class Orchestrator:
             if len(summary) > 200:
                 summary = summary[:200] + "…"
             action = f"action: {env.tool}({summary})"
+        elif isinstance(env, ActionsEnvelope):
+            thought = env.thought
+            action = "actions: " + ", ".join(c.tool for c in env.calls)
         elif isinstance(env, AskUserEnvelope):
             action = f"ask_user: {env.question}"
         elif isinstance(env, FinalEnvelope):
@@ -805,13 +950,15 @@ class Orchestrator:
             pass
 
     async def _run_one_tool(
-        self, tool_name: str, args: dict, *, label: str = "", reason: str = ""
+        self, tool_name: str, args: dict, *, label: str = "", reason: str = "",
+        session_id: str = "orchestrator",
     ) -> ToolResult:
         """Propose → gate → invoke → observe one registry tool. Shared by the
         pentest loop (mode a), the orchestrator's own recon (mode c), and every
         subagent's tool calls. `label` attributes the call to a subagent in the
         UI + approval prompt (empty for the top-level agent — preserving mode-a
-        output byte-for-byte)."""
+        output byte-for-byte). `session_id` isolates the caller's persistent
+        python_exec interpreter (one per actor)."""
         call_id = uuid.uuid4().hex[:8]
         if tool_name not in self.registry:
             obs = f"unknown tool: {tool_name!r}"
@@ -846,13 +993,17 @@ class Orchestrator:
             await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label))
             return ToolResult(ok=False, output=obs)
 
-        result = await self._invoke_tool(tool, args)
+        result = await self._invoke_tool(tool, args, session_id=session_id)
         await self._emit(
             ToolObservation(
                 tool=tool_name, call_id=call_id,
                 ok=result.ok, output=result.output, truncated=result.truncated, label=label,
             )
         )
+        # Surface a plan update as a checklist (Claude-Code TodoWrite). Labelled
+        # (subagent) todos are routed out of the main chat by the UI.
+        if tool_name == "todo_write" and result.ok:
+            await self._emit(TodoUpdate(items=list(args.get("items", [])), label=label))
         self.audit.write(
             "tool_observation", tool=tool_name, call_id=call_id,
             ok=result.ok, output=result.output[:4000], truncated=result.truncated, label=label,
@@ -886,7 +1037,10 @@ class Orchestrator:
                 "risk_level": t.risk_level.value,
                 "schema": t.json_schema(),
             }
-            for t in dispatch_tools()
+            # dispatch tools + the orchestrator-only memory inspection tools
+            # (read_subagent_memory / list_memories). Both are intercepted in
+            # _do_orchestrator_action and never run() or remoted.
+            for t in dispatch_tools() + inspect_tools()
         ]
         loop = build_orchestrator_loop(
             backend=self.backend,
@@ -894,7 +1048,15 @@ class Orchestrator:
             project_context=project_ctx,
             max_turns=self.cfg.max_turns,
         )
+        self._active_loop = loop  # for the status bar's context-window usage
         base_system_prompt = loop.system_prompt
+        # Resume from the orchestrator's own memory if a prior turn/session saved
+        # one (its session_id is the stable "orchestrator", so this persists across
+        # finalize→idle→next prompt). Seed as a user message, not the system prompt,
+        # which is rewritten every turn (and to keep the prompt cacheable).
+        own_memory = read_memory("orchestrator")
+        if own_memory:
+            loop.add_user_message(f"## Your memory from earlier\n\n{own_memory}")
         if self.cfg.goal:
             loop.add_user_message(self.cfg.goal)
             self.audit.write("user_message", text=self.cfg.goal, source="cli")
@@ -1024,7 +1186,7 @@ class Orchestrator:
                     loop.add_ask_user_answer(answer)
                     self.audit.write("ask_user_answered", question=env.question, answer=answer)
                     continue
-                if isinstance(env, ActionEnvelope):
+                if isinstance(env, (ActionEnvelope, ActionsEnvelope)):
                     await self._do_orchestrator_action(loop, env)
                     if self._go_idle:
                         # finalize produced a report; wait for the next prompt
@@ -1040,15 +1202,58 @@ class Orchestrator:
             if self.subagents is not None:
                 await self.subagents.cancel_all()
 
-    async def _do_orchestrator_action(self, loop, env: ActionEnvelope) -> None:
+    async def _do_orchestrator_action(self, loop, env) -> None:
+        if isinstance(env, ActionsEnvelope):
+            # Run the batch through the concurrent executor so a slow recon call does
+            # NOT block the dispatches behind it. (Regression seen on Guild: a
+            # python_exec recursive glob batched ahead of 3 dispatch_pentester calls
+            # held them up ~10 min until the RPC died — pentesters "failed to spin".)
+            # python_exec/pip_install are serialized by the executor; dispatch/inspect
+            # only mutate shared bookkeeping synchronously (no await between read and
+            # write), so concurrent execution is safe.
+            await self._run_action_batch(
+                env.calls, lambda c: self._handle_one_orch_call(loop, c)
+            )
+            return
+        await self._handle_one_orch_call(loop, env)
+
+    async def _handle_one_orch_call(self, loop, env: ActionEnvelope) -> None:
         if is_dispatch_tool(env.tool):
             obs = await self._handle_dispatch(loop, env)
             if obs is not None:
                 loop.add_observation(env.tool, True, obs)
             return
+        if is_inspect_tool(env.tool):
+            obs = await self._handle_inspect(env)
+            loop.add_observation(env.tool, True, obs)
+            return
         # A recon tool the orchestrator runs directly.
         result = await self._run_one_tool(env.tool, env.args, reason=env.thought)
         loop.add_observation(env.tool, result.ok, result.output)
+
+    async def _handle_inspect(self, env: ActionEnvelope) -> str:
+        """Orchestrator-only memory inspection. Reads any subagent's memory file
+        (host-side) — handled here, like the dispatch tools, so it never gets
+        remoted into the sandbox."""
+        if env.tool == "list_memories":
+            root = memory_root()
+            ids = sorted(p.stem for p in root.glob("*.md")) if root.exists() else []
+            await self._emit(ActivityLine(text=f"  ▸ listing memories ({len(ids)})"))
+            self.audit.write("list_memories", ids=ids)
+            if not ids:
+                return "no agent memories saved yet."
+            return "agent memories on record: " + ", ".join(ids)
+        # read_subagent_memory
+        try:
+            a = ReadSubagentMemoryArgs(**env.args)
+        except Exception as e:  # noqa: BLE001
+            return f"bad read_subagent_memory args: {e}"
+        body = read_memory(a.agent_id)
+        await self._emit(ActivityLine(text=f"  ▸ reading memory of {a.agent_id}"))
+        self.audit.write("read_subagent_memory", agent_id=a.agent_id, found=bool(body))
+        if not body:
+            return f"no memory on record for {a.agent_id!r} (it may not have saved any)."
+        return f"=== memory of {a.agent_id} ===\n{body}"
 
     async def _handle_dispatch(self, loop, env: ActionEnvelope) -> str | None:
         """Handle an orchestrator dispatch tool. Returns the observation string
@@ -1218,6 +1423,44 @@ class Orchestrator:
 
     # ------------------------------------------------------------ subagent runners
 
+    def _autowrite_memory(self, session_id: str, content: str) -> None:
+        """Harness-side safety net: persist an actor's end-state to its memory file
+        so `read_subagent_memory` always works — even when the model never called
+        `memory_write` (in practice it rarely does). MERGES rather than clobbers: if
+        the agent kept its own running memory, we append the end-state below it so
+        nothing is lost. Best-effort; never crash a run."""
+        try:
+            existing = read_memory(session_id).strip()
+            if existing and content not in existing:
+                content = f"{existing}\n\n---\n{content}"
+            write_memory(session_id, content)
+        except Exception as e:  # noqa: BLE001 — memory persistence must not break a run
+            self.audit.write("memory_autowrite_failed", session_id=session_id, error=str(e))
+
+    async def _run_action_batch(self, calls, run_one, *, concurrent: bool = True):
+        """Execute an `actions` batch in ONE turn. Independent calls run concurrently
+        (one LLM round-trip for the whole batch — the win); calls that share the
+        actor's stateful interpreter (`_SERIAL_BATCH_TOOLS`) run sequentially in
+        listed order. `run_one(call)` is the per-call handler; results are returned in
+        call order. Set `concurrent=False` to force fully-sequential execution (used by
+        the orchestrator, whose intercepted dispatch/inspect tools mutate shared state)."""
+        results: list[Any] = [None] * len(calls)
+        if not concurrent:
+            for i, c in enumerate(calls):
+                results[i] = await run_one(c)
+            return results
+
+        async def _do(i: int) -> None:
+            results[i] = await run_one(calls[i])
+
+        conc = [i for i, c in enumerate(calls) if c.tool not in _SERIAL_BATCH_TOOLS]
+        serial = [i for i, c in enumerate(calls) if c.tool in _SERIAL_BATCH_TOOLS]
+        if conc:
+            await asyncio.gather(*(_do(i) for i in conc))
+        for i in serial:  # after the concurrent ones, in listed order
+            await _do(i)
+        return results
+
     async def _run_subagent(self, rec) -> SubagentResult:
         """Injected into SubagentManager: build + drive one subagent loop."""
         if rec.kind == "validator":
@@ -1253,7 +1496,13 @@ class Orchestrator:
         if rec.context:
             brief += f"CONTEXT from the orchestrator (creds/tokens/prior results to use): {rec.context}\n"
         brief += (
-            "Investigate ONLY this idea against this target. Do not submit findings yourself; "
+            "Investigate ONLY this idea against this target — it is ONE link of a larger "
+            "chain that the orchestrator is sequencing, NOT the whole kill chain. You have a "
+            "BOUNDED turn budget, so go deep on this single step and produce its one concrete "
+            "artifact (a leaked file, a recovered/forged token, a working payload, a confirmed "
+            "injection); do NOT try to carry the attack end-to-end — report your artifact in "
+            "`discovered` and the orchestrator will dispatch the next step seeded with it. "
+            "Do not submit findings yourself; "
             "when done, reply with a `final` whose `answer` is a JSON object: "
             '{"status": "EXPLOITED" | "NO_FINDING", "summary": "...", '
             '"candidate_findings": [{"title":..., "summary":..., "endpoint":..., "method":..., '
@@ -1272,12 +1521,25 @@ class Orchestrator:
             "the orchestrator improve a near-miss instead of blindly re-dispatching the same idea.\n"
             f"The `summary` budget is large (up to {SUMMARY_MAX_CHARS} characters) — use it: paste "
             "full promising payloads, raw request/response snippets, or a working/partial exploit "
-            "script verbatim rather than truncating them."
+            "script verbatim rather than truncating them.\n"
+            "Don't tunnel-vision: if an approach isn't working after a few attempts, switch "
+            "technique rather than repeating variations of the same failing step; if nothing pans "
+            "out, conclude NO_FINDING with what you tried and the most promising lead."
         )
         loop.add_user_message(brief)
+        # If this actor saved memory earlier this run, seed it so it resumes
+        # instead of starting blank (and so a crashed/re-dispatched id continues).
+        prior_memory = read_memory(rec.id)
+        if prior_memory:
+            loop.add_user_message(f"## Your memory from earlier this run\n\n{prior_memory}")
         label = f"pentester[{rec.id} {rec.target}]"
         start = time.monotonic()
         deadline = start + self.cfg.subagent_deadline_seconds
+        # A single backend error (e.g. claude `error_max_turns` from a momentary
+        # native-tool-use drift, or a transient `claude -p` failure) must NOT kill the
+        # whole subagent and discard its work — like the orchestrator, feed the error
+        # back and retry the turn, giving up only after several consecutive failures.
+        consecutive_errors = 0
         while True:
             # Wall-clock backstop, checked between turns: the per-call
             # `--subagent-timeout` only bounds ONE `claude -p` call, so a
@@ -1289,6 +1551,12 @@ class Orchestrator:
                     "subagent_deadline", subagent_id=rec.id, target=rec.target,
                     turns=loop.turn, elapsed=round(elapsed),
                 )
+                self._autowrite_memory(
+                    rec.id,
+                    f"# pentester {rec.id} — {rec.target}\nidea: {rec.idea}\n\n"
+                    f"STATUS: ERROR (wall-clock deadline {self.cfg.subagent_deadline_seconds}s "
+                    f"after {loop.turn} turn(s), no conclusion).",
+                )
                 return SubagentResult(
                     subagent_id=rec.id, kind="pentester", target=rec.target, idea=rec.idea,
                     status="ERROR",
@@ -1298,7 +1566,42 @@ class Orchestrator:
                     ),
                     turns=loop.turn, duration=elapsed,
                 )
-            step = await loop.step()
+            try:
+                step = await loop.step()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — a backend glitch must not kill the subagent
+                consecutive_errors += 1
+                self.audit.write(
+                    "subagent_turn_error", subagent_id=rec.id,
+                    error=f"{type(e).__name__}: {e}", consecutive=consecutive_errors,
+                )
+                if consecutive_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    elapsed = time.monotonic() - start
+                    self._autowrite_memory(
+                        rec.id,
+                        f"# pentester {rec.id} — {rec.target}\nidea: {rec.idea}\n\n"
+                        f"STATUS: ERROR ({consecutive_errors} consecutive backend errors; "
+                        f"last: {type(e).__name__}: {e}).",
+                    )
+                    return SubagentResult(
+                        subagent_id=rec.id, kind="pentester", target=rec.target, idea=rec.idea,
+                        status="ERROR",
+                        summary=(
+                            f"stopped after {consecutive_errors} consecutive backend errors "
+                            f"(last: {type(e).__name__}: {e})."
+                        ),
+                        turns=loop.turn, duration=elapsed,
+                    )
+                # Feed the error back and retry the turn (don't lose progress).
+                loop.add_observation(
+                    "(system)", False,
+                    f"your previous turn failed: {e}. Reply with EXACTLY ONE JSON envelope "
+                    "AS TEXT (action / ask_user / final) — do NOT make a native tool call; "
+                    "name the tool inside the envelope and the runtime runs it.",
+                )
+                continue
+            consecutive_errors = 0
             env = step.envelope
             self._log_thinking(f"pentester {rec.id} [{rec.target}]", loop.turn, env)
             await self._emit(
@@ -1306,6 +1609,19 @@ class Orchestrator:
             )
             if isinstance(env, FinalEnvelope):
                 parsed = parse_pentester_result(env.answer)
+                # Safety net: persist the authoritative end-state to this subagent's
+                # memory so the orchestrator can recover it via read_subagent_memory
+                # even though the model itself almost never calls memory_write.
+                disc = parsed.get("discovered") or []
+                cands = parsed.get("candidate_findings") or []
+                self._autowrite_memory(
+                    rec.id,
+                    f"# pentester {rec.id} — {rec.target}\nidea: {rec.idea}\n\n"
+                    f"STATUS: {parsed['status']}\n\n## summary\n{parsed['summary']}\n\n"
+                    "## discovered\n" + ("\n".join(f"- {d}" for d in disc) or "(none)") + "\n\n"
+                    "## candidate findings\n"
+                    + ("\n".join(f"- {c.get('title', '?')}" for c in cands) or "(none)"),
+                )
                 return SubagentResult(
                     subagent_id=rec.id, kind="pentester", target=rec.target, idea=rec.idea,
                     status=parsed["status"], summary=parsed["summary"],
@@ -1317,15 +1633,37 @@ class Orchestrator:
                 loop.add_ask_user_answer(answer)
                 continue
             if isinstance(env, ActionEnvelope):
-                result = await self._run_one_tool(env.tool, env.args, label=label, reason=env.thought)
+                result = await self._run_one_tool(
+                    env.tool, env.args, label=label, reason=env.thought, session_id=rec.id
+                )
                 loop.add_observation(env.tool, result.ok, result.output)
+                continue
+            if isinstance(env, ActionsEnvelope):
+                async def _one(c, _env=env):
+                    return await self._run_one_tool(
+                        c.tool, c.args, label=label, reason=c.thought or _env.thought,
+                        session_id=rec.id,
+                    )
+                results = await self._run_action_batch(env.calls, _one)
+                for c, r in zip(env.calls, results):
+                    loop.add_observation(c.tool, r.ok, r.output)
                 continue
 
     async def _run_validator_subagent(self, rec) -> SubagentResult:
         start = time.monotonic()
         finding = rec.finding
+        # Key memory/python_exec off the clean actor id (rec.id), not the verbose
+        # UI label, so the orchestrator can read it via read_subagent_memory(rec.id).
+        prior_memory = read_memory(rec.id)
+        seed = (
+            f"## Your memory from earlier this run\n\n{prior_memory}" if prior_memory else None
+        )
         verdict, ids = await self._run_validation(
-            finding, dedup_hash(finding), label=f"validator[{rec.id} {rec.target}]"
+            finding, dedup_hash(finding),
+            label=f"validator[{rec.id} {rec.target}]",
+            session_id=rec.id,
+            seed_memory=seed,
+            record=rec,
         )
         return SubagentResult(
             subagent_id=rec.id, kind="validator", target=rec.target, idea=rec.idea,
@@ -1460,11 +1798,22 @@ class Orchestrator:
         task.add_done_callback(self._validation_tasks.discard)
 
     async def _run_validation(
-        self, finding: FindingModel, dedup_h: str, *, label: str = "validator"
+        self,
+        finding: FindingModel,
+        dedup_h: str,
+        *,
+        label: str = "validator",
+        session_id: str = "validator",
+        seed_memory: str | None = None,
+        record: Any = None,
     ) -> tuple[str, list[str]]:
         """Drive the Validator and surface the verdict to the UI. Returns
         (verdict, finding_ids). Used both as a mode-a background task and as the
-        orchestrated validator subagent runner."""
+        orchestrated validator subagent runner.
+
+        `session_id` keys this validator's isolated python_exec + memory (a clean
+        actor id like its subagent `rec.id`, distinct from the verbose UI `label`);
+        `seed_memory` is its own prior memory injected at the start of its loop."""
         assert self.router is not None
 
         async def action_handler(action_env: ActionEnvelope) -> str:
@@ -1495,7 +1844,9 @@ class Orchestrator:
             )
             if not allowed:
                 return "user denied tool call"
-            result = await self._invoke_tool(tool, action_env.args)
+            result = await self._invoke_tool(
+                tool, action_env.args, session_id=session_id
+            )
             await self._emit(
                 ToolObservation(
                     tool=action_env.tool, call_id=sub_call_id,
@@ -1510,6 +1861,11 @@ class Orchestrator:
         validator_deadline = time.monotonic() + self.cfg.subagent_deadline_seconds
 
         async def driver(sub_loop):
+            # Expose the validator's live loop on its record so the running view can
+            # show its context-window usage (pentesters set rec.loop directly; the
+            # validator loop is built inside the router, so we capture it here).
+            if record is not None:
+                record.loop = sub_loop
             return await default_validator_driver(
                 sub_loop,
                 action_handler=action_handler,
@@ -1519,7 +1875,9 @@ class Orchestrator:
             )
 
         try:
-            res = await self.router.handle_finding_submit(finding, drive_validator=driver)
+            res = await self.router.handle_finding_submit(
+                finding, drive_validator=driver, extra_user_message=seed_memory
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — never let a background task crash the session
@@ -1563,6 +1921,15 @@ class Orchestrator:
             v = res.record.validation
             verdict = v.verdict if v else "pending"
             finding_ids = [res.record.id]
+            # Safety net: persist this validator's end-state to its memory (keyed by
+            # session_id, == rec.id for the orchestrated subagent) so the orchestrator
+            # can recover it even when the model never called memory_write.
+            self._autowrite_memory(
+                session_id,
+                f"# validator — {finding.title}\n\nVERDICT: {verdict}\n\n"
+                f"## rationale\n{(v.rationale if v else '')}\n\n"
+                f"## reproducer\n{(v.reproducer if v else '')}",
+            )
             # Resolve the on-disk path so the UI card can show it.
             file_path = self._find_record_path(res.record.id, verdict)
             await self._emit(
@@ -1616,9 +1983,17 @@ class Orchestrator:
         candidate = p / f"{finding_id}.md"
         return str(candidate)
 
-    async def _invoke_tool(self, tool: Tool, args: dict):
+    async def _invoke_tool(self, tool: Tool, args: dict, *, session_id: str = "orchestrator"):
         from zero.tools.base import ToolResult
 
+        # python_exec keeps a PERSISTENT interpreter per session, and the memory
+        # tools key their file off the actor; inject the caller's session id
+        # (infra, not LLM-set) so each actor — orchestrator, each pentester/
+        # validator subagent — gets an isolated session and its OWN memory file.
+        if tool.name in (
+            "python_exec", "memory_read", "memory_write", "todo_read", "todo_write",
+        ):
+            args = {**args, "session_id": session_id}
         try:
             parsed = tool.Args(**args)
         except ValidationError as e:
@@ -1712,6 +2087,9 @@ class Orchestrator:
                 validations_rejected=self._validations_rejected,
                 running_pentesters=rp,
                 running_validators=rv,
+                # The top-level agent's (orchestrator / mode-a) context-window usage.
+                context_tokens=getattr(self._active_loop, "context_tokens", 0),
+                context_window=self.cfg.context_window,
             )
         )
 

@@ -61,7 +61,7 @@ class DispatchValidatorArgs(BaseModel):
     affected_credentials: list[str] = Field(default_factory=list)
     notes: str = ""
     payload_shape: str = ""
-    source_subagent: str = Field(default="", description="the pentester id that found it, e.g. '#3'")
+    source_subagent: str = Field(default="", description="the pentester id that found it, e.g. 'gino_3'")
 
     def to_finding(self) -> Finding:
         data = self.model_dump()
@@ -131,6 +131,43 @@ class FinalizeTool(_OrchestratorTool):
     Args = FinalizeArgs
 
 
+# --- read_subagent_memory / list_memories ------------------------------------
+#
+# Orchestrator-only memory INSPECTION tools. Subagents maintain their own memory
+# via the agent-facing `memory_read` / `memory_write` tools (in default_registry);
+# these let the ORCHESTRATOR read ANY subagent's memory — including one that is
+# still running, finished, or crashed — to recover its progress. Like the dispatch
+# tools they are intercepted (`is_inspect_tool` + `_do_orchestrator_action`) and
+# never `run()`. They are kept OUT of `dispatch_tools()` on purpose (that list has
+# a fixed contract its test asserts on); the orchestrator appends `inspect_tools()`
+# alongside it.
+
+
+class ReadSubagentMemoryArgs(BaseModel):
+    agent_id: str = Field(description="the subagent id whose memory to read, e.g. 'gino_2'")
+
+
+class ReadSubagentMemoryTool(_OrchestratorTool):
+    name = "read_subagent_memory"
+    description = (
+        "Read a subagent's working memory by id (e.g. 'gino_2'). Use it to recover what"
+        " a subagent was doing when it finished, ran out of turns, or crashed — its"
+        " memory persists even when its final summary doesn't. Use list_memories to see"
+        " which ids exist."
+    )
+    Args = ReadSubagentMemoryArgs
+
+
+class ListMemoriesArgs(BaseModel):
+    pass
+
+
+class ListMemoriesTool(_OrchestratorTool):
+    name = "list_memories"
+    description = "List the agent ids that currently have a saved memory file."
+    Args = ListMemoriesArgs
+
+
 # --- helpers -----------------------------------------------------------------
 
 
@@ -160,6 +197,21 @@ def dispatch_tools() -> list[Tool]:
         ListSubagentsTool(),
         FinalizeTool(),
     ]
+
+
+INSPECT_TOOL_NAMES: frozenset[str] = frozenset(
+    {ReadSubagentMemoryTool.name, ListMemoriesTool.name}
+)
+
+
+def is_inspect_tool(tool_name: str) -> bool:
+    return tool_name in INSPECT_TOOL_NAMES
+
+
+def inspect_tools() -> list[Tool]:
+    """Orchestrator-only memory inspection tools, instantiated. Appended to the
+    orchestrator catalog next to `dispatch_tools()`; intercepted, never `run()`."""
+    return [ReadSubagentMemoryTool(), ListMemoriesTool()]
 
 
 def validator_args_to_finding(raw_args: dict[str, Any]) -> Finding:

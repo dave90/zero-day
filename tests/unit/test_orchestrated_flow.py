@@ -26,8 +26,10 @@ from zero.ui.events import (
     Finding as FindingEvent,
     SessionEnd,
     SessionSummary,
+    Status,
     SubagentFinished,
     SubagentStarted,
+    TodoUpdate,
 )
 
 
@@ -64,6 +66,14 @@ _FINDING = {
 
 def _action(tool: str, args: dict, thought: str = "t") -> str:
     return json.dumps({"type": "action", "tool": tool, "args": args, "thought": thought})
+
+
+def _actions(calls: list[tuple[str, dict]], thought: str = "batch") -> str:
+    return json.dumps({
+        "type": "actions",
+        "thought": thought,
+        "calls": [{"tool": t, "args": a} for t, a in calls],
+    })
 
 
 def _pentester_final() -> str:
@@ -429,7 +439,9 @@ async def test_pentester_uses_its_own_turn_budget_not_orchestrators(tmp_path: Pa
     result = await asyncio.wait_for(orch._run_pentester_subagent(rec), timeout=5)
 
     assert result.turns == 2          # stopped at pentester_max_turns, not 99
-    assert backend.calls == 2
+    # 2 work turns + 1 final "handoff" call at the cap (so a pentester that runs
+    # out of turns still hands its findings back instead of a bare cap message).
+    assert backend.calls == 3
 
 
 async def test_pentester_stops_at_wall_clock_deadline(tmp_path: Path, monkeypatch):
@@ -608,6 +620,272 @@ async def test_subagent_survives_a_crashing_tool_call(tmp_path: Path, monkeypatc
     # Survived the crashing tool call → reached its own NO_FINDING final,
     # NOT killed with status ERROR.
     assert finished[0].status == "NO_FINDING"
+
+
+async def test_subagent_memory_written_and_orchestrator_reads_it(tmp_path: Path, monkeypatch):
+    """Per-agent memory: a pentester and a validator each write their working
+    memory (keyed by their OWN actor id), and the orchestrator reads both back via
+    read_subagent_memory. Locks in (a) host-side memory tools, (b) per-actor
+    session_id injection, and (c) the validator keying on rec.id, not the UI label."""
+    from zero.tools._memroot import path_for
+
+    monkeypatch.chdir(tmp_path)
+    # Deterministic subagent ids: pentester=gino_1, validator=gino_2.
+    monkeypatch.setattr("zero.orchestrator.subagents.random.choice", lambda seq: "gino")
+
+    def pentester_script():
+        return ScriptedBackend(
+            [
+                _action("memory_write", {"content": "PENTEST MEMO: admin token=abc123"}),
+                _pentester_final(),
+            ]
+        )
+
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("dispatch_pentester", {"attack_idea": "XSS in uid", "target": "/snippets"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("dispatch_validator", {**_FINDING, "source_subagent": "gino_1"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("read_subagent_memory", {"agent_id": "gino_1"}),
+            _action("read_subagent_memory", {"agent_id": "gino_2"}),
+            _action("list_memories", {}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    validator_backend = ScriptedBackend(
+        [
+            _action("memory_write", {"content": "VALIDATOR MEMO: reproduced the reflection"}),
+            _validator_final("confirmed"),
+        ]
+    )
+    cfg = OrchestratorConfig(
+        cwd=tmp_path, goal="find a web bug", backend="echo", execution_mode="c", yolo=True,
+    )
+    orch = Orchestrator(cfg)
+    orch.backend = orchestrator_backend
+    orch._subagent_backend_factory = lambda rec: pentester_script()
+
+    capture: list = []
+    await _run_orchestrated(orch, validator_backend, capture)
+
+    # Each actor wrote to ITS OWN file (validator keyed by rec.id, not the label).
+    assert "PENTEST MEMO: admin token=abc123" in path_for("gino_1").read_text(encoding="utf-8")
+    assert "VALIDATOR MEMO: reproduced the reflection" in path_for("gino_2").read_text(encoding="utf-8")
+
+    # The orchestrator's reads were handled (intercepted, host-side) and it finalized.
+    kinds = [r["kind"] for r in read_audit(tmp_path / ".pentest" / "audit.jsonl")]
+    reads = [r for r in read_audit(tmp_path / ".pentest" / "audit.jsonl")
+             if r["kind"] == "read_subagent_memory"]
+    assert {r["agent_id"] for r in reads} == {"gino_1", "gino_2"}
+    assert all(r["found"] for r in reads)
+    assert "list_memories" in kinds
+    assert "finalize" in kinds
+    assert any(isinstance(e, SessionSummary) for e in capture)
+
+
+async def test_harness_autowrites_memory_when_model_never_does(tmp_path: Path, monkeypatch):
+    """Phase A safety net: even though the scripted pentester + validator NEVER call
+    memory_write, the harness persists each one's end-state to its memory file so the
+    orchestrator can recover it. (Regression: in real runs agents read memory but
+    write 0×, leaving files empty.)"""
+    from zero.tools._memroot import path_for
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("zero.orchestrator.subagents.random.choice", lambda seq: "gino")
+
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("dispatch_pentester", {"attack_idea": "XSS in uid", "target": "/snippets"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("dispatch_validator", {**_FINDING, "source_subagent": "gino_1"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    validator_backend = ScriptedBackend([_validator_final("confirmed")])
+    # Pentester just finals (EXPLOITED) — no memory_write anywhere.
+    orch = _make_orch(tmp_path, orchestrator_backend, _pentester_final)
+
+    capture: list = []
+    await _run_orchestrated(orch, validator_backend, capture)
+
+    pent_mem = path_for("gino_1").read_text(encoding="utf-8")
+    assert "STATUS: EXPLOITED" in pent_mem
+    assert "uid reflects" in pent_mem            # the pentester's summary landed
+    val_mem = path_for("gino_2").read_text(encoding="utf-8")
+    assert "VERDICT: confirmed" in val_mem       # validator end-state persisted too
+
+
+async def test_pentester_actions_batch_runs_all_calls_in_one_turn(tmp_path: Path, monkeypatch):
+    """Phase B: a subagent emits ONE `actions` envelope with two independent tool
+    calls; both run and BOTH observations are appended in a single turn (one LLM
+    round-trip), then it finals."""
+    monkeypatch.chdir(tmp_path)
+
+    seen: list[str] = []
+
+    class _CountingBackend(LLMBackend):
+        def __init__(self) -> None:
+            self.calls = 0
+            self._script = [
+                _actions([("list_dir", {"path": "."}), ("grep", {"pattern": "x", "path": "."})]),
+                _pentester_noop_final(),
+            ]
+
+        async def run(self, system_prompt, messages, tools):
+            # Record observations the loop fed back so we can assert both landed.
+            for m in messages:
+                if getattr(m, "role", "") == "observation":
+                    seen.append(m.content)
+            self.calls += 1
+            return LLMResponse(text=self._script[self.calls - 1])
+
+    backend = _CountingBackend()
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
+    orch = Orchestrator(cfg)
+    orch._subagent_backend_factory = lambda rec: backend
+
+    rec = SubagentRecord(id="#1", kind="pentester", target="/t", idea="i")
+    result = await asyncio.wait_for(orch._run_pentester_subagent(rec), timeout=5)
+
+    assert result.status == "NO_FINDING"
+    assert backend.calls == 2  # batch turn + final turn — NOT 3 (the two calls shared one turn)
+    # On the 2nd LLM call the loop had fed back BOTH observations from the batch.
+    blob = "\n".join(seen)
+    assert "list_dir" in blob and "grep" in blob
+
+
+async def test_orchestrator_todo_write_emits_todo_update(tmp_path: Path, monkeypatch):
+    """Phase C: when the orchestrator calls todo_write, a TodoUpdate event reaches the
+    UI (checklist) and the plan is persisted host-side."""
+    from zero.tools.todo import read_todo_items
+
+    monkeypatch.chdir(tmp_path)
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("todo_write", {"items": [
+                {"step": "recon", "status": "in_progress"},
+                {"step": "exploit", "status": "pending"},
+            ]}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    orch = _make_orch(tmp_path, orchestrator_backend, _pentester_noop_final)
+
+    capture: list = []
+    await _run_orchestrated(orch, ScriptedBackend([]), capture)
+
+    todos = [e for e in capture if isinstance(e, TodoUpdate)]
+    assert todos and any("recon" in i["step"] for i in todos[0].items)
+    assert todos[0].label == ""  # orchestrator's plan → shown in chat
+    # Persisted under the orchestrator's session.
+    assert [i["step"] for i in read_todo_items("orchestrator")] == ["recon", "exploit"]
+
+
+async def test_orchestrator_batch_dispatches_all_pentesters(tmp_path: Path, monkeypatch):
+    """Phase B regression (Guild 'pentesters failed to spin'): several
+    dispatch_pentester calls in ONE actions batch must all spawn — a batch runs
+    through the concurrent executor, so they aren't serialized behind each other (or
+    behind a slow recon call)."""
+    monkeypatch.chdir(tmp_path)
+    orchestrator_backend = ScriptedBackend(
+        [
+            _actions([
+                ("dispatch_pentester", {"attack_idea": "reset", "target": "/forgetpassword"}),
+                ("dispatch_pentester", {"attack_idea": "sqli", "target": "/login"}),
+                ("dispatch_pentester", {"attack_idea": "cookie", "target": "/signup"}),
+            ]),
+            _action("await_subagents", {"which": "all"}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    orch = _make_orch(tmp_path, orchestrator_backend, _pentester_noop_final)
+
+    capture: list = []
+    await _run_orchestrated(orch, ScriptedBackend([]), capture)
+
+    kinds = [r["kind"] for r in read_audit(tmp_path / ".pentest" / "audit.jsonl")]
+    assert kinds.count("dispatch_pentester") == 3            # all three spawned
+    assert len(orch.subagents.attempts) == 3
+    assert all(a.status != "running" for a in orch.subagents.attempts)
+
+
+async def test_status_carries_context_window(tmp_path: Path, monkeypatch):
+    """The orchestrator's Status events carry the context-window size (and the
+    active loop's token usage) for the UI's per-agent ctx display."""
+    monkeypatch.chdir(tmp_path)
+    orchestrator_backend = ScriptedBackend([_action("finalize", {"summary": "done"})])
+    cfg = OrchestratorConfig(
+        cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True,
+        context_window=1_000_000,
+    )
+    orch = Orchestrator(cfg)
+    orch.backend = orchestrator_backend
+
+    capture: list = []
+    await _run_orchestrated(orch, ScriptedBackend([]), capture)
+
+    statuses = [e for e in capture if isinstance(e, Status)]
+    assert statuses, "expected at least one Status event"
+    assert all(s.context_window == 1_000_000 for s in statuses)  # wired from cfg
+
+
+async def test_pentester_recovers_from_a_backend_turn_error(tmp_path: Path, monkeypatch):
+    """A single backend error (e.g. claude error_max_turns) must NOT kill the
+    subagent — it feeds the error back and retries the turn, then finishes normally."""
+    monkeypatch.chdir(tmp_path)
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
+    orch = Orchestrator(cfg)
+    # First step raises (drift→error_max_turns); the retry returns a clean final.
+    orch._subagent_backend_factory = lambda rec: ScriptedBackend(
+        [RuntimeError("claude -p exit 1: error_max_turns (stop=tool_use, num_turns=4)"),
+         _pentester_noop_final()]
+    )
+    rec = SubagentRecord(id="#1", kind="pentester", target="/t", idea="i")
+    result = await asyncio.wait_for(orch._run_pentester_subagent(rec), timeout=5)
+    assert result.status == "NO_FINDING"   # recovered, not ERROR
+    assert result.turns >= 2               # the failed turn + the recovered one
+
+
+async def test_pentester_gives_up_after_repeated_errors_and_keeps_memory(tmp_path: Path, monkeypatch):
+    """If the backend keeps failing, the subagent ends ERROR gracefully (not a bare
+    crash) AFTER the consecutive cap, and its end-state is persisted to memory."""
+    from zero.tools.memory import read_memory
+
+    monkeypatch.chdir(tmp_path)
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c", yolo=True)
+    orch = Orchestrator(cfg)
+
+    class _AlwaysRaises(LLMBackend):
+        async def run(self, system_prompt, messages, tools):
+            raise RuntimeError("error_max_turns")
+
+    orch._subagent_backend_factory = lambda rec: _AlwaysRaises()
+    rec = SubagentRecord(id="gino_9", kind="pentester", target="/t", idea="i")
+    result = await asyncio.wait_for(orch._run_pentester_subagent(rec), timeout=5)
+    assert result.status == "ERROR"
+    assert "consecutive" in result.summary
+    assert "ERROR" in read_memory("gino_9")  # work/end-state not silently lost
+
+
+async def test_validator_driver_recovers_from_a_turn_error(tmp_path: Path):
+    """default_validator_driver must survive a backend error and still produce a
+    verdict (rather than returning None / parking the finding as pending)."""
+    from zero.agents.base import AgentLoop
+    from zero.orchestrator.router import default_validator_driver
+
+    backend = ScriptedBackend([RuntimeError("error_max_turns"), _validator_final("confirmed")])
+    loop = AgentLoop(backend, system_prompt="s", tools=[])
+
+    async def _noop_action(env):  # not reached (final-only script)
+        return ""
+
+    async def _noop_ask(env):
+        return "auto"
+
+    v = await default_validator_driver(loop, action_handler=_noop_action, ask_handler=_noop_ask)
+    assert v is not None and v.verdict == "confirmed"
 
 
 def test_thought_display_gating(tmp_path: Path):

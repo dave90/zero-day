@@ -292,9 +292,11 @@ async def test_validator_backend_failure_parks_pending_with_error_in_notes(
             _pentest_final(),
         ]
     )
-    # The validator's backend call raises (simulates `claude -p exit 1`).
+    # The validator's backend call raises every time (a real `claude -p exit 1` is
+    # persistent). The driver retries a few times, then re-raises so the error is
+    # captured in the finding notes.
     validator = ScriptedOrErrorBackend(
-        [RuntimeError("claude -p exit 1: context length exceeded")]
+        [RuntimeError("claude -p exit 1: context length exceeded") for _ in range(5)]
     )
     orch = _make_orch(tmp_path, pentest, validator_backend=validator)
     await _run_with(orch)

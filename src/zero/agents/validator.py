@@ -11,6 +11,26 @@ from zero.llm.envelope import FinalEnvelope
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "validator_system.md"
 
+# Spent when the validator hits its turn cap: force it to commit a verdict + the
+# evidence gathered so far, instead of a bare "out of turns" (which would park the
+# finding as pending with no reasoning).
+VALIDATOR_WRAPUP_PROMPT = (
+    "You have reached your turn limit — this is your LAST message. Emit your FINAL"
+    " Validation envelope NOW (the required JSON). Commit to the verdict your"
+    " evidence best supports (confirmed / rejected / pending), and put everything you"
+    " established — reproduction steps, what you confirmed, and what remained"
+    " unverified — in the reasoning. Do NOT return a bare 'out of turns' message."
+)
+
+
+# Periodic nudge (Claude-Code "<system-reminder>"): keep testing, keep memory current.
+VALIDATOR_REMINDER = (
+    "<system-reminder> Keep going — actually reproduce the finding with a tool call"
+    " before you decide; don't return `pending` just because it's faster. Checkpoint"
+    " with `memory_write` (what you reproduced, what's still unverified) and keep your"
+    " `todo_write` plan current. </system-reminder>"
+)
+
 
 def load_system_prompt(project_context: str | None = None) -> str:
     body = PROMPT_PATH.read_text(encoding="utf-8")
@@ -31,6 +51,9 @@ def build_validator_loop(
         system_prompt=load_system_prompt(project_context),
         tools=tools,
         max_turns=max_turns,
+        wrapup_prompt=VALIDATOR_WRAPUP_PROMPT,
+        reminder_text=VALIDATOR_REMINDER,
+        reminder_every=6,
     )
 
 

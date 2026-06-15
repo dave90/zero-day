@@ -25,6 +25,7 @@ from zero.llm.backend import Message
 from zero.llm.claude_code import ClaudeCodeBackend, build_prompt
 from zero.llm.envelope import (
     ActionEnvelope,
+    ActionsEnvelope,
     AskUserEnvelope,
     FinalEnvelope,
     parse_envelope,
@@ -173,3 +174,94 @@ async def test_build_prompt_round_trips_through_claude():
     )
     env = parse_envelope(resp.text)
     assert isinstance(env, (FinalEnvelope, ActionEnvelope, AskUserEnvelope))
+
+
+# --- the recurring class: subagents losing tool access under lock-down ---------
+#
+# This is the test the previous ones MISSED. `test_disallowed_builtins_prevent_
+# max_turns_error` above uses SIMPLE_SYSTEM + a tiny prompt — which always passes
+# even when the lock-down is broken. The bug only fires with the REAL, large agent
+# system prompt + the FULL tool catalog + an insistent "act now" brief: that's what
+# pushes a capable model to emit a stray native tool_use, which (if any built-in is
+# still callable) trips `error_max_turns (stop=tool_use)` and kills the subagent —
+# the Guild failure, reproduced. Run a few reps because the stray attempt is
+# probabilistic; production needs it to never happen.
+
+REPS = 3
+
+
+def _real_catalog() -> list[dict]:
+    """The exact tool catalog a pentester/validator subagent is handed (full
+    default_registry minus the orchestrator-only dispatch tools + finding_submit)."""
+    from zero.tools.registry import default_registry
+    from zero.tools.dispatch import is_dispatch_tool
+
+    return [
+        t for t in default_registry().catalog()
+        if not is_dispatch_tool(t["name"]) and t["name"] != "finding_submit"
+    ]
+
+
+# An insistent brief shaped like the orchestrator's real pentester seed — it tells
+# the agent to ACT against a target NOW, which is what tempts the stray tool_use.
+_INSISTENT_BRIEF = (
+    "You are a focused pentester subagent. TARGET: http://10.10.10.10:8080/login\n"
+    "ATTACK IDEA: test the /login POST (username, password) for SQL-injection auth "
+    "bypass. Begin probing immediately with your tools and emit ONE action envelope "
+    "now — do not ask questions, do not stall.\n"
+    "Respond with exactly one envelope JSON object now."
+)
+
+
+@pytest.mark.parametrize(
+    "load_prompt",
+    [
+        pytest.param(
+            lambda: __import__(
+                "zero.agents.pentest", fromlist=["load_system_prompt"]
+            ).load_system_prompt(),
+            id="pentester",
+        ),
+        pytest.param(
+            lambda: __import__(
+                "zero.agents.validator", fromlist=["load_system_prompt"]
+            ).load_system_prompt(),
+            id="validator",
+        ),
+    ],
+)
+async def test_locked_down_subagent_never_calls_native_tool(load_prompt):
+    """Invariant: under the PRODUCTION lock-down, a subagent driven by the REAL
+    agent system prompt + FULL catalog + an insistent "act now" brief must (a) not
+    raise (no `error_max_turns` / `claude -p exit 1`), (b) return parseable envelope
+    text, and (c) NEVER stop on a native tool_use. Failing any rep means the
+    lock-down regressed and subagents will lose tool access again."""
+    system_prompt = load_prompt()
+    catalog = _real_catalog()
+    backend = ClaudeCodeBackend()  # production config — no overrides
+
+    for rep in range(REPS):
+        try:
+            resp = await backend.run(
+                system_prompt=system_prompt,
+                messages=[Message(role="user", content=_INSISTENT_BRIEF)],
+                tools=catalog,
+            )
+        except RuntimeError as e:  # the backend raises on error_max_turns
+            pytest.fail(
+                f"rep {rep}: lock-down regressed — claude raised instead of emitting "
+                f"an envelope (the subagent-lost-tools bug): {e}"
+            )
+        # The model must not have stopped on a native tool call — that means a
+        # built-in was still callable (e.g. LSP), the exact failure mode.
+        stop = (resp.raw or {}).get("stop_reason")
+        assert stop != "tool_use", (
+            f"rep {rep}: claude stopped on a NATIVE tool_use (a built-in is still "
+            f"callable — lock-down regressed): raw={resp.raw!r}"
+        )
+        # And the text must be a usable envelope, like the agent loop expects
+        # (single action, a batch of actions, an ask, or a final).
+        env = parse_envelope(resp.text)
+        assert isinstance(
+            env, (ActionEnvelope, ActionsEnvelope, FinalEnvelope, AskUserEnvelope)
+        ), f"rep {rep}: not an envelope: {resp.text!r}"

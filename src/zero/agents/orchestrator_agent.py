@@ -9,6 +9,15 @@ from zero.llm.backend import LLMBackend
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "orchestrator_system.md"
 
+# Periodic nudge (Claude-Code "<system-reminder>"): hold the big picture, keep the
+# plan + memory current, validate before finalizing, pivot off dead ends.
+ORCHESTRATOR_REMINDER = (
+    "<system-reminder> Keep the engagement moving: update your `todo_write` plan and"
+    " `memory_write` map of the chain so far, validate strong candidates (a Validator"
+    " verdict — your own recon doesn't count), and pivot off dead ends rather than"
+    " re-dispatching the same idea. </system-reminder>"
+)
+
 
 def load_system_prompt(project_context: str | None = None) -> str:
     body = PROMPT_PATH.read_text(encoding="utf-8")
@@ -29,6 +38,8 @@ def build_orchestrator_loop(
         system_prompt=load_system_prompt(project_context),
         tools=tools,
         max_turns=max_turns,
+        reminder_text=ORCHESTRATOR_REMINDER,
+        reminder_every=3,
     )
 
 

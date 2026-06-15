@@ -3,8 +3,13 @@
 The agent must reply with exactly one of:
 
   {"type": "action",   "tool": "...", "args": {...}, "thought": "..."}
+  {"type": "actions",  "thought": "...", "calls": [{"tool": "...", "args": {...}}, ...]}
   {"type": "ask_user", "question": "...", "options": [...], "free_form": bool, "blocking": bool}
   {"type": "final",    "answer": "..."}
+
+`actions` is the batch form: several INDEPENDENT tool calls run in one turn (one
+LLM round-trip) instead of one-per-turn. `action` (singular) is still valid and
+unchanged.
 
 Anything else (extra fields, missing required fields, prose around the JSON)
 is a parse error. The caller is expected to issue one-shot retry with a
@@ -30,6 +35,15 @@ class ActionEnvelope:
 
 
 @dataclass
+class ActionsEnvelope:
+    """A batch of tool calls to run in ONE turn (one LLM round-trip). The caller
+    runs them (independent ones concurrently) and appends one observation per call."""
+
+    calls: list[ActionEnvelope]
+    thought: str = ""
+
+
+@dataclass
 class AskUserEnvelope:
     question: str
     options: list[str]
@@ -42,11 +56,16 @@ class FinalEnvelope:
     answer: str
 
 
-Envelope = ActionEnvelope | AskUserEnvelope | FinalEnvelope
+Envelope = ActionEnvelope | ActionsEnvelope | AskUserEnvelope | FinalEnvelope
 
 
-_VALID_TYPES = {"action", "ask_user", "final"}
+# Cap on tool calls per `actions` batch — a backstop against a runaway batch, not a
+# tuning knob. The concurrency cap is enforced separately by the executor.
+MAX_BATCH_CALLS = 8
+
+_VALID_TYPES = {"action", "actions", "ask_user", "final"}
 _ACTION_FIELDS = {"type", "tool", "args", "thought"}
+_ACTIONS_FIELDS = {"type", "calls", "thought"}
 _ASK_FIELDS = {"type", "question", "options", "free_form", "blocking"}
 _FINAL_FIELDS = {"type", "answer"}
 
@@ -99,6 +118,31 @@ def _parse_envelope_inner(text: str) -> Envelope:
         if not isinstance(args, dict):
             raise EnvelopeError("'args' must be an object")
         return ActionEnvelope(tool=tool, args=args, thought=obj.get("thought", ""))
+
+    if t == "actions":
+        _strict_fields(obj, _ACTIONS_FIELDS, required={"type", "calls"})
+        calls = obj["calls"]
+        if not isinstance(calls, list) or not calls:
+            raise EnvelopeError("'calls' must be a non-empty list")
+        if len(calls) > MAX_BATCH_CALLS:
+            raise EnvelopeError(
+                f"too many calls in one batch ({len(calls)} > {MAX_BATCH_CALLS}) — "
+                "split into separate turns"
+            )
+        parsed_calls: list[ActionEnvelope] = []
+        for i, c in enumerate(calls):
+            if not isinstance(c, dict):
+                raise EnvelopeError(f"calls[{i}] must be an object")
+            ctool = c.get("tool")
+            cargs = c.get("args", {})
+            if not isinstance(ctool, str) or not ctool:
+                raise EnvelopeError(f"calls[{i}].tool must be a non-empty string")
+            if not isinstance(cargs, dict):
+                raise EnvelopeError(f"calls[{i}].args must be an object")
+            parsed_calls.append(
+                ActionEnvelope(tool=ctool, args=cargs, thought=c.get("thought", ""))
+            )
+        return ActionsEnvelope(calls=parsed_calls, thought=obj.get("thought", ""))
 
     if t == "ask_user":
         _strict_fields(obj, _ASK_FIELDS, required={"type", "question"})
@@ -241,8 +285,9 @@ def _extract_json(text: str) -> str:
 RETRY_REMINDER = (
     "Your previous response was not a valid envelope. Reply with EXACTLY ONE JSON object and"
     " NOTHING ELSE — no prose before or after, no markdown fence, no comments, no trailing"
-    " comma. It must be one of these three shapes:\n"
+    " comma. It must be one of these shapes:\n"
     '{"type": "action", "tool": "<tool name>", "args": {<json args>}, "thought": "<why>"}\n'
+    '{"type": "actions", "thought": "<why>", "calls": [{"tool": "<name>", "args": {<json>}}, ...]}\n'
     '{"type": "ask_user", "question": "<question>"}\n'
     '{"type": "final", "answer": "<answer>"}\n'
     "Output the JSON object now, starting with the character '{'."

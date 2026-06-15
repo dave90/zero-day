@@ -34,16 +34,18 @@ from zero.ui.events import (
     ActivityLine,
     ApprovalPrompt,
     AskUser,
+    ReasoningSummary,
     SessionEnd,
     SessionSummary,
     Status,
     SubagentFinished,
     SubagentProgress,
     SubagentStarted,
+    TodoUpdate,
     ToolObservation,
     ToolProposal,
 )
-from zero.ui.render import render_event, short_reason, status_line
+from zero.ui.render import fmt_context, render_event, short_reason, status_line
 
 if TYPE_CHECKING:
     from zero.orchestrator.orchestrator import Orchestrator
@@ -137,19 +139,22 @@ class ZeroUI:
             if self._sel_idx >= len(snap):
                 self._sel_idx = len(snap) - 1
             width = self._term_width()
+            window = getattr(getattr(self.orch, "cfg", None), "context_window", 0)
             for i, s in enumerate(snap[:8]):
                 marker = "›" if i == self._sel_idx else " "
                 # Long gruyere-style targets would eat the row — keep the tail.
                 tgt = self._short(s["target"], 28)
                 idea = self._short(s["idea"], 44)
+                ctx = fmt_context(s.get("context_tokens", 0), window)
+                ctx_seg = f" · {ctx}" if ctx else ""
                 lines.append(
-                    f"{marker}⏳ {s['id']} {s['kind']} {tgt} — {idea}  ({s['elapsed']:.0f}s)"
+                    f"{marker}⏳ {s['id']} {s['kind']} {tgt} — {idea}  ({s['elapsed']:.0f}s{ctx_seg})"
                 )
                 if i == self._sel_idx and self._sel_expanded:
                     lines.extend(self._wrap_field("goal", s["idea"], width))
                     lines.extend(self._wrap_field("target", s["target"], width))
                     lines.append(
-                        f"      turn {s['turn']} · {s['status']} · {s['elapsed']:.0f}s"
+                        f"      turn {s['turn']} · {s['status']} · {s['elapsed']:.0f}s{ctx_seg}"
                     )
             if len(snap) > 8:
                 lines.append(f"  … +{len(snap) - 8} more running")
@@ -440,6 +445,12 @@ class ZeroUI:
                 continue
             # Subagent recon activity is labelled and stays out of the chat.
             if isinstance(ev, ActivityLine) and ev.label:
+                continue
+            # Subagent reasoning is labelled and stays out of the chat too.
+            if isinstance(ev, ReasoningSummary) and ev.label:
+                continue
+            # Subagent plans are labelled and stay out of the chat too.
+            if isinstance(ev, TodoUpdate) and ev.label:
                 continue
 
             if isinstance(ev, Status):

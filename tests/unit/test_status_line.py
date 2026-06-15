@@ -9,7 +9,8 @@ from zero.ui.render import status_line
 def test_status_line_shows_approvals_and_findings():
     st = Status(
         turn=3,
-        tokens=1200,
+        context_tokens=48_000,
+        context_window=200_000,
         pending_approvals=1,
         validations_pending=2,
         validations_confirmed=4,
@@ -21,6 +22,12 @@ def test_status_line_shows_approvals_and_findings():
     assert "turn 3" in line
     assert "approvals waiting: 1" in line
     assert "4 confirmed" in line
+    assert "ctx 48k/200k (24%)" in line  # context-window usage segment
+
+
+def test_status_line_omits_ctx_without_window():
+    line = status_line(Status(context_tokens=999, context_window=0))
+    assert "ctx" not in line
 
 
 def test_status_line_omits_removed_fields():

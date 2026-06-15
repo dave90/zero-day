@@ -11,12 +11,14 @@ from zero.ui.events import (
     AskUser,
     Finding,
     GoalBanner,
+    ReasoningSummary,
     SessionEnd,
     SessionSummary,
     Status,
     SubagentFinished,
     SubagentProgress,
     SubagentStarted,
+    TodoUpdate,
     ToolObservation,
     ToolProposal,
     TurnCancelled,
@@ -46,7 +48,23 @@ def render_event(ev: UIEvent) -> Iterable[str]:
         yield f"╰────────────"
     elif isinstance(ev, TurnStart):
         yield ""
-        yield f"⋯ [{ev.agent} · turn {ev.turn}] thinking…"
+        yield f"⋯ [{_agent_display(ev.agent)} · turn {ev.turn}] thinking…"
+    elif isinstance(ev, TodoUpdate):
+        glyph = {"pending": "☐", "in_progress": "◐", "done": "☑"}
+        yield "  ┌ plan"
+        for it in ev.items or [{"step": "(empty)", "status": "pending"}]:
+            g = glyph.get(it.get("status", "pending"), "☐")
+            yield f"  │ {g} {it.get('step', '?')}"
+        yield "  └─"
+    elif isinstance(ev, ReasoningSummary):
+        # The resolved "thinking…" — a concise reasoning summary (Codex/Claude-Code
+        # style). First line is the headline; any remainder (only in `full` mode) is
+        # indented under it.
+        lines = ev.text.strip().splitlines() or [""]
+        yield f"  ↳ {lines[0]}"
+        for line in lines[1:]:
+            if line.strip():
+                yield f"    {line}"
     elif isinstance(ev, ToolProposal):
         pretty = summarize_tool_call(ev.tool, ev.args)
         yield f"  → {ev.tool}  [{ev.risk_level}]  {pretty}"
@@ -220,14 +238,41 @@ def summarize_tool_call(tool: str, args: dict) -> str:
     return _short(json.dumps(a, ensure_ascii=False), 200)
 
 
+def _agent_display(name: str) -> str:
+    """User-facing name for an agent. The orchestrator is presented as `zero`
+    (its internal identifier stays 'orchestrator' for audit/logs/session keys)."""
+    return "zero" if name == "orchestrator" else name
+
+
+def fmt_tokens(n: int) -> str:
+    """Compact token count: 940, 48k, 1.2M."""
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.0f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+def fmt_context(used: int, window: int) -> str:
+    """`48k/200k (24%)` — the context-window usage segment. Empty if no window."""
+    if window <= 0:
+        return ""
+    pct = min(100, round(100 * used / window))
+    return f"ctx {fmt_tokens(used)}/{fmt_tokens(window)} ({pct}%)"
+
+
 def status_line(st: Status) -> str:
     # Distinct, non-overlapping labels:
     #   approvals waiting → tool calls awaiting YOUR y/n
     #   findings          → confirmed / rejected results so far
+    #   ctx               → orchestrator context-window usage (used/window %)
+    ctx = fmt_context(st.context_tokens, st.context_window)
+    ctx_seg = f" · {ctx}" if ctx else ""
     return (
         f" turn {st.turn} · mode {st.mode}"
         f" · approvals waiting: {st.pending_approvals}"
-        f" · findings: {st.validations_confirmed} confirmed / {st.validations_rejected} rejected "
+        f" · findings: {st.validations_confirmed} confirmed / {st.validations_rejected} rejected"
+        f"{ctx_seg} "
     )
 
 

@@ -14,11 +14,25 @@ full orchestrator (and lets tests inject a gated fake runner).
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal
 
 from zero.ui.events import SubagentFinished, SubagentStarted, UIEvent
+
+# Funny Italian first names (men + women) used to label subagents — a random one
+# is prepended to the serial counter, so an id reads like `gino_2` instead of `#2`.
+# Purely cosmetic; the trailing number is still the unique serial.
+_FUNNY_NAMES: tuple[str, ...] = (
+    "gino", "pino", "nino", "dino", "lino", "beppe", "gigi", "ciccio", "tonino",
+    "peppino", "rocco", "nello", "cosimo", "vito", "saverio", "gennaro", "ottavio",
+    "ugo", "aldo", "gualtiero", "ermenegildo", "osvaldo", "fiorello", "battista",
+    "primo", "secondo", "amedeo", "bartolomeo", "pasquale", "ovidio",
+    "gina", "pina", "nina", "carmela", "assunta", "concetta", "immacolata", "rosa",
+    "filomena", "antonietta", "wanda", "loredana", "ornella", "gelsomina", "palmira",
+    "agata", "santina", "romina", "addolorata", "cleofe",
+)
 
 # How many characters of a subagent's `summary` reach the orchestrator via
 # `format_results`. Deliberately LARGE: a pentester that didn't fully solve it
@@ -110,7 +124,9 @@ class SubagentManager:
         """Register + launch a subagent. Returns its id immediately. Execution
         is gated by the semaphore (over-cap dispatches queue)."""
         self._counter += 1
-        sid = f"#{self._counter}"
+        # Serial counter (1,2,3…) keeps ids unique; prepend a random funny name
+        # purely for flavour, e.g. `gino_2`.
+        sid = f"{random.choice(_FUNNY_NAMES)}_{self._counter}"
         rec = SubagentRecord(
             id=sid, kind=kind, target=target, idea=idea,
             context=context, max_turns=max_turns, finding=finding,
@@ -233,6 +249,9 @@ class SubagentManager:
                     "turn": getattr(r.loop, "turn", 0),
                     "elapsed": (self._clock() - r.start_ts) if r.status == "running" else 0.0,
                     "status": r.status,
+                    # Context-window tokens used by this subagent's last LLM call
+                    # (the live AgentLoop tracks it). The UI shows used/window.
+                    "context_tokens": getattr(r.loop, "context_tokens", 0),
                 }
             )
         return out

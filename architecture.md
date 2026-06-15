@@ -182,7 +182,12 @@ orchestrator and never `run()` directly:
 | `dispatch_validator(title, summary, endpoint, …, source_subagent?)` | Spawn a Validator subagent to confirm/refute a candidate finding (deduped first). |
 | `await_subagents(which="any"\|"all", timeout?)` | Block until subagent result(s) are available. Defaults to returning as soon as the **first** finishes so the orchestrator can react. **Interruptible by operator input** (§5). |
 | `list_subagents()` | Non-blocking snapshot of what's running. |
+| `read_subagent_memory(agent_id)` / `list_memories()` | Read any subagent's working memory by id — recover what a subagent did even if it ran out of turns or crashed (its memory persists when its final summary doesn't). |
 | `finalize(summary)` | Drain remaining subagents, write `report.md`, then go idle. |
+
+These are intercepted host-side (never `run()`/remoted) and added only to the
+orchestrator's catalog. The orchestrator may also batch several `dispatch_pentester`
+calls in one `actions` envelope to fan out concurrently.
 
 **SubagentManager** (`zero/orchestrator/subagents.py`) runs each subagent as an
 independent `asyncio` task, capped by a semaphore (`--max-subagents`, default
@@ -242,8 +247,10 @@ history.
 > The original design called for the Validator to keep one conversation across
 > findings and for the orchestrator to auto-compact older turns near a token
 > budget. Today each validation runs with a fresh history and there is no
-> automatic history summarization/compaction of agent context. (The UI *does*
-> compact tool-observation *rendering*, which is unrelated.)
+> automatic history summarization/compaction of agent context. (Each actor *does*
+> keep a self-managed per-run **memory** file — §3.14 — but that's a scratchpad,
+> not automatic context compaction. The UI also compacts tool-observation
+> *rendering*, which is unrelated.)
 
 **Output: `Validation` object** (`zero/findings/schema.py`):
 
@@ -320,7 +327,8 @@ class LLMBackend(ABC):
 **Implementations today:**
 
 - `ClaudeCodeBackend` — shells out to `claude -p ... --output-format json`
-  (backend Mode A). **Default.** Reuses the user's Claude subscription.
+  (backend Mode A). **Default.** Reuses the user's Claude subscription; pins the
+  model and locks the CLI down to zero real tools + our identity (§3.5.1).
 - `ClaudeCodeBackendModeB` — registers an in-process MCP bridge and runs the
   `claude` CLI in agent mode (backend Mode B; used by execution mode `b`).
 - `EchoBackend`, `ReplayBackend` — test/replay fixtures (not for production).
@@ -339,26 +347,45 @@ executes tools.
 
 1. The tool catalog (names, descriptions, JSON schemas) is passed to the LLM **as
    data inside the prompt**, not as callable tools.
-2. The LLM must answer in a strict, **flat, `type`-tagged JSON envelope** with one
-   of three shapes (`zero/llm/envelope.py`):
+2. The LLM must answer in a strict, **flat, `type`-tagged JSON envelope**
+   (`zero/llm/envelope.py`):
    ```json
    {"type": "action",   "tool": "sqlmap", "args": {...}, "thought": "..."}
+   {"type": "actions",  "thought": "...", "calls": [{"tool": "...", "args": {...}}, ...]}
    {"type": "ask_user", "question": "...", "options": [...], "free_form": true, "blocking": true}
    {"type": "final",    "answer": "..."}
    ```
-   *(Note: the envelope is flat — `tool`/`args` are top-level keys, not nested
-   under an `action` object.)*
-3. The CLI's built-in tools (`Bash`, `Read`/`Write`/`Edit`, `Grep`/`Glob`,
-   `WebFetch`/`WebSearch`, …) are **disabled** via `--disallowedTools`, so the
-   CLI can't execute anything itself — every action routes through the envelope.
-4. The orchestrator parses the envelope, runs the tool (in the container), and
+   `actions` is the **batch** form: several INDEPENDENT tool calls run in ONE turn
+   (one LLM round-trip). The executor runs them concurrently, except calls that
+   share a stateful interpreter (`python_exec`/`pip_install`) which are serialized;
+   one observation per call is appended. `action` (singular) still works unchanged.
+3. The CLI must have **zero real tools** so the model can only answer with text
+   (our envelope). The backend strips everything:
+   - **`--allowedTools ""`** — an empty *whitelist* grants no tools. (An empty
+     `--tools ""` does **not** work — it's a greedy variadic and leaves Claude
+     Code's defaults enabled; that bug let subagents still see and call `LSP`.)
+   - **`--strict-mcp-config`** — ignore the user's MCP servers (Mode A passes no
+     `--mcp-config`).
+   - **`--disable-slash-commands`** — no skills.
+   - **`DEFAULT_DISALLOWED_TOOLS`** denylist as a backstop (Bash/Read/…/`LSP`/
+     `ToolSearch`/`Monitor`/…), kept exhaustive vs the installed CLI build.
+4. The CLI's **identity** is replaced so the subagent acts as our agent, not Claude
+   Code: **`--system-prompt`** carries our agent prompt (also dropping the default
+   cwd/env/git/memory sections), and **`--setting-sources user`** drops project/
+   local settings so the engagement repo's `CLAUDE.md` is never auto-discovered.
+5. The model is **pinned** with `--model` (default `claude-opus-4-8[1m]`).
+6. The orchestrator parses the envelope, runs the tool (in the container), and
    feeds the result back as the next observation.
 
-Invocation: `claude -p "$PROMPT" --output-format json --max-turns N`. With the
-built-in tools disabled, the CLI never enters a real tool loop; `--max-turns`
-(default 10 for the orchestrator's own backend, with a one-time retry bonus on
-`error_max_turns`) is just internal bookkeeping headroom. Subagent backends use
-the same shape with a higher per-call timeout (§5).
+Invocation: `claude -p "$PROMPT" --output-format json --max-turns N --model … --system-prompt … --allowedTools "" --strict-mcp-config --disable-slash-commands --setting-sources user`.
+With zero tools the CLI never enters a real tool loop; `--max-turns` (default **4**,
+with a small retry bonus on `error_max_turns`) is only internal bookkeeping — small
+on purpose: a few turns of headroom let a rare stray native-tool_use attempt fail
+harmlessly (the tool isn't callable) and the model recover to a text envelope,
+instead of the whole call hard-failing with `error_max_turns (stop=tool_use)`.
+A startup banner prints the effective model / lock-down / context window so a stale
+process (Python doesn't hot-reload) is obvious. Subagent backends use the same shape
+with a higher per-call timeout (§5).
 
 **Pros:** total control — every action passes the approval gate, rate limiter,
 and audit log; replayable. **Cons:** verbose (full history re-sent each turn).
@@ -393,7 +420,14 @@ bypass the gate).
 | `nuclei` | `nuclei` binary | active | Template-based scanning. |
 | `nmap` | `nmap` binary | active | Port/service discovery. |
 | `jwt_tool` | `jwt_tool` | active | Inspect / tamper JWTs. |
-| `python_exec` | sandboxed python | active | Run a short Python snippet (craft payloads, decode blobs). |
+| `python_exec` | sandboxed python | active | Run a Python snippet. **Persistent per-actor session** — globals/imports/helpers survive across calls; each agent gets its own isolated interpreter. **No hard kill timeout:** code runs in a worker thread; if a call exceeds `wait_seconds` it KEEPS RUNNING and the tool returns "still running" + output-so-far, so the agent can `action="poll"` (wait more) or `action="cancel"` (stop + reset the session). Stops one slow call (e.g. a recursive `glob` over `/usr/share`) freezing the turn forever. |
+| `pip_install` | pip | active | Install Python packages into the sandbox so `python_exec` can import them. Non-interactive, **hard-timeout** (won't wedge a session), package specs sanitized against option injection. Common libs (pdfminer.six, pypdf, bs4, cryptography, …) are pre-baked. |
+| `python_bg` | sandboxed python | active | **Detachable background jobs** — run python that serves/listens/long-polls (an HTTP redirector, an XXE DTD host, a socket catcher), keep it alive, poll its captured logs for callbacks, stop it, or let it **auto-close after a TTL**. The general out-of-band primitive: the agent writes whatever listener it needs (no fixed OOB API). Distinct from `python_exec`, where a `serve_forever()` would hang the turn forever. A bound port is only reachable by a remote target when zero runs with `--host-network`. |
+| `list_dir` | sandboxed python | safe | Plain listing of a directory's sub-dirs + files (dirs first, trailing `/`; hidden shown; optional recursive). **Read-only, never prompts, hard-jailed to `--files-root`** (`/zero_files` in the sandbox) — can't escape via `..`/absolute/symlink. |
+| `grep` | sandboxed python | safe | Regex-search files under the files root → `path:lineno: line` (recursive, `include` glob, `context`). Skips binary/oversized files. **Read-only, never prompts, hard-jailed to `--files-root`.** |
+| `read_file` | sandboxed python | safe | Read a file's content with `offset`/`max_bytes` paging. **Read-only, never prompts, hard-jailed to `--files-root`.** |
+| `memory_read` / `memory_write` | host file | safe (no prompt) | Each actor's bounded **working memory** (replace-model markdown) under `.pentest/memory/<id>.md`. Keyed by the injected `session_id`; runs **host-side, excluded from remoting** (see §3.14). |
+| `todo_read` / `todo_write` | host file | safe (no prompt) | Each actor's **plan/checklist** (`{step,status}` list) under `.pentest/todo/<id>.json`; rendered live in the UI (§3.14). |
 | `web_search` | DuckDuckGo (`ddgs`) | safe | Search the public web. |
 | `web_fetch` | `httpx` | safe | Fetch a public URL (scope-host blocklist applies). |
 | `finding_submit` | internal | safe | Submit a candidate finding (orchestrator-intercepted). |
@@ -559,9 +593,44 @@ the limiter is acquired before the tool runs.
 
 An **inline** prompt_toolkit UI (`zero/ui/app.py`) — not a full-screen TUI. The
 transcript prints to normal scrollback (native scroll/copy work); only a small
-input prompt + a status toolbar are redrawn at the bottom. The toolbar shows each
-running subagent with its goal and elapsed time (↑/↓ select, Enter expand). Slash
+input prompt + a status toolbar are redrawn at the bottom. Each turn shows a
+**concise reasoning summary** (the agent's `thought`, Codex/Claude-Code style). The
+toolbar shows each running subagent with its goal, elapsed time, and **context-window
+usage** (`ctx used/window %`), plus the orchestrator's own ctx in the status line and
+its **todo checklist** (`☐/◐/☑`); ↑/↓ select a subagent, Enter expands it. A startup
+banner prints the effective backend config (model · tool lock-down · context window).
+Subagent reasoning/todo are kept out of the main chat (they carry a label). Slash
 commands (`/running`, `/exit`, …) are handled locally without hitting the LLM.
+
+### 3.14 Per-agent working state: memory & plan
+
+Every actor (the orchestrator and each pentester/validator subagent) keeps two
+bounded files of working state, so progress survives a long run, a re-dispatch, or a
+crash:
+
+- **Memory** (`memory_read`/`memory_write` → `.pentest/memory/<id>.md`) — a running
+  summary the agent overwrites (replace-model, so it never grows like the transcript).
+- **Plan** (`todo_read`/`todo_write` → `.pentest/todo/<id>.json`) — a checklist of
+  `{step, status}`, rendered live in the UI.
+
+Both are keyed purely by the per-actor `session_id` the orchestrator injects in
+`_invoke_tool` (the LLM never sets it — the same mechanism as `python_exec`), so a
+subagent can only ever touch **its own** files. They run **host-side and are excluded
+from sandbox remoting** (the store lives on the host under `.pentest/`, never mounted
+into the container). At the start of a run each agent is **seeded** with its own
+memory, and the orchestrator can read any subagent's via `read_subagent_memory` /
+`list_memories` (§3.3).
+
+**Harness auto-write (safety net).** In practice models rarely call `memory_write`
+on their own, so the harness also persists each subagent's **end-state** (final
+status + summary + discovered creds/tokens, or the validator's verdict + rationale)
+to its memory on completion — merged below any notes the agent wrote. This is what
+makes `read_subagent_memory` reliably useful even when a subagent produced a thin
+final or died.
+
+> 📋 **Roadmap — token-budget auto-compaction** of live agent *context* is still not
+> implemented (memory is a self-managed scratchpad, not automatic history
+> summarization). See §9.
 
 ---
 
@@ -578,13 +647,21 @@ pinned tool versions per release; one-command install.
 runs a small RPC server (`zero/container/rpc.py` ↔ host `ContainerRPC`) that
 executes tool calls and returns results over HTTP. (A unix-socket transport was
 attempted but HTTP is used because UDS-in-shared-volume is unreliable on Docker
-Desktop / macOS.)
+Desktop / macOS.) The image also bakes **wordlists** — `seclists`, `dirb`/
+`dirbuster`, and an unpacked `rockyou.txt` under `/usr/share/wordlists` — so
+`ffuf` (default wordlist `/usr/share/wordlists/dirb/common.txt`), `sqlmap`, etc.
+work out of the box. Changing a baked tool/wordlist requires rebuilding the image.
 
 **Mounts:**
 - `./` (project dir) → `/work` read-write — `pentest.md`, findings, logs.
 - `~/.claude/` → `/root/.claude` read-only — so an in-container `claude` could use
   host auth (opt-in).
 - `--burp-dir` → `/work/burp` read-only.
+- `--files-root` (default `./zero_files`, resolved against cwd, auto-created) →
+  `/zero_files` read-write — the **jail root** the read-only fs tools
+  (`list_dir`/`grep`/`read_file`) are confined to, advertised via the
+  `ZERO_FILES_ROOT` env. Those tools can never read outside it (`..`/absolute/symlink
+  escapes are rejected) — a hard boundary, unlike the advisory `--scope-host`.
 
 **Network:** bridge by default; `--host-network` for talking to Burp on
 `127.0.0.1`; otherwise `host.docker.internal` (with `--add-host` on Linux).
@@ -608,8 +685,8 @@ limits compose:
 | `--llm-timeout` | 900 s | Wall-clock for **one** `claude -p` call — shared by the orchestrator's own turns **and** the pentester/validator subagents (one value for all). |
 | `--pentester-max-turns` | 14 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
 | `--subagent-deadline` | 1200 s | **Total** wall-clock per subagent, checked between turns (pentesters and validators). |
-| `--validator-max-turns` | 40 | Validator investigation steps. |
-| `--validator-claude-max-turns` | 60 | Per-call `claude -p --max-turns` for the validator backend. |
+| `--validator-max-turns` | 40 | Validator investigation steps (our loop). |
+| `--validator-claude-max-turns` | 1 | claude's INTERNAL per-call `--max-turns` for the validator (NOT its investigation budget — that's `--validator-max-turns`). Kept tiny like the agent backend; a high value only lets the model drift into a native tool call. |
 | `--max-subagents` | 10 | Max concurrent subagents (semaphore). |
 | `--max-turns` | 10 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
 
@@ -627,10 +704,17 @@ the running subagents keep going, and the orchestrator reads + responds to the
 message before resuming. This keeps the chat responsive instead of frozen for the
 whole batch.
 
-**Turn-error recovery.** A backend timeout, a `claude -p` failure, or a parse
-error on a turn no longer silently kills the orchestrator loop. The error is
-surfaced as a `[turn error]` line, recorded as `turn_error` in the audit, and the
-engagement goes idle for the next prompt — the session stays open and recovers.
+**Turn-error recovery (orchestrator AND subagents).** A backend timeout, a
+`claude -p` failure (e.g. `error_max_turns`), or a parse error on a turn no longer
+kills the loop. The orchestrator surfaces a `[turn error]` line, records `turn_error`,
+and goes idle for the next prompt. **Subagents recover the same way:** the pentester
+loop and the validator driver catch a `loop.step()` error, feed it back as a
+corrective observation ("emit one JSON envelope as text; don't call tools natively"),
+and **retry the turn** — only giving up after a few consecutive failures, and then
+*gracefully* (an `ERROR` result with its end-state written to memory, or — for the
+validator — re-raising so the finding is parked pending *with the error in its
+notes*). Previously a single backend glitch turned the whole subagent into `ERROR`
+and discarded its work.
 
 **Shutdown.** The session ends only when the UI exits. On exit the orchestrator
 cancels any in-flight subagents; `finalize` (or hitting the turn budget) instead
@@ -711,7 +795,7 @@ User goal: *"Find access-control bugs in the orders API."*
 | Burp | REST API ingestion (Pro); Burp-extension push (Community). |
 | Scope | Mandatory `violates_scope → BLOCK` gate (allowlist semantics), not user-overridable. |
 | Credentials | Reference-by-name (`{{user_low}}`) + execution-time substitution so the LLM never sees secrets. |
-| Memory | Shared cross-finding validator history; token-budget auto-compaction of agent context. |
+| Memory | Shared cross-finding validator history; token-budget auto-compaction of agent context. (Per-agent scratchpad **memory + plan** already ship — §3.14; this is the remaining cross-finding / auto-compaction work.) |
 | Approval UI | Wire up the `EDIT` decision (edit args before approving). |
 | Roles | Triage / Reporter agents (dedup across sessions; HackerOne/Bugcrowd report templates). |
 | Platforms | Network-layer tools (smb/ldap), mobile (Frida), cloud (S3/IAM), basic binary. |

@@ -58,13 +58,20 @@ def default_registry() -> ToolRegistry:
     from zero.tools.curl_raw import CurlRawTool
     from zero.tools.ffuf import FfufTool
     from zero.tools.finding_submit import FindingSubmitTool
+    from zero.tools.grep import GrepTool
     from zero.tools.http_replay import HttpReplayTool
     from zero.tools.httpx_tool import HttpxTool
     from zero.tools.jwt_tool import JwtTool
+    from zero.tools.list_dir import ListDirTool
+    from zero.tools.memory import MemoryReadTool, MemoryWriteTool
     from zero.tools.nmap import NmapTool
     from zero.tools.nuclei import NucleiTool
+    from zero.tools.pip_install import PipInstallTool
+    from zero.tools.python_bg import PythonBgTool
     from zero.tools.python_exec import PythonExecTool
+    from zero.tools.read_file import ReadFileTool
     from zero.tools.sqlmap import SqlmapTool
+    from zero.tools.todo import TodoReadTool, TodoWriteTool
     from zero.tools.web_fetch import WebFetchTool
     from zero.tools.web_search import WebSearchTool
 
@@ -73,6 +80,18 @@ def default_registry() -> ToolRegistry:
     reg.register(WebSearchTool())
     reg.register(WebFetchTool())
     reg.register(PythonExecTool())
+    reg.register(PipInstallTool())
+    reg.register(PythonBgTool())
+    # Read-only filesystem tools (jailed to --files-root; never prompt).
+    reg.register(ListDirTool())
+    reg.register(GrepTool())
+    reg.register(ReadFileTool())
+    # Per-agent working memory (bounded scratchpad; host-side, never remoted).
+    reg.register(MemoryReadTool())
+    reg.register(MemoryWriteTool())
+    # Per-agent task plan / checklist (host-side, never remoted).
+    reg.register(TodoReadTool())
+    reg.register(TodoWriteTool())
     # M5 traffic + binary tools
     reg.register(BurpTrafficTool())
     reg.register(HttpReplayTool())

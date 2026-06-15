@@ -6,6 +6,7 @@ from pathlib import Path
 from zero.container.manager import (
     DEFAULT_IMAGE,
     DEFAULT_WORK_MOUNT,
+    FILES_ROOT_IN_CONTAINER,
     ContainerSpec,
     build_run_args,
 )
@@ -33,6 +34,23 @@ def test_cwd_mounted_rw(tmp_path: Path):
     args = build_run_args(spec, name="x")
     expected = f"{tmp_path}:{DEFAULT_WORK_MOUNT}:rw"
     assert expected in args
+
+
+def test_files_root_mounted_and_env_set(tmp_path: Path):
+    """The read-only fs tools' jail root is bind-mounted at /zero_files and
+    advertised via ZERO_FILES_ROOT so the tools confine to it."""
+    root = tmp_path / "loot"
+    root.mkdir()
+    spec = ContainerSpec(cwd=tmp_path, claude_dir_host=None, files_root=root)
+    args = build_run_args(spec, name="x")
+    assert f"{root}:{FILES_ROOT_IN_CONTAINER}:rw" in args
+    env_idx = args.index("-e")
+    # find the ZERO_FILES_ROOT -e (there may be others later)
+    assert any(
+        args[i] == "-e" and args[i + 1] == f"ZERO_FILES_ROOT={FILES_ROOT_IN_CONTAINER}"
+        for i in range(len(args) - 1)
+    ), args
+    assert env_idx  # sanity: an -e exists
 
 
 def test_rpc_port_published(tmp_path: Path):

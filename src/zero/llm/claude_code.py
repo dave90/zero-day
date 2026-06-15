@@ -33,35 +33,93 @@ from zero.llm.backend import LLMBackend, LLMResponse, Message
 # claude's built-in tools that we must disable in Mode A: we route every
 # action through our envelope, but if any built-in is left enabled, claude
 # may decide to call ITS tool — and each tool-use cycle counts against
-# `--max-turns`, so even a single internal Read/Bash/WebFetch triggers
+# `--max-turns`, so even a single internal Read/Bash/WebFetch/LSP triggers
 # `error_max_turns` and exits non-zero. Disabling them forces claude to
-# respond with text only, which is exactly what our envelope protocol
-# wants.
+# respond with text only, which is exactly what our envelope protocol wants.
+#
+# This list is belt-and-suspenders BEHIND the empty `--allowedTools ""` whitelist
+# (see build_mode_a_argv): the whitelist is the primary disable, this denylist
+# names any built-in that must NEVER be callable even if the whitelist regresses.
+# The list MUST stay exhaustive w.r.t. the installed Claude Code build — the real
+# Guild bug was a subagent that fell back to the ONE built-in we'd forgotten here
+# (`LSP`), called it, tripped `error_max_turns (stop=tool_use)`, and confabulated
+# "the pentest tooling isn't wired up". Every name below is a current Claude Code
+# built-in; add new ones as the CLI grows (the unit-test guard asserts the
+# load-bearing ones are present). Pass ONLY valid names — a bogus name makes
+# `claude` exit non-zero with empty stdout.
 DEFAULT_DISALLOWED_TOOLS: tuple[str, ...] = (
     "Bash", "BashOutput", "KillShell",
     "Read", "Write", "Edit", "Glob", "Grep",
     "WebFetch", "WebSearch",
     "Task", "TodoWrite", "NotebookEdit",
+    # Newer built-ins the original list missed — `LSP` is the one that bit us.
+    "LSP", "ToolSearch", "Monitor", "Skill", "SlashCommand",
+    "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+    "CronCreate", "CronDelete", "CronList",
+    "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+    "PushNotification", "RemoteTrigger", "DesignSync", "Agent",
 )
+
+
+# `claude -p` runs Claude Code with ITS OWN system prompt ("You are Claude Code…"
+# + your cwd/git/CLAUDE.md), so a subagent launched from inside this repo read the
+# zero dev CLAUDE.md (walked up from the engagement dir) and concluded it was "a
+# Claude Code dev session over the zero repo" — refusing to act as a pentester and
+# claiming its only tools were Skill/Workflow/Read. We fix the identity leak by:
+#   * --system-prompt  : REPLACE Claude Code's identity with OUR agent prompt (this
+#                        also drops the default dynamic cwd/env/git/memory sections),
+#   * --setting-sources: load USER settings only, dropping project/local so the
+#                        repo's CLAUDE.md is never auto-discovered for the agent.
+# (We avoid `--bare`, which would force ANTHROPIC_API_KEY and break OAuth auth.)
+_DEFAULT_SETTING_SOURCES = "user"
 
 
 @dataclass
 class ClaudeCodeConfig:
     binary: str = "claude"
-    # 10 leaves headroom for claude's internal turn accounting (cache
-    # lookups, system messages, retries). We expect exactly one envelope
-    # per call, but the internal turn counter inflates fast on long
-    # prompts; reports of `error_max_turns` came in even at 5. With
-    # built-in tools disabled (see DEFAULT_DISALLOWED_TOOLS) the extra
-    # turns are never used to execute anything, just bookkeeping.
-    max_turns: int = 10
+    # Pin the model for every `claude -p` call (alias like 'opus'/'sonnet' or a full
+    # id like 'claude-opus-4-8[1m]' for the 1M-context variant). None ⇒ use the
+    # account default. Set by the orchestrator from --model.
+    model: str | None = None
+    # Which Claude Code setting sources to load. "user" drops project/local so the
+    # engagement repo's CLAUDE.md doesn't leak into the agent's context.
+    setting_sources: str = _DEFAULT_SETTING_SOURCES
+    # Mode A is an ENVELOPE protocol: the agent must NOT call any real tool — it
+    # emits one JSON envelope naming one of OUR pentest tools (text), which the
+    # orchestrator then executes. But `claude -p` otherwise exposes its full
+    # harness (Bash/Read/Workflow/Skill/ToolSearch/Cron/Task/Monitor/LSP) AND the
+    # user's MCP servers (Google, …). A capable model then tries to CALL those,
+    # finds our pentest tools aren't real callable tools, and concludes "the
+    # pentest tools aren't wired in" — refusing to proceed (real Guild bug). So we
+    # strip EVERY real tool: --allowedTools "" (empty whitelist ⇒ grant ZERO tools),
+    # --strict-mcp-config (no MCP servers, since Mode A passes no --mcp-config),
+    # --disable-slash-commands (no skills), plus the DEFAULT_DISALLOWED_TOOLS denylist
+    # as a backstop. NOTE: an empty `--tools ""` does NOT work — `--tools <tools...>`
+    # is a greedy variadic and the empty value leaves Claude Code's defaults enabled
+    # (that was the bug: subagents still saw LSP and called it). The empty *whitelist*
+    # `--allowedTools ""` is the reliable disable. With zero tools the model can only
+    # respond with text == our envelope.
+    lock_down_tools: bool = True
+    # claude's INTERNAL agentic-turn cap for one `claude -p` call. We drive the
+    # multi-turn loop OURSELVES (one envelope per call), so the model never needs an
+    # internal loop. We keep a SMALL budget rather than 1: under lock-down no tool is
+    # callable, but a capable model on a large/insistent prompt can still EMIT a stray
+    # native tool_use attempt — with `--max-turns 1` that single attempt instantly
+    # trips `error_max_turns (stop=tool_use)` and fails the whole call (the live-
+    # reproduced Guild bug). A few turns of headroom let that rare stray attempt fail
+    # harmlessly (the tool isn't callable) and the model recover to a text envelope on
+    # the next internal step. The old `10` was a pre-lock-down workaround for when real
+    # tools WERE present and consumed internal turns.
+    max_turns: int = 4
     timeout_seconds: int = 300
     disallowed_tools: tuple[str, ...] = DEFAULT_DISALLOWED_TOOLS
-    # On `error_max_turns`, retry once with `max_turns_retry_bonus` extra
-    # internal turns before giving up — claude's internal turn counter can
-    # trip the cap on long prompts even with built-in tools disabled.
+    # On `error_max_turns`, retry once with `max_turns_retry_bonus` extra internal
+    # turns before giving up. Kept SMALL (was 20): a big bonus would reopen the
+    # internal agentic loop on the retry — the very thing that lets the model drift
+    # into a native tool call and confabulate "tools unavailable". 1→3 is enough to
+    # clear a transient accounting trip without giving it room to loop.
     retry_on_max_turns: bool = True
-    max_turns_retry_bonus: int = 20
+    max_turns_retry_bonus: int = 2
 
 
 _NUL_RUN = re.compile("\x00+")
@@ -89,14 +147,39 @@ def build_mode_a_argv(
     prompt: str,
     max_turns: int,
     disallowed_tools: tuple[str, ...],
+    system_prompt: str = "",
+    setting_sources: str = "",
+    lock_down_tools: bool = False,
+    model: str = "",
 ) -> list[str]:
-    """Pure-function argv assembly — easy to unit test."""
+    """Pure-function argv assembly — easy to unit test.
+
+    When `system_prompt` is given it goes to `--system-prompt` (REPLACING Claude
+    Code's own identity so the agent IS our pentester/validator, not Claude Code),
+    and `prompt` carries only the dynamic tools+conversation body. `setting_sources`
+    (e.g. "user") drops project/local settings so the repo's CLAUDE.md doesn't leak.
+    `lock_down_tools` strips every real tool via an empty `--allowedTools ""` whitelist
+    (+ no MCP + no skills + a denylist backstop) so the model can only emit our envelope
+    text — see ClaudeCodeConfig.lock_down_tools (and why `--tools ""` does NOT work)."""
     argv = [
         binary,
         "-p", neutralize_nul(prompt),
         "--output-format", "json",
         "--max-turns", str(max_turns),
     ]
+    if model:
+        argv += ["--model", model]
+    if system_prompt:
+        argv += ["--system-prompt", neutralize_nul(system_prompt)]
+    if setting_sources:
+        argv += ["--setting-sources", setting_sources]
+    if lock_down_tools:
+        # No real tools at all → the only thing the model can do is reply with text,
+        # which is exactly our envelope. `--allowedTools ""` is an EMPTY WHITELIST
+        # (grant zero tools) — the reliable disable; `--tools ""` does NOT work (the
+        # empty value to the greedy variadic flag leaves the defaults enabled, so the
+        # model still saw/called LSP — the Guild bug). Then no MCP servers, no skills.
+        argv += ["--allowedTools", "", "--strict-mcp-config", "--disable-slash-commands"]
     if disallowed_tools:
         argv += ["--disallowedTools", ",".join(disallowed_tools)]
     return argv
@@ -118,7 +201,9 @@ class ClaudeCodeBackend(LLMBackend):
                 f"`{self.cfg.binary}` not on PATH; install Claude Code CLI or"
                 " run with --backend echo."
             )
-        prompt = build_prompt(system_prompt, messages, tools)
+        # Our agent prompt goes to --system-prompt (see _DEFAULT_SETTING_SOURCES note);
+        # the `-p` body carries only the dynamic tools + conversation.
+        prompt = build_user_prompt(messages, tools)
 
         # First attempt at the configured cap. claude's internal turn
         # counter inflates on long prompts and can trip `error_max_turns`
@@ -131,7 +216,9 @@ class ClaudeCodeBackend(LLMBackend):
             caps.append(self.cfg.max_turns + self.cfg.max_turns_retry_bonus)
         last_error: str | None = None
         for attempt, max_turns in enumerate(caps):
-            out_text, returncode, err = await self._run_once(binary, prompt, max_turns)
+            out_text, returncode, err = await self._run_once(
+                binary, prompt, max_turns, system_prompt
+            )
             if returncode == 0:
                 return parse_claude_json(out_text)
             # claude often reports structured errors on stdout even with
@@ -147,7 +234,7 @@ class ClaudeCodeBackend(LLMBackend):
         raise RuntimeError(last_error or "claude -p failed")
 
     async def _run_once(
-        self, binary: str, prompt: str, max_turns: int
+        self, binary: str, prompt: str, max_turns: int, system_prompt: str = ""
     ) -> tuple[str, int | None, str]:
         """Run one `claude -p` invocation. Returns (stdout, returncode, stderr)."""
         argv = build_mode_a_argv(
@@ -155,6 +242,10 @@ class ClaudeCodeBackend(LLMBackend):
             prompt=prompt,
             max_turns=max_turns,
             disallowed_tools=self.cfg.disallowed_tools,
+            system_prompt=system_prompt,
+            setting_sources=self.cfg.setting_sources,
+            lock_down_tools=self.cfg.lock_down_tools,
+            model=self.cfg.model or "",
         )
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -234,19 +325,33 @@ def parse_claude_json(stdout: str) -> LLMResponse:
     return LLMResponse(text=text, usage=usage if isinstance(usage, dict) else {}, raw=obj)
 
 
-def build_prompt(
-    system_prompt: str,
+def build_user_prompt(
     messages: list[Message],
     tools: list[dict[str, Any]],
 ) -> str:
-    """Concatenate system + tool catalog + history into a single prompt string."""
-    parts = [system_prompt.rstrip(), "", "## Available tools", _format_tools(tools), ""]
+    """The `-p` body: tool catalog + history (no system prompt — that goes to
+    `--system-prompt` so the agent's identity isn't a mere user message under Claude
+    Code's own system prompt)."""
+    parts = ["## Available tools", _format_tools(tools), ""]
     if messages:
         parts.append("## Conversation")
         for m in messages:
             parts.append(f"[{m.role}] {m.content}")
         parts.append("")
     parts.append("Respond with exactly one envelope JSON object now.")
+    return "\n".join(parts)
+
+
+def build_prompt(
+    system_prompt: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]],
+) -> str:
+    """Concatenate system + tool catalog + history into a single prompt string.
+
+    Retained for the live e2e tests; the live `run()` path now sends the system
+    prompt via `--system-prompt` and uses `build_user_prompt` for the `-p` body."""
+    parts = [system_prompt.rstrip(), "", build_user_prompt(messages, tools)]
     return "\n".join(parts)
 
 
@@ -270,6 +375,7 @@ class ModeBConfig:
     binary: str = "claude"
     timeout_seconds: int = 3600
     disallowed_builtin_tools: tuple[str, ...] = ("WebSearch", "WebFetch")
+    model: str | None = None  # pin the model (e.g. 'claude-opus-4-8[1m]'); None ⇒ default
 
 
 def build_mcp_config(
@@ -300,6 +406,7 @@ def build_mode_b_argv(
     prompt: str,
     mcp_config_path: Path,
     disallowed_builtin_tools: tuple[str, ...],
+    model: str = "",
 ) -> list[str]:
     """Pure-function assembly of the Mode B `claude` argv."""
     argv = [
@@ -308,6 +415,8 @@ def build_mode_b_argv(
         "--output-format", "json",
         "--mcp-config", str(mcp_config_path),
     ]
+    if model:
+        argv += ["--model", model]
     if disallowed_builtin_tools:
         argv += ["--disallowedTools", ",".join(disallowed_builtin_tools)]
     return argv
@@ -350,6 +459,7 @@ class ClaudeCodeBackendModeB:
                 prompt=prompt,
                 mcp_config_path=cfg_path,
                 disallowed_builtin_tools=self.cfg.disallowed_builtin_tools,
+                model=self.cfg.model or "",
             )
             env = {**os.environ}
             proc = await asyncio.create_subprocess_exec(
