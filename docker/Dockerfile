@@ -109,9 +109,17 @@ ENV PYTHONPATH=/opt/zero
 
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/tool_server /opt/zero_tool_server
-RUN chmod +x /entrypoint.sh
+# Strip any CR before chmod: when the repo is cloned on Windows (git
+# core.autocrlf=true), entrypoint.sh checks out with CRLF line endings, so the
+# shebang becomes `#!/usr/bin/env bash\r` and the container dies at startup with
+# `env: 'bash\r': No such file or directory`. Normalizing here makes the image
+# build correctly regardless of the host's git line-ending config (.gitattributes
+# fixes fresh checkouts; this defends already-CRLF working trees too).
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
-# Sanity check: the entrypoint must be syntactically valid.
-RUN bash -n /entrypoint.sh
+# Sanity check: the entrypoint must be syntactically valid AND carry no CR
+# (a stray CR would mean the normalization above didn't run). `! grep -q` is
+# POSIX — Dockerfile RUN uses /bin/sh, so no bash-only `$'\r'`.
+RUN bash -n /entrypoint.sh && ! grep -q "$(printf '\r')" /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

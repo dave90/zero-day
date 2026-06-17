@@ -1,0 +1,14 @@
+# Keep line endings sane across OSes. The Docker sandbox runs on Linux, so any
+# script it executes via a shebang MUST stay LF — otherwise a Windows checkout
+# (git core.autocrlf=true) rewrites it to CRLF and the container dies at startup
+# with `env: 'bash\r': No such file or directory`. Force LF for shell scripts and
+# the container entrypoint regardless of the cloning machine's git config.
+*.sh            text eol=lf
+docker/entrypoint.sh text eol=lf
+
+# Let git normalize text files but never touch true binaries.
+* text=auto
+*.png binary
+*.jpg binary
+*.gz  binary
+*.zip binary
