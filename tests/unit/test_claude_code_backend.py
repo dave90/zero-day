@@ -17,20 +17,27 @@ def _argval(argv, flag):
     return argv[argv.index(flag) + 1]
 
 
-def test_mode_a_argv_sets_system_prompt_and_setting_sources():
-    """Identity fix: our agent prompt must go to --system-prompt (replacing Claude
-    Code's own identity), and --setting-sources must drop the repo CLAUDE.md."""
+def test_mode_a_argv_keeps_big_strings_off_the_command_line():
+    """Windows fix ([WinError 206], command line capped at 32 KB): neither the system
+    prompt nor the conversation body may be argv elements. The system prompt goes to a
+    FILE (`--system-prompt-file`) and the body is piped on STDIN (`--print`, no `-p
+    <body>` positional). --setting-sources still drops the repo CLAUDE.md."""
     argv = build_mode_a_argv(
-        binary="claude", prompt="BODY", max_turns=5, disallowed_tools=(),
-        system_prompt="You are the Pentest agent.", setting_sources="user",
+        binary="claude", max_turns=5, disallowed_tools=(),
+        system_prompt_path="/tmp/sys.md", setting_sources="user",
     )
-    assert "--system-prompt" in argv
-    assert _argval(argv, "--system-prompt") == "You are the Pentest agent."
+    assert "--print" in argv
+    assert "-p" not in argv                 # no inline prompt positional/flag
+    assert "--system-prompt" not in argv     # the inline (huge-argv) variant is gone
+    assert _argval(argv, "--system-prompt-file") == "/tmp/sys.md"
     assert _argval(argv, "--setting-sources") == "user"
+    # Nothing on the command line should be a large string (the body/system prompt).
+    assert all(len(a) < 200 for a in argv), argv
 
 
 def test_mode_a_argv_omits_identity_flags_when_unset():
-    argv = build_mode_a_argv(binary="claude", prompt="x", max_turns=5, disallowed_tools=())
+    argv = build_mode_a_argv(binary="claude", max_turns=5, disallowed_tools=())
+    assert "--system-prompt-file" not in argv
     assert "--system-prompt" not in argv
     assert "--setting-sources" not in argv
 
@@ -56,7 +63,7 @@ def test_backend_locks_down_all_real_tools_by_default():
 
     assert ClaudeCodeConfig().lock_down_tools is True
     argv = build_mode_a_argv(
-        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        binary="claude", max_turns=5, disallowed_tools=(),
         lock_down_tools=True,
     )
     # An EMPTY WHITELIST `--allowedTools ""` is what actually grants zero tools.
@@ -70,7 +77,7 @@ def test_backend_locks_down_all_real_tools_by_default():
 
 def test_lock_down_omitted_when_disabled():
     argv = build_mode_a_argv(
-        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        binary="claude", max_turns=5, disallowed_tools=(),
         lock_down_tools=False,
     )
     assert "--allowedTools" not in argv and "--strict-mcp-config" not in argv
@@ -78,14 +85,14 @@ def test_lock_down_omitted_when_disabled():
 
 def test_mode_a_argv_pins_model():
     argv = build_mode_a_argv(
-        binary="claude", prompt="x", max_turns=5, disallowed_tools=(),
+        binary="claude", max_turns=5, disallowed_tools=(),
         model="claude-opus-4-8[1m]",
     )
     assert _argval(argv, "--model") == "claude-opus-4-8[1m]"
 
 
 def test_mode_a_argv_no_model_flag_when_empty():
-    argv = build_mode_a_argv(binary="claude", prompt="x", max_turns=5, disallowed_tools=())
+    argv = build_mode_a_argv(binary="claude", max_turns=5, disallowed_tools=())
     assert "--model" not in argv
 
 
@@ -142,7 +149,6 @@ def test_build_prompt_no_history():
 def test_mode_a_argv_includes_disallowed_builtins():
     argv = build_mode_a_argv(
         binary="/usr/bin/claude",
-        prompt="hello",
         max_turns=5,
         disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
     )
@@ -175,24 +181,23 @@ def test_mode_a_internal_max_turns_has_small_headroom():
 
 def test_mode_a_argv_no_disallow_when_empty():
     argv = build_mode_a_argv(
-        binary="claude", prompt="x", max_turns=5, disallowed_tools=()
+        binary="claude", max_turns=5, disallowed_tools=()
     )
     assert "--disallowedTools" not in argv
 
 
-def test_mode_a_argv_neutralizes_nul_in_prompt():
-    """Regression (Blueprint_Heist): a NUL byte in the prompt (from a binary tool
-    observation flowing into the transcript) raises `ValueError: embedded null
-    byte` at `create_subprocess_exec`. The argv builder must neutralize it so the
-    spawn can't crash — while keeping a visible marker of where it was."""
-    prompt = "decoded body:\x00\x00 GET /x" + "\x00"
-    argv = build_mode_a_argv(
-        binary="claude", prompt=prompt, max_turns=5, disallowed_tools=()
-    )
-    assert all("\x00" not in a for a in argv), argv
-    p = argv[argv.index("-p") + 1]
-    assert "decoded body:" in p          # surrounding content preserved
-    assert "[NUL*2]" in p and "[NUL*1]" in p  # the null runs are marked, with counts
+def test_neutralize_nul_marks_runs_with_counts():
+    """Regression (Blueprint_Heist): a NUL byte flowing into the prompt (from a binary
+    tool observation) raises `ValueError: embedded null byte` at create_subprocess_exec
+    if it ever reaches argv. The body now travels on STDIN (a byte stream tolerates
+    NUL), but we still neutralize it — claude/node can mishandle NUL, and the marker
+    keeps the security-relevant fact that N null bytes appeared here."""
+    from zero.llm.claude_code import neutralize_nul
+
+    out = neutralize_nul("decoded body:\x00\x00 GET /x" + "\x00")
+    assert "\x00" not in out
+    assert "decoded body:" in out          # surrounding content preserved
+    assert "[NUL*2]" in out and "[NUL*1]" in out  # null runs marked, with counts
 
 
 def test_neutralize_nul_helper():
@@ -263,7 +268,9 @@ class _FakeProc:
         self._stdout = stdout.encode()
         self.returncode = returncode
 
-    async def communicate(self):
+    async def communicate(self, input=None):  # noqa: A002 — match asyncio's signature
+        # The prompt body is now piped on STDIN (Windows command-line-length fix), so
+        # the backend calls communicate(input=...). Accept and ignore it.
         return self._stdout, b""
 
     def kill(self):  # pragma: no cover - only hit on timeout
@@ -344,3 +351,38 @@ async def test_run_non_max_turns_error_fails_fast(monkeypatch):
     with pytest.raises(RuntimeError):
         await backend.run("sys", [Message(role="user", content="hi")], [])
     assert caps == ["10"]  # failed fast, no retry
+
+
+async def test_run_keeps_command_line_tiny_with_huge_prompt(monkeypatch):
+    """Windows regression ([WinError 206], CreateProcess caps the command line at
+    32,767 chars). No matter how large the system prompt + conversation grow, NOTHING
+    large may reach argv: the body goes on STDIN, the system prompt to a temp FILE.
+    This is the cheap always-run guard for the bug that broke Windows after a few turns.
+    """
+    from zero.llm import claude_code as cc
+    from zero.llm.claude_code import ClaudeCodeBackend, ClaudeCodeConfig
+
+    monkeypatch.setattr(cc.shutil, "which", lambda b: "/usr/bin/claude")
+    captured: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        captured["argv"] = argv
+        captured["got_stdin_pipe"] = kwargs.get("stdin") is not None
+        return _FakeProc(_OK_FINAL, 0)
+
+    monkeypatch.setattr(cc.asyncio, "create_subprocess_exec", fake_exec)
+
+    huge = "A" * 100_000  # would be ~3x the Windows cap if it landed on argv
+    backend = ClaudeCodeBackend(ClaudeCodeConfig(retry_on_max_turns=False))
+    await backend.run(
+        system_prompt=huge,
+        messages=[Message(role="user", content=huge)],
+        tools=[{"name": "t", "description": huge, "risk_level": "safe", "schema": {}}],
+    )
+    argv = captured["argv"]
+    assert captured["got_stdin_pipe"], "prompt body must be piped on stdin"
+    assert huge not in argv                       # the inline string never appears
+    assert all(len(a) < 1000 for a in argv), [len(a) for a in argv]
+    assert sum(len(a) for a in argv) < 4000       # whole command line << 32,767
+    # The system prompt is referenced by FILE path, not inlined.
+    assert "--system-prompt-file" in argv and "--system-prompt" not in argv

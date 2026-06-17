@@ -144,33 +144,40 @@ def neutralize_nul(s: str) -> str:
 def build_mode_a_argv(
     *,
     binary: str,
-    prompt: str,
     max_turns: int,
     disallowed_tools: tuple[str, ...],
-    system_prompt: str = "",
+    system_prompt_path: str = "",
     setting_sources: str = "",
     lock_down_tools: bool = False,
     model: str = "",
 ) -> list[str]:
     """Pure-function argv assembly — easy to unit test.
 
-    When `system_prompt` is given it goes to `--system-prompt` (REPLACING Claude
-    Code's own identity so the agent IS our pentester/validator, not Claude Code),
-    and `prompt` carries only the dynamic tools+conversation body. `setting_sources`
-    (e.g. "user") drops project/local settings so the repo's CLAUDE.md doesn't leak.
-    `lock_down_tools` strips every real tool via an empty `--allowedTools ""` whitelist
-    (+ no MCP + no skills + a denylist backstop) so the model can only emit our envelope
-    text — see ClaudeCodeConfig.lock_down_tools (and why `--tools ""` does NOT work)."""
+    The two BIG strings — the conversation/tools body and the system prompt — are
+    deliberately NOT argv elements:
+      * the body is fed to claude on STDIN (`--print` with no positional prompt), and
+      * the system prompt is written to a temp file passed via `--system-prompt-file`.
+    This is required for Windows: argv there goes through `CreateProcess`, whose total
+    command line is capped at 32,767 chars — and our body (tool catalog ~18 KB + a
+    growing transcript) blows past that within a few turns, raising
+    `[WinError 206] The filename or extension is too long`. POSIX has a much larger
+    ARG_MAX so it only ever bit Windows, but stdin/file keeps the command line tiny on
+    every platform. `--system-prompt-file` still REPLACES Claude Code's own identity so
+    the agent IS our pentester/validator. `setting_sources` (e.g. "user") drops
+    project/local settings so the repo's CLAUDE.md doesn't leak. `lock_down_tools`
+    strips every real tool via an empty `--allowedTools ""` whitelist (+ no MCP + no
+    skills + a denylist backstop) — see ClaudeCodeConfig.lock_down_tools (and why
+    `--tools ""` does NOT work)."""
     argv = [
         binary,
-        "-p", neutralize_nul(prompt),
+        "--print",  # non-interactive; the prompt body arrives on STDIN, not argv
         "--output-format", "json",
         "--max-turns", str(max_turns),
     ]
     if model:
         argv += ["--model", model]
-    if system_prompt:
-        argv += ["--system-prompt", neutralize_nul(system_prompt)]
+    if system_prompt_path:
+        argv += ["--system-prompt-file", system_prompt_path]
     if setting_sources:
         argv += ["--setting-sources", setting_sources]
     if lock_down_tools:
@@ -236,35 +243,58 @@ class ClaudeCodeBackend(LLMBackend):
     async def _run_once(
         self, binary: str, prompt: str, max_turns: int, system_prompt: str = ""
     ) -> tuple[str, int | None, str]:
-        """Run one `claude -p` invocation. Returns (stdout, returncode, stderr)."""
-        argv = build_mode_a_argv(
-            binary=binary,
-            prompt=prompt,
-            max_turns=max_turns,
-            disallowed_tools=self.cfg.disallowed_tools,
-            system_prompt=system_prompt,
-            setting_sources=self.cfg.setting_sources,
-            lock_down_tools=self.cfg.lock_down_tools,
-            model=self.cfg.model or "",
-        )
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        """Run one `claude -p` invocation. Returns (stdout, returncode, stderr).
+
+        The big strings are kept OFF the command line (Windows `CreateProcess` caps it
+        at 32,767 chars → `[WinError 206]`): the system prompt goes to a temp file
+        (`--system-prompt-file`) and the conversation body is piped on STDIN."""
+        sp_path = ""
+        if system_prompt:
+            # Temp file deleted in `finally`. NamedTemporaryFile(delete=False) so the
+            # child process can open it by name on Windows (can't share an open handle).
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".md", delete=False, encoding="utf-8"
+            ) as fh:
+                fh.write(neutralize_nul(system_prompt))
+                sp_path = fh.name
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.cfg.timeout_seconds
+            argv = build_mode_a_argv(
+                binary=binary,
+                max_turns=max_turns,
+                disallowed_tools=self.cfg.disallowed_tools,
+                system_prompt_path=sp_path,
+                setting_sources=self.cfg.setting_sources,
+                lock_down_tools=self.cfg.lock_down_tools,
+                model=self.cfg.model or "",
             )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise TimeoutError(f"claude -p timed out after {self.cfg.timeout_seconds}s")
-        return (
-            stdout.decode("utf-8", errors="replace").strip(),
-            proc.returncode,
-            stderr.decode("utf-8", errors="replace").strip(),
-        )
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdin_bytes = neutralize_nul(prompt).encode("utf-8")
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(input=stdin_bytes), timeout=self.cfg.timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise TimeoutError(
+                    f"claude -p timed out after {self.cfg.timeout_seconds}s"
+                )
+            return (
+                stdout.decode("utf-8", errors="replace").strip(),
+                proc.returncode,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+        finally:
+            if sp_path:
+                try:
+                    os.unlink(sp_path)
+                except OSError:
+                    pass
 
 
 def _extract_claude_error(stdout: str) -> str:
@@ -403,15 +433,18 @@ def build_mcp_config(
 def build_mode_b_argv(
     *,
     binary: str,
-    prompt: str,
     mcp_config_path: Path,
     disallowed_builtin_tools: tuple[str, ...],
     model: str = "",
 ) -> list[str]:
-    """Pure-function assembly of the Mode B `claude` argv."""
+    """Pure-function assembly of the Mode B `claude` argv.
+
+    Like Mode A, the prompt is fed on STDIN (`--print`, no positional prompt) rather
+    than as an argv element, so a large goal+project-context body can't overflow the
+    Windows `CreateProcess` command-line limit (`[WinError 206]`)."""
     argv = [
         binary,
-        "-p", neutralize_nul(prompt),
+        "--print",  # prompt arrives on STDIN
         "--output-format", "json",
         "--mcp-config", str(mcp_config_path),
     ]
@@ -456,7 +489,6 @@ class ClaudeCodeBackendModeB:
         try:
             argv = build_mode_b_argv(
                 binary=binary,
-                prompt=prompt,
                 mcp_config_path=cfg_path,
                 disallowed_builtin_tools=self.cfg.disallowed_builtin_tools,
                 model=self.cfg.model or "",
@@ -465,12 +497,14 @@ class ClaudeCodeBackendModeB:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 env=env,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.cfg.timeout_seconds
+                    proc.communicate(input=neutralize_nul(prompt).encode("utf-8")),
+                    timeout=self.cfg.timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 proc.kill()
