@@ -29,7 +29,7 @@ from zero.agents.validator import (
 from zero.findings.dedup import dedup_hash
 from zero.findings.schema import Finding, FindingRecord, Validation, Verdict
 from zero.findings.store import FindingsStore, new_finding_id
-from zero.llm.backend import LLMBackend
+from zero.llm.backend import LLMBackend, Session
 from zero.llm.envelope import ActionEnvelope, ActionsEnvelope, AskUserEnvelope, FinalEnvelope
 
 
@@ -53,6 +53,7 @@ class AgentRouter:
         project_context: str | None,
         validator_max_turns: int = 40,
         goal: str | None = None,
+        session_factory: "Callable[[str], Session | None] | None" = None,
     ) -> None:
         self.store = store
         self.backend = backend
@@ -62,6 +63,10 @@ class AgentRouter:
         # Operator goal (carries the base URL/host). The validator doesn't see
         # the orchestrator's conversation, so we seed it alongside the finding.
         self.goal = goal
+        # Makes a fresh persistent-claude session per validator (or None when
+        # session-resume is off / non-claude backend). Injected by the orchestrator
+        # so the router doesn't need to know the backend type.
+        self._session_factory = session_factory
 
     async def handle_finding_submit(
         self,
@@ -92,6 +97,7 @@ class AgentRouter:
             validator_tools,
             project_context=self.project_context,
             max_turns=self.validator_max_turns,
+            session=self._session_factory(f"validator-{h[:8]}") if self._session_factory else None,
         )
         seed_with_finding(loop, finding)
         if self.goal:

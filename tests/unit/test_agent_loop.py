@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+
+import pytest
 
 from zero.agents.base import AgentLoop
-from zero.llm.backend import LLMBackend, LLMResponse, Message
+from zero.llm.backend import LLMBackend, LLMResponse, Message, Session
 from zero.llm.echo import EchoBackend
 from zero.llm.envelope import (
     ActionEnvelope,
@@ -26,6 +27,91 @@ class ScriptedBackend(LLMBackend):
         if not self._responses:
             raise AssertionError("script exhausted")
         return LLMResponse(text=self._responses.pop(0))
+
+
+class SessionAwareBackend(LLMBackend):
+    """Records, per call, whether the session was already `started` (resuming) and the
+    exact `messages` it received. Mimics ClaudeCodeBackend's contract: a successful
+    create flips `session.started=True`. Optionally raises on a chosen call index to
+    exercise session-loss recovery."""
+
+    def __init__(self, responses: list[str], *, fail_on_call: int | None = None) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[bool, list[Message]]] = []
+        self._fail_on = fail_on_call
+        self._n = 0
+
+    async def run(self, system_prompt, messages, tools, *, session: Session | None = None):
+        started_before = bool(session and session.started)
+        self.calls.append((started_before, list(messages)))
+        n, self._n = self._n, self._n + 1
+        if self._fail_on is not None and n == self._fail_on:
+            raise RuntimeError("simulated session lost")
+        if session is not None and not session.started:
+            session.started = True  # create succeeded → next call resumes
+        if not self._responses:
+            raise AssertionError("script exhausted")
+        return LLMResponse(text=self._responses.pop(0))
+
+
+_ACT = json.dumps({"type": "action", "tool": "x", "args": {}})
+_FIN = json.dumps({"type": "final", "answer": "ok"})
+
+
+async def test_session_sends_full_then_delta_only():
+    """With a Session, turn 1 sends the full history (create) and later turns send ONLY
+    the messages appended since — claude holds the rest. The model's own assistant
+    replies and already-sent messages are never re-shipped."""
+    backend = SessionAwareBackend([_ACT, _FIN])
+    sess = Session(id="UUID-1", name="pentester-rosa_1")
+    loop = AgentLoop(backend, system_prompt="sys", tools=[], session=sess)
+    loop.add_user_message("brief")
+
+    await loop.step()                       # turn 1 → create
+    loop.add_observation("x", True, "OBS1")
+    await loop.step()                       # turn 2 → resume
+
+    # Turn 1: not started yet, full history (just the brief so far).
+    assert backend.calls[0][0] is False
+    assert [m.content for m in backend.calls[0][1]] == ["brief"]
+    # Turn 2: session started, delta is ONLY the new observation.
+    assert backend.calls[1][0] is True
+    delta = backend.calls[1][1]
+    assert any("OBS1" in m.content for m in delta)
+    assert all("brief" not in m.content for m in delta)      # not re-sent
+    assert all(m.role != "assistant" for m in delta)         # claude's reply not re-sent
+    assert sess.started is True
+
+
+async def test_session_none_sends_full_history_each_turn():
+    """The legacy (stateless) path is unchanged: every call gets the whole transcript."""
+    backend = SessionAwareBackend([_ACT, _FIN])
+    loop = AgentLoop(backend, system_prompt="sys", tools=[], session=None)
+    loop.add_user_message("brief")
+    await loop.step()
+    loop.add_observation("x", True, "OBS1")
+    await loop.step()
+    # Turn 2 sees brief + assistant reply + observation (the full grown history).
+    assert len(backend.calls[1][1]) == 3
+    assert any("brief" in m.content for m in backend.calls[1][1])
+
+
+async def test_session_recovery_regenerates_id_on_failure():
+    """If a call fails (e.g. the create's `--session-id` was claimed but errored, or a
+    resume lost the session), the loop gives the session a FRESH id and drops back to a
+    full create — so the retry can't hit 'Session ID already in use' and replays the
+    whole transcript."""
+    backend = SessionAwareBackend([_ACT], fail_on_call=1)
+    sess = Session(id="UUID-2")
+    loop = AgentLoop(backend, system_prompt="sys", tools=[], session=sess)
+    loop.add_user_message("brief")
+    await loop.step()                       # call 0: create OK
+    loop.add_observation("x", True, "OBS1")
+    with pytest.raises(RuntimeError):
+        await loop.step()                   # call 1: resume → raises
+    assert sess.id != "UUID-2"              # fresh id ⇒ retry create can't clash
+    assert sess.started is False            # recovery: re-create next time
+    assert loop._sent_idx == 0              # next send replays the full transcript
 
 
 async def test_periodic_reminder_injected_every_n_turns():

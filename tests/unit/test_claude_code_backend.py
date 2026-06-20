@@ -42,6 +42,54 @@ def test_mode_a_argv_omits_identity_flags_when_unset():
     assert "--setting-sources" not in argv
 
 
+def test_mode_a_argv_session_create():
+    """Create turn: pin the session UUID (--session-id), pass the identity/settings, and
+    a debug display name (-n). NOT --resume."""
+    argv = build_mode_a_argv(
+        binary="claude", max_turns=4, disallowed_tools=("LSP",),
+        system_prompt_path="/tmp/sys.md", setting_sources="user", lock_down_tools=True,
+        session_id="UUID-1", session_name="pentester-rosa_1", resume=False,
+    )
+    assert _argval(argv, "--session-id") == "UUID-1"
+    assert _argval(argv, "-n") == "pentester-rosa_1"
+    assert "--resume" not in argv
+    assert _argval(argv, "--system-prompt-file") == "/tmp/sys.md"
+    assert _argval(argv, "--setting-sources") == "user"
+    assert "--allowedTools" in argv  # lock-down on the create turn
+
+
+def test_mode_a_argv_session_resume():
+    """Resume turn: continue the session (--resume), and DROP the identity/settings/name
+    (they live in the session) while KEEPING the lock-down + model."""
+    argv = build_mode_a_argv(
+        binary="claude", max_turns=4, disallowed_tools=("LSP",),
+        system_prompt_path="", setting_sources="", lock_down_tools=True,
+        model="claude-opus-4-8[1m]", session_id="UUID-1", resume=True,
+    )
+    assert _argval(argv, "--resume") == "UUID-1"
+    assert "--session-id" not in argv
+    assert "--system-prompt-file" not in argv
+    assert "--setting-sources" not in argv
+    assert "-n" not in argv
+    assert _argval(argv, "--model") == "claude-opus-4-8[1m]"
+    assert "--allowedTools" in argv  # lock-down still enforced on resume
+
+
+def test_build_user_prompt_omits_catalog_when_no_tools():
+    """The resume body carries only the new conversation — no '## Available tools'
+    section (the catalog was sent once on the create turn)."""
+    from zero.llm.backend import Message
+
+    body = build_user_prompt([Message(role="observation", content="HTTP 200")], [])
+    assert "## Available tools" not in body
+    assert "HTTP 200" in body
+    # ...but with tools present (the create turn) the catalog IS included.
+    with_tools = build_user_prompt(
+        [], [{"name": "curl_raw", "risk_level": "active", "description": "d"}]
+    )
+    assert "## Available tools" in with_tools and "curl_raw" in with_tools
+
+
 def test_build_user_prompt_excludes_system_prompt():
     tools = [{"name": "t", "description": "d", "risk_level": "safe", "schema": {"type": "object"}}]
     p = build_user_prompt([Message(role="user", content="hi")], tools)

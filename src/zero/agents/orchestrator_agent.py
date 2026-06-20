@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from zero.agents.base import AgentLoop
-from zero.llm.backend import LLMBackend
+from zero.llm.backend import LLMBackend, Session
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "orchestrator_system.md"
 
@@ -32,6 +32,7 @@ def build_orchestrator_loop(
     *,
     project_context: str | None = None,
     max_turns: int = 20,
+    session: Session | None = None,
 ) -> AgentLoop:
     return AgentLoop(
         backend=backend,
@@ -40,6 +41,7 @@ def build_orchestrator_loop(
         max_turns=max_turns,
         reminder_text=ORCHESTRATOR_REMINDER,
         reminder_every=3,
+        session=session,
     )
 
 

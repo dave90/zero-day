@@ -56,6 +56,8 @@ class EchoBackend(LLMBackend):
         system_prompt: str,
         messages: list[Message],
         tools: list[dict[str, Any]],
+        *,
+        session: Any = None,  # accepted + ignored; this fixture is stateless
     ) -> LLMResponse:
         if self._idx >= len(self._script):
             env: dict[str, Any] = {"type": "final", "answer": "(echo backend exhausted)"}

@@ -18,6 +18,23 @@ class Message:
 
 
 @dataclass
+class Session:
+    """A persistent `claude` conversation, keyed by a stable UUID.
+
+    Lets the ClaudeCodeBackend talk to one claude session across many `claude -p`
+    calls (`--session-id` to create, `--resume` to continue) so we send only the
+    NEW messages each turn instead of re-shipping the whole transcript — claude
+    holds the conversation and does the caching/context management itself. One
+    Session per actor (orchestrator + each subagent). `started` flips to True after
+    the create call; `name` is a human-readable label (`-n`) for debugging only.
+    Backends that aren't session-aware (echo/scripted/replay) ignore it."""
+
+    id: str
+    name: str = ""
+    started: bool = False
+
+
+@dataclass
 class LLMResponse:
     text: str
     usage: dict[str, int] = field(default_factory=dict)
@@ -50,14 +67,25 @@ class LLMBackend(ABC):
         system_prompt: str,
         messages: list[Message],
         tools: list[dict[str, Any]],
-    ) -> LLMResponse: ...
+        *,
+        session: Session | None = None,
+    ) -> LLMResponse:
+        """Run one turn. `session=None` (default) ⇒ stateless: `messages` is the FULL
+        conversation and the backend re-sends it every call (legacy behavior, used by
+        echo/scripted/replay fixtures). When a `Session` is given, a session-aware
+        backend (ClaudeCodeBackend) creates/continues that claude session and treats
+        `messages` as the DELTA to append — see Session. Backends that don't support
+        sessions must accept and ignore the kwarg."""
+        ...
 
     async def stream(
         self,
         system_prompt: str,
         messages: list[Message],
         tools: list[dict[str, Any]],
+        *,
+        session: Session | None = None,
     ) -> AsyncIterator[str]:
         """Optional: stream tokens. Default falls back to one-shot run."""
-        resp = await self.run(system_prompt, messages, tools)
+        resp = await self.run(system_prompt, messages, tools, session=session)
         yield resp.text

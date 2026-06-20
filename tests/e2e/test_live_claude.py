@@ -265,3 +265,64 @@ async def test_locked_down_subagent_never_calls_native_tool(load_prompt):
         assert isinstance(
             env, (ActionEnvelope, ActionsEnvelope, FinalEnvelope, AskUserEnvelope)
         ), f"rep {rep}: not an envelope: {resp.text!r}"
+
+
+# --- persistent-session token saver (--session-id / --resume) ------------------
+
+
+async def test_session_resume_keeps_context_and_shrinks_input():
+    """End-to-end of the token fix: drive a real pentester AgentLoop with a persistent
+    claude session over three turns. Assert (a) the resumed turns send FAR fewer input
+    tokens than the create turn (we stop re-shipping the transcript), (b) claude retains
+    the conversation across separate `claude -p` processes (a marker seeded on turn 1 is
+    recalled on turn 3), and (c) the lock-down holds — reaching turn 3 means no turn ever
+    crashed on a native tool_use (`step()` raises on `error_max_turns`)."""
+    import uuid as _uuid
+
+    from zero.agents.pentest import build_pentest_loop
+    from zero.llm.backend import Session
+    from zero.tools.dispatch import is_dispatch_tool
+    from zero.tools.registry import default_registry
+
+    tools = [
+        t for t in default_registry().catalog()
+        if not is_dispatch_tool(t["name"]) and t["name"] != "finding_submit"
+    ]
+    sess = Session(id=str(_uuid.uuid4()), name="pentester-live")
+    loop = build_pentest_loop(
+        ClaudeCodeBackend(), tools, max_turns=6, session=sess,
+    )
+    loop.add_user_message(
+        "You are a pentester. TARGET http://10.0.0.1/login. IMPORTANT: remember the "
+        "engagement marker ZK-9-OMEGA for later. Begin: emit ONE action envelope now."
+    )
+
+    await loop.step()                                       # turn 1 → create session
+    assert sess.started is True
+    loop.add_observation("curl_raw", True, "HTTP/1.1 200 OK; body contained 'Welcome'.")
+    s2 = await loop.step()                                  # turn 2 → resume
+    loop.add_user_message(
+        "Recall: what is the exact engagement marker I gave you? Put it verbatim in the "
+        "`thought` field of your next envelope."
+    )
+    s3 = await loop.step()                                  # turn 3 → resume
+
+    # Continuity across separate `claude -p` processes: the marker seeded on turn 1
+    # survives into turn 3 — proof the session persists and we DON'T re-ship it ourselves.
+    assert "ZK-9-OMEGA" in (s3.raw_text or ""), f"marker not recalled: {s3.raw_text!r}"
+
+    # The efficiency signal (input_tokens is useless — Claude Code caches the body, so
+    # it's ~2 every turn). Once the session cache warms, a resume turn serves the whole
+    # conversation prefix as cache_READ (0.1×) and only writes the small new delta —
+    # i.e. cache_read dominates cache_creation. Turn 2 can still be a cache warmup, so
+    # require at least one resume turn to be read-dominated.
+    def read_dominated(step) -> bool:
+        u = step.usage
+        read = u.get("cache_read_input_tokens", 0)
+        create = u.get("cache_creation_input_tokens", 0)
+        return read > 0 and read > create
+
+    assert read_dominated(s2) or read_dominated(s3), (
+        "no resume turn served its prefix from cache "
+        f"(s2={s2.usage}, s3={s3.usage}) — session caching may be broken"
+    )

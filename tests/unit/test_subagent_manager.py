@@ -34,6 +34,35 @@ def _result(rec, status="NO_FINDING", **kw):
     )
 
 
+async def test_max_total_gates_dispatch_independently_of_concurrency():
+    """`--max-total-subagents` is a hard ceiling on the TOTAL ever spawned (≠ the
+    concurrency cap). `at_total_capacity()` flips True once the quota is spawned, and
+    counts validators as well as pentesters."""
+    async def runner(rec):
+        return _result(rec)
+
+    mgr = SubagentManager(
+        max_concurrent=10, max_total=2, runner=runner, emit=lambda e: asyncio.sleep(0)
+    )
+    assert mgr.at_total_capacity() is False
+    mgr.spawn("pentester", target="/t", idea="i")
+    assert mgr.at_total_capacity() is False
+    mgr.spawn("validator", target="/t", idea="i")          # 2nd → quota reached
+    assert mgr.at_total_capacity() is True
+
+
+async def test_max_total_zero_is_unlimited():
+    async def runner(rec):
+        return _result(rec)
+
+    mgr = SubagentManager(
+        max_concurrent=10, max_total=0, runner=runner, emit=lambda e: asyncio.sleep(0)
+    )
+    for _ in range(25):
+        mgr.spawn("pentester", target="/t", idea="i")
+    assert mgr.at_total_capacity() is False                 # 0 ⇒ never at capacity
+
+
 async def test_semaphore_caps_concurrency():
     gate = asyncio.Event()
     active = 0

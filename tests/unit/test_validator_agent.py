@@ -49,6 +49,30 @@ def test_parse_validation_bad_returns_none():
     assert parse_validation(FinalEnvelope(answer="{}")) is None
 
 
+def test_parse_validation_salvages_prose_verdict():
+    """Regression: on a `--resume` session the validator often drops the JSON-answer
+    format and emits a prose verdict like 'VALIDATION: CONFIRMED — …'. A clearly-stated
+    verdict must be salvaged (verdict + prose rationale), not discarded as `pending`."""
+    # Real prose finals observed in a session-resume run.
+    for prose in (
+        "VALIDATION: CONFIRMED — Reflected XSS in the error page (CWE-79, medium).",
+        "VALIDATION — VERDICT: CONFIRMED",
+        "VALIDATION: CONFIRMED (high confidence)",
+    ):
+        v = parse_validation(FinalEnvelope(answer=prose))
+        assert v is not None and v.verdict == "confirmed", prose
+        assert v.rationale == prose                       # prose kept as rationale
+
+    # An explicit 'rejected' marker wins over an earlier mention of another word.
+    v = parse_validation(
+        FinalEnvelope(answer="Could not reproduce. VERDICT: rejected — no reflection.")
+    )
+    assert v is not None and v.verdict == "rejected"
+
+    # No verdict word at all → still None (don't invent a verdict).
+    assert parse_validation(FinalEnvelope(answer="the weather is nice today")) is None
+
+
 def test_validator_recovers_when_model_uses_sibling_key():
     """End-to-end: the real-world bug was claude emitting
         {"type":"final","validation":{...}}

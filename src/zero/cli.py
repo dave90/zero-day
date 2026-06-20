@@ -134,7 +134,15 @@ def main() -> None:
     type=int,
     default=10,
     show_default=True,
-    help="Max concurrent subagents in orchestrated mode (c).",
+    help="Max CONCURRENT subagents in orchestrated mode (c) — how many run at once.",
+)
+@click.option(
+    "--max-total-subagents",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Hard cap on the TOTAL subagents (pentesters + validators) dispatched over the"
+    " whole run (orchestrated mode c). 0 = unlimited. Cost-control knob.",
 )
 @click.option(
     "--container/--no-container",
@@ -156,6 +164,16 @@ def main() -> None:
     "--host-network",
     is_flag=True,
     help="Run the sandbox on the host network (needed for Burp on 127.0.0.1).",
+)
+@click.option(
+    "--session-resume/--no-session-resume",
+    default=True,
+    show_default=True,
+    help=(
+        "Keep one persistent `claude` session per actor and send only each new turn"
+        " via --resume (claude holds + caches the history) instead of re-shipping the"
+        " whole transcript every call. Big token saver; claude-backend only."
+    ),
 )
 @click.option(
     "--burp-dir",
@@ -238,9 +256,11 @@ def run(
     pentester_max_turns: int,
     subagent_deadline: int,
     max_subagents: int,
+    max_total_subagents: int,
     container: bool,
     container_image: str,
     host_network: bool,
+    session_resume: bool,
     burp_dir: Path | None,
     files_root: Path,
     container_cpus: float,
@@ -269,6 +289,7 @@ def run(
         cwd=Path.cwd(),
         goal=goal,
         backend=backend,
+        session_resume=session_resume,
         auto_approve=approve,
         yolo=yolo,
         i_understand=i_understand,
@@ -281,6 +302,7 @@ def run(
         pentester_max_turns=pentester_max_turns,
         subagent_deadline_seconds=subagent_deadline,
         max_concurrent_subagents=max_subagents,
+        max_total_subagents=max_total_subagents,
         use_container=container,
         container_image=container_image,
         host_network=host_network,

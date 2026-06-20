@@ -95,9 +95,14 @@ class SubagentManager:
         max_concurrent: int,
         runner: Runner,
         emit: Emit,
+        max_total: int = 0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.max_concurrent = max_concurrent
+        # Hard ceiling on the TOTAL subagents ever spawned this run (0 = unlimited).
+        # Distinct from `max_concurrent` (how many run AT ONCE). `_counter` is the
+        # running total, so `at_total_capacity()` gates further dispatches.
+        self.max_total = max_total
         self._sem = asyncio.Semaphore(max_concurrent)
         self._runner = runner
         self._emit = emit
@@ -110,6 +115,11 @@ class SubagentManager:
         self._counter = 0
 
     # --------------------------------------------------------------- dispatch
+
+    def at_total_capacity(self) -> bool:
+        """True once `max_total` subagents have been spawned this run (the orchestrator
+        checks this before dispatching). Always False when max_total is 0 (unlimited)."""
+        return bool(self.max_total) and self._counter >= self.max_total
 
     def spawn(
         self,

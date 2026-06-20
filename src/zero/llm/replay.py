@@ -27,6 +27,8 @@ class ReplayBackend(LLMBackend):
         system_prompt: str,
         messages: list[Message],
         tools: list[dict[str, Any]],
+        *,
+        session: Any = None,  # accepted + ignored; replay is index-driven
     ) -> LLMResponse:
         if self._idx >= len(self._script):
             return LLMResponse(

@@ -20,7 +20,7 @@ from pydantic import ValidationError
 
 from zero.agents.pentest import build_pentest_loop
 from zero.agents.orchestrator_agent import build_orchestrator_loop, parse_pentester_result
-from zero.llm.backend import LLMBackend
+from zero.llm.backend import LLMBackend, Session
 from zero.llm.envelope import (
     ActionEnvelope,
     ActionsEnvelope,
@@ -118,6 +118,12 @@ class OrchestratorConfig:
     cwd: Path
     goal: str | None = None
     backend: str = "claude"  # production default; "echo" is a test-only fixture
+    # Persistent `claude` sessions: each actor (orchestrator + every subagent) keeps a
+    # `claude --session-id` conversation and sends only the new turn via `--resume`,
+    # instead of re-shipping the whole transcript every call. Massive token win (claude
+    # holds + caches the history). claude-backend only; `--no-session-resume` reverts to
+    # the stateless re-ship-everything path.
+    session_resume: bool = True
     auto_approve: set[str] = field(default_factory=set)
     yolo: bool = False
     i_understand: bool = False
@@ -155,6 +161,11 @@ class OrchestratorConfig:
     subagent_deadline_seconds: int = 1200
     # Orchestrated mode (M8): cap on concurrently-running subagents.
     max_concurrent_subagents: int = 10
+    # Hard ceiling on the TOTAL subagents (pentesters + validators) dispatched over
+    # the whole run — distinct from the concurrency cap above. 0 = unlimited. Once
+    # reached, dispatch_pentester/dispatch_validator are refused and the orchestrator
+    # is told to finalize with what it has. Cost-control knob (--max-total-subagents).
+    max_total_subagents: int = 0
     # M4 sandbox knobs. Secure by default: run tools INSIDE the container, and
     # proxy ALL of them there (not just python_exec). Falls back to host (with
     # the approval guard) if Docker isn't available. Use --no-container to opt
@@ -290,6 +301,15 @@ class Orchestrator:
             wf.blocked_hosts = {h.lower() for h in self.cfg.scope_hosts}
         return reg
 
+    def _make_session(self, label: str) -> Session | None:
+        """A fresh persistent-claude session for one actor, or None when session-resume
+        is off or the backend isn't claude (echo/replay are stateless — they must keep
+        getting the full transcript). `id` is a UUID (`--session-id` requires one);
+        `label` becomes the `-n` display name for debugging only."""
+        if not self.cfg.session_resume or self.cfg.backend != "claude":
+            return None
+        return Session(id=str(uuid.uuid4()), name=label)
+
     def _build_backend(self) -> LLMBackend:
         if self.cfg.backend == "echo":
             from zero.llm.echo import EchoBackend
@@ -409,6 +429,7 @@ class Orchestrator:
             project_context=project_ctx,
             validator_max_turns=self.cfg.validator_max_turns,
             goal=self.cfg.goal,
+            session_factory=self._make_session,
         )
 
         if self.cfg.execution_mode == "b":
@@ -728,6 +749,7 @@ class Orchestrator:
             tools=self.registry.catalog(),
             project_context=project_ctx,
             max_turns=self.cfg.max_turns,
+            session=self._make_session("pentest"),
         )
         self._active_loop = loop  # for the status bar's context-window usage
         if self.cfg.goal:
@@ -1020,6 +1042,7 @@ class Orchestrator:
         self._go_idle = False
         self.subagents = SubagentManager(
             max_concurrent=self.cfg.max_concurrent_subagents,
+            max_total=self.cfg.max_total_subagents,
             runner=self._run_subagent,
             emit=self._emit,
         )
@@ -1047,6 +1070,7 @@ class Orchestrator:
             tools=recon + disp,
             project_context=project_ctx,
             max_turns=self.cfg.max_turns,
+            session=self._make_session("orchestrator"),
         )
         self._active_loop = loop  # for the status bar's context-window usage
         base_system_prompt = loop.system_prompt
@@ -1260,6 +1284,16 @@ class Orchestrator:
         for the orchestrator loop, or None when the session is ending."""
         assert self.subagents is not None
         tool, args = env.tool, env.args
+
+        # Hard total-subagent budget (--max-total-subagents): refuse new dispatches once
+        # the run has spawned its quota, BEFORE any per-tool bookkeeping. Counts both
+        # pentesters and validators. 0 ⇒ unlimited (at_total_capacity always False).
+        if tool in ("dispatch_pentester", "dispatch_validator") and self.subagents.at_total_capacity():
+            return (
+                f"subagent budget reached ({self.cfg.max_total_subagents} total subagents this "
+                f"run) — '{tool}' refused. Do NOT dispatch more: await any running subagents, "
+                "validate the strongest candidates already in hand, then call `finalize`."
+            )
 
         if tool == "dispatch_pentester":
             try:
@@ -1483,6 +1517,7 @@ class Orchestrator:
             # inherit the orchestrator's large max_turns, which let a single
             # idea run 40+ turns. An explicit dispatch max_turns still wins.
             max_turns=rec.max_turns or self.cfg.pentester_max_turns,
+            session=self._make_session(f"pentester-{rec.id}"),
         )
         rec.loop = loop
         brief = (

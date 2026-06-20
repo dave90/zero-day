@@ -23,11 +23,12 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from zero.llm.backend import LLMBackend, LLMResponse, Message
+from zero.llm.backend import LLMBackend, LLMResponse, Message, Session
 
 
 # claude's built-in tools that we must disable in Mode A: we route every
@@ -150,6 +151,9 @@ def build_mode_a_argv(
     setting_sources: str = "",
     lock_down_tools: bool = False,
     model: str = "",
+    session_id: str = "",
+    session_name: str = "",
+    resume: bool = False,
 ) -> list[str]:
     """Pure-function argv assembly — easy to unit test.
 
@@ -176,6 +180,18 @@ def build_mode_a_argv(
     ]
     if model:
         argv += ["--model", model]
+    # Persistent-session flags. On `resume` we CONTINUE an existing claude session
+    # (`--resume <uuid>`) and send only the new conversation delta on stdin — the
+    # system prompt, settings, and tool catalog were all fixed on the create turn and
+    # live in the session, so they are deliberately NOT re-sent here. On create we
+    # pin the session id (`--session-id <uuid>`, must be a valid UUID) and pass the
+    # identity/settings; `-n` is a human-readable label for debugging only.
+    if resume and session_id:
+        argv += ["--resume", session_id]
+    elif session_id:
+        argv += ["--session-id", session_id]
+        if session_name:
+            argv += ["-n", session_name]
     if system_prompt_path:
         argv += ["--system-prompt-file", system_prompt_path]
     if setting_sources:
@@ -201,6 +217,8 @@ class ClaudeCodeBackend(LLMBackend):
         system_prompt: str,
         messages: list[Message],
         tools: list[dict[str, Any]],
+        *,
+        session: Session | None = None,
     ) -> LLMResponse:
         binary = shutil.which(self.cfg.binary)
         if not binary:
@@ -208,25 +226,30 @@ class ClaudeCodeBackend(LLMBackend):
                 f"`{self.cfg.binary}` not on PATH; install Claude Code CLI or"
                 " run with --backend echo."
             )
-        # Our agent prompt goes to --system-prompt (see _DEFAULT_SETTING_SOURCES note);
-        # the `-p` body carries only the dynamic tools + conversation.
-        prompt = build_user_prompt(messages, tools)
+        # Session mode: when continuing an existing claude session (`--resume`),
+        # `messages` is only the NEW delta, the system prompt + tool catalog are
+        # already in the session, so we omit both (no `--system-prompt-file`, empty
+        # tools ⇒ build_user_prompt drops the catalog). On the create turn (or with no
+        # session at all) we send the full body + identity, pinning `--session-id`.
+        resuming = session is not None and session.started
+        body_tools = [] if resuming else tools
+        sys_for_call = "" if resuming else system_prompt
+        prompt = build_user_prompt(messages, body_tools)
 
-        # First attempt at the configured cap. claude's internal turn
-        # counter inflates on long prompts and can trip `error_max_turns`
-        # even though we never let it execute a tool — so on that specific
-        # failure, retry ONCE with extra headroom rather than crashing the
-        # whole turn (which, for the validator, would park a finding as
-        # pending for no good reason). Any other error fails fast.
+        # claude's internal turn counter inflates on long prompts and can trip
+        # `error_max_turns` even though we never let it execute a tool — so on that
+        # failure, retry ONCE with extra headroom rather than crashing the turn.
         caps = [self.cfg.max_turns]
         if self.cfg.retry_on_max_turns:
             caps.append(self.cfg.max_turns + self.cfg.max_turns_retry_bonus)
         last_error: str | None = None
         for attempt, max_turns in enumerate(caps):
             out_text, returncode, err = await self._run_once(
-                binary, prompt, max_turns, system_prompt
+                binary, prompt, max_turns, sys_for_call, session=session, resume=resuming
             )
             if returncode == 0:
+                if session is not None and not resuming:
+                    session.started = True  # create succeeded → continue with --resume
                 return parse_claude_json(out_text)
             # claude often reports structured errors on stdout even with
             # exit != 0. Extract a tight one-liner instead of dumping the
@@ -235,13 +258,26 @@ class ClaudeCodeBackend(LLMBackend):
             last_error = f"claude -p exit {returncode}: {detail}"
             is_max_turns = "error_max_turns" in detail
             if is_max_turns and attempt + 1 < len(caps):
+                # A create that errored has ALREADY claimed its `--session-id`, so
+                # retrying the create with the same id fails "Session ID already in
+                # use". Give the session a FRESH id (the stdin body still carries the
+                # full seed) so the retry is a clean create. (Resume keeps its id.)
+                if session is not None and not resuming:
+                    session.id = str(uuid.uuid4())
                 continue  # retry with more turns
             raise RuntimeError(last_error)
         # Unreachable (the loop always returns or raises), but keeps types happy.
         raise RuntimeError(last_error or "claude -p failed")
 
     async def _run_once(
-        self, binary: str, prompt: str, max_turns: int, system_prompt: str = ""
+        self,
+        binary: str,
+        prompt: str,
+        max_turns: int,
+        system_prompt: str = "",
+        *,
+        session: Session | None = None,
+        resume: bool = False,
     ) -> tuple[str, int | None, str]:
         """Run one `claude -p` invocation. Returns (stdout, returncode, stderr).
 
@@ -263,9 +299,14 @@ class ClaudeCodeBackend(LLMBackend):
                 max_turns=max_turns,
                 disallowed_tools=self.cfg.disallowed_tools,
                 system_prompt_path=sp_path,
-                setting_sources=self.cfg.setting_sources,
+                # On resume the session already carries the settings; only pass
+                # --setting-sources on the create turn (alongside --system-prompt-file).
+                setting_sources="" if resume else self.cfg.setting_sources,
                 lock_down_tools=self.cfg.lock_down_tools,
                 model=self.cfg.model or "",
+                session_id=session.id if session else "",
+                session_name=session.name if session else "",
+                resume=resume,
             )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -361,8 +402,14 @@ def build_user_prompt(
 ) -> str:
     """The `-p` body: tool catalog + history (no system prompt — that goes to
     `--system-prompt` so the agent's identity isn't a mere user message under Claude
-    Code's own system prompt)."""
-    parts = ["## Available tools", _format_tools(tools), ""]
+    Code's own system prompt).
+
+    `tools` empty ⇒ the `## Available tools` section is omitted entirely. That's the
+    session-`--resume` path: the catalog was sent ONCE on the create turn and lives in
+    claude's session, so later turns send only the new conversation delta."""
+    parts: list[str] = []
+    if tools:
+        parts += ["## Available tools", _format_tools(tools), ""]
     if messages:
         parts.append("## Conversation")
         for m in messages:
