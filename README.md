@@ -140,6 +140,10 @@ recovery**.
 uv sync
 ```
 
+```bash
+docker build -t zero-sandbox:latest -f docker/Dockerfile .
+```
+
 That creates `.venv/` and installs runtime + dev dependencies into it.
 
 ## Run
