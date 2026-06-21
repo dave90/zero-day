@@ -24,11 +24,13 @@ from typing import TYPE_CHECKING, Iterable
 from prompt_toolkit import PromptSession, print_formatted_text
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.shortcuts import clear
 
 from zero.orchestrator.approval import Decision
+from zero.ui import theme
 from zero.ui.commands import build_default_registry
 from zero.ui.events import (
     ActivityLine,
@@ -45,7 +47,7 @@ from zero.ui.events import (
     ToolObservation,
     ToolProposal,
 )
-from zero.ui.render import fmt_context, render_event, short_reason, status_line
+from zero.ui.render import fmt_context, render_event, short_reason
 
 if TYPE_CHECKING:
     from zero.orchestrator.orchestrator import Orchestrator
@@ -83,18 +85,22 @@ class ZeroUI:
             message=self._prompt_message,
             bottom_toolbar=self._toolbar,
             key_bindings=self._build_key_bindings(),
+            style=theme.THEME,            # resolve `class:` names everywhere
             multiline=False,
             refresh_interval=0.5,  # keep the toolbar (token/turn counts) live
         )
 
     # --------------------------------------------------------- prompt chrome
 
-    def _prompt_message(self) -> str:
+    def _prompt_message(self) -> FormattedText:
+        # A violet bar above the input line (Claude-style). The matching bar
+        # below lives in the toolbar (_toolbar), so the input sits between them.
+        top = [theme.rule(self._term_width()), ("", "\n")]
         if self._pending_approval is not None:
-            return "approve? [y/n/a] › "
+            return FormattedText([*top, ("class:prompt.approve", "approve? [y/n/a] › ")])
         if self._pending_ask is not None:
-            return "answer › "
-        return "› "
+            return FormattedText([*top, ("class:prompt.ask", "answer › ")])
+        return FormattedText([*top, ("class:prompt", "› ")])
 
     def _running_snapshot(self) -> list:
         subs = getattr(self.orch, "subagents", None)
@@ -126,44 +132,81 @@ class ZeroUI:
         out.extend(indent + w for w in wrapped[1:])
         return out
 
-    def _toolbar(self) -> str:
+    def _toolbar(self) -> FormattedText:
         """Live bottom area: each running subagent with its goal + elapsed
         time (Claude-Code style), above the status line. Subagent *logs* never
-        hit the chat — only this live view + the status counters.
+        hit the chat — only this live view + the status counters. A Braille
+        spinner animates per refresh (0.5 s) so the bar feels alive.
 
         ↑/↓ select a row; Enter expands the selected subagent's full
         description (word-wrapped to the terminal width)."""
-        lines: list[str] = []
+        frags: list = []
+
+        def row(*parts) -> None:
+            frags.extend(parts)
+            frags.append(("", "\n"))
+
+        # The bar below the input line (its twin above is in _prompt_message).
+        row(theme.rule(self._term_width()))
+
         snap = self._running_snapshot()
         if snap:
             if self._sel_idx >= len(snap):
                 self._sel_idx = len(snap) - 1
             width = self._term_width()
             window = getattr(getattr(self.orch, "cfg", None), "context_window", 0)
+            spin = theme.spinner_frame()
             for i, s in enumerate(snap[:8]):
-                marker = "›" if i == self._sel_idx else " "
+                selected = i == self._sel_idx
+                marker = "›" if selected else " "
                 # Long gruyere-style targets would eat the row — keep the tail.
                 tgt = self._short(s["target"], 28)
                 idea = self._short(s["idea"], 44)
                 ctx = fmt_context(s.get("context_tokens", 0), window)
                 ctx_seg = f" · {ctx}" if ctx else ""
-                lines.append(
-                    f"{marker}⏳ {s['id']} {s['kind']} {tgt} — {idea}  ({s['elapsed']:.0f}s{ctx_seg})"
+                marker_cls = "class:toolbar.sel" if selected else "class:dim"
+                row(
+                    (marker_cls, f"{marker}{spin} "),
+                    ("class:accent", f"{s['id']} "),
+                    ("class:dim", f"{s['kind']} {tgt} "),
+                    ("", f"— {idea}"),
+                    ("class:dim", f"  ({s['elapsed']:.0f}s{ctx_seg})"),
                 )
-                if i == self._sel_idx and self._sel_expanded:
-                    lines.extend(self._wrap_field("goal", s["idea"], width))
-                    lines.extend(self._wrap_field("target", s["target"], width))
-                    lines.append(
-                        f"      turn {s['turn']} · {s['status']} · {s['elapsed']:.0f}s{ctx_seg}"
-                    )
+                if selected and self._sel_expanded:
+                    for ln in self._wrap_field("goal", s["idea"], width):
+                        row(("class:dim", ln))
+                    for ln in self._wrap_field("target", s["target"], width):
+                        row(("class:dim", ln))
+                    row(("class:dim", f"      turn {s['turn']} · {s['status']} · {s['elapsed']:.0f}s{ctx_seg}"))
             if len(snap) > 8:
-                lines.append(f"  … +{len(snap) - 8} more running")
-            lines.append(" [↑/↓ select · Enter expand/collapse]")
+                row(("class:dim", f"  … +{len(snap) - 8} more running"))
+            row(("class:dim", " [↑/↓ select · Enter expand/collapse]"))
         else:
             self._sel_idx = 0
             self._sel_expanded = False
-        lines.append(status_line(self._status))
-        return "\n".join(lines)
+        frags.extend(self._status_fragments())
+        return FormattedText(frags)
+
+    def _status_fragments(self) -> list:
+        """Styled twin of render.status_line() — same fields, with color + a
+        ctx usage bar. (render.status_line stays plain; tests pin its text.)"""
+        st = self._status
+        appr_cls = "class:warn" if st.pending_approvals else "class:dim"
+        out: list = [
+            ("class:accent", f" turn {st.turn}"),
+            ("class:dim", f" · mode {st.mode} · "),
+            (appr_cls, f"approvals waiting: {st.pending_approvals}"),
+            ("class:dim", " · findings: "),
+            ("class:ok", f"{st.validations_confirmed}✓"),
+            ("class:dim", " / "),
+            ("class:fail", f"{st.validations_rejected}✗"),
+        ]
+        bar = theme.ctx_bar(st.context_tokens, st.context_window)
+        if bar:
+            out.append(("class:dim", " · "))
+            out.extend(bar)
+        out.append(("", " "))
+        return out
 
     # ------------------------------------------------------------ key binds
 
@@ -390,7 +433,10 @@ class ZeroUI:
 
     def _print(self, lines: Iterable[str]) -> None:
         for ln in lines:
-            print_formatted_text(ln)
+            # Already-styled chrome (welcome banner / approval prompt) passes
+            # straight through; plain strings get colorized by their marker.
+            ft = ln if isinstance(ln, FormattedText) else theme.stylize(ln)
+            print_formatted_text(ft, style=theme.THEME)
 
     def _invalidate(self) -> None:
         app = self._session.app
@@ -466,9 +512,20 @@ class ZeroUI:
                 self._emit_chat(list(render_event(ev)))
 
     def _flush_stream(self, buf: list[str]) -> None:
-        if buf:
-            self._emit_chat(["".join(buf).rstrip()])
-            buf.clear()
+        if not buf:
+            return
+        text = "".join(buf).rstrip()
+        buf.clear()
+        if not text:
+            return
+        # The agent answers in Markdown. Render it to styled text so the user
+        # doesn't read raw `##`, `**`, backticks. Plain agent lines (startup
+        # config, "ready —", error tags) have no markdown and keep the existing
+        # marker-based styling via stylize().
+        if theme.has_markdown(text):
+            self._emit_chat([theme.render_markdown(text, self._term_width())])
+        else:
+            self._emit_chat([text])
 
     def _flush_buffer(self) -> None:
         if self._output_buffer:
@@ -479,6 +536,12 @@ class ZeroUI:
 
     async def run(self) -> None:
         with patch_stdout():
+            cfg = getattr(self.orch, "cfg", None)
+            if cfg is not None:
+                print_formatted_text(
+                    theme.welcome_banner(cfg, width=self._term_width()),
+                    style=theme.THEME,
+                )
             pump = asyncio.create_task(self.pump_events(), name="ui_pump")
             try:
                 while not self._exit:
@@ -495,17 +558,30 @@ class ZeroUI:
                     await pump
 
 
-def _approval_lines(ev: ApprovalPrompt) -> list[str]:
+def _approval_lines(ev: ApprovalPrompt) -> list[FormattedText]:
+    """Styled approval prompt — risk badge colored by level, hint legible."""
+    risk_cls = theme.risk_class(ev.risk_level)
     who = f"  {ev.label}" if ev.label else ""
-    lines = [
-        "",
-        f"  → approve tool call?{who}  tool: {ev.tool}  risk: {ev.risk_level}",
+    lines: list[FormattedText] = [
+        FormattedText([("", "")]),
+        FormattedText(
+            [
+                ("class:warn", f"  → approve tool call?{who}  "),
+                ("class:accent", f"tool: {ev.tool}"),
+                ("", "  risk: "),
+                (f"class:{risk_cls}", ev.risk_level),
+            ]
+        ),
     ]
     why = short_reason(ev.reason)
     if why:
-        lines.append(f"    why: {why}")
-    lines.append(f"    args: {ev.args}")
-    lines.append("    [y] yes   [n] no   [a] always-this-tool   (or type + Enter; Esc denies)")
+        lines.append(FormattedText([("class:dim", f"    why: {why}")]))
+    lines.append(FormattedText([("class:dim", f"    args: {ev.args}")]))
+    lines.append(
+        FormattedText(
+            [("class:dim", "    [y] yes   [n] no   [a] always-this-tool   (or type + Enter; Esc denies)")]
+        )
+    )
     return lines
 
 

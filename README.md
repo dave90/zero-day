@@ -250,6 +250,7 @@ uv run pytest -q          # DEFAULT: unit + docker sandbox tests — free, no to
                           # (docker tests skip with a hint if the image isn't built)
 uv run pytest -m live     # opt-in: the token-spending live LLM runs (claude + gruyere)
 uv run pytest tests/unit -q   # only the offline unit tests (no Docker needed)
+uv run pytest -m regression -s tests/regression/   # opt-in capability regression (see below)
 ```
 
 Token-spending live runs are **excluded by default** (`addopts = -m 'not live'`),
@@ -257,6 +258,89 @@ so a plain `pytest` never costs tokens; `-m live` overrides that filter to run
 them. Every registered tool has a sandbox test
 (`tests/e2e/test_tools_in_sandbox.py`), and a registry-driven guard fails if a
 new tool is added without one.
+
+### Capability regression suite (`tests/regression/`)
+
+A graded stable of **known-vulnerable docker targets** (OWASP Juice Shop,
+sqli-labs, VAmPI, DVNA, DVWA, plus the local HTB challenges in `targets/`) that
+guards `zero`'s *finding ability* — not just the plumbing. Each case stands the
+target up in docker, runs a real orchestrated session against it (real `claude`
++ sandbox), and asserts a **validator-confirmed** finding matches the target's
+known vulnerability. A scorecard prints at the end, so a capability regression
+shows up as a drop in the confirmed count. It carries the `live` marker, so a
+plain `pytest` never runs it.
+
+**Prerequisites** (each missing one makes targets *skip*, not fail):
+
+- Docker running, with enough disk for the images (the Kali sandbox alone is
+  ~6 GB; if Docker Desktop evicts images mid-run, raise its disk-image size in
+  Settings → Resources).
+- `claude` authenticated and on `PATH` (it spends subscription tokens — watch
+  `/usage`).
+- The sandbox image built once:
+  `docker build -t zero-sandbox:latest -f docker/Dockerfile .`
+
+**Run it:**
+
+```bash
+uv run pytest -m regression                  # ALL targets, one command (costs tokens, ~1h+)
+uv run pytest -m regression -s               # same, but stream live agent output
+uv run pytest -m regression -k juice-shop    # just one target
+uv run pytest -m regression -k "easy or medium"   # only the easy+medium tiers
+uv run pytest -m regression -k hard          # only the hard HTB targets (long; 1h budget each)
+```
+
+`-m regression` selects every regression target across the repo (it overrides the
+default `-m 'not live'` filter), so a single command runs the whole stable — no
+need to invoke them one at a time. Add `-k <name|tier>` to narrow (ids are
+`<difficulty>-<name>`, e.g. `hard-omniwatch`). Public target images are pulled on
+first use; the local HTB targets are built from `targets/` automatically (OmniWatch
+builds for `linux/amd64` under emulation, so its first run is slow).
+
+**What you get:** a per-target `PASS`/`FAIL`/`SKIP` line plus a tally, e.g.
+
+```
+=================== zero capability regression scorecard ===================
+  easy   juice-shop   PASS  confirmed CWE-89 (SQLi auth bypass on /rest/user/login)
+  ...
+  confirmed 7/7   (easy 2/2,  medium 3/3,  hard 2/2)
+```
+
+**Adding a target:** append a `TargetSpec` to `tests/regression/manifest.py`
+(image, ports, scope, and the ground-truth `expected_cwes`/`endpoint_hints`/
+`keywords`) — verify the image is pullable first. The matching/scoring logic is
+unit-tested offline in `tests/unit/test_regression_assertions.py` (runs in the
+free default suite). This suite is a manual, opt-in run — not part of CI, since it
+needs an authenticated `claude` subscription and spends tokens.
+
+#### Blind coverage benchmark (`-m regression_blind`)
+
+A second, complementary mode that measures *raw* finding ability. Unlike the
+strict gate above, it is **black-box** — the `pentest.md` carries only operational
+context (creds, setup, vulnerable-mode env) with **no hint about where/how the
+bugs are** — and it **never fails**. Instead it reports, per target, *how many* of
+that target's known vulnerabilities the agent found and confirmed (the checklist
+is each target's `expected_vulns`), plus an overall coverage %.
+
+```bash
+uv run pytest -m regression_blind -s            # all targets, coverage report
+uv run pytest -m regression_blind -s -k vampi   # just one target
+```
+
+```
+=================== zero blind capability coverage ===================
+  easy   juice-shop   2/2 (100%)  found[sqli-login,xss-search]
+  medium vampi        3/5 ( 60%)  found[sqli,bola-idor,jwt-bypass]  missed[mass-assignment,excessive-data]
+  hard   omniwatch    1/4 ( 25%)  found[stored-xss]  missed[cache-poisoning,jwt-forgery,sqli]
+  ---------------------------------------------------------------
+  TOTAL  11/21 vulns found (52%)
+```
+
+Use the strict `-m regression` as a **pass/fail regression gate** and
+`-m regression_blind` as a **capability benchmark** to track over time. Blind
+scores are lower (no hints) and a full run costs more tokens (it enumerates many
+vulns per target instead of stopping at the first). Both share the same target
+manifest, container fixture, and prerequisites.
 
 Lint:
 

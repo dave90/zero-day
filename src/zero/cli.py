@@ -337,6 +337,14 @@ def init() -> None:
         (pdir / sub).mkdir(parents=True, exist_ok=True)
     click.echo(f"scaffolded {pdir}/")
 
+    # The read-only files jail the agent's list_dir/grep/read_file tools are
+    # locked to (config default --files-root). It IS auto-created at run time,
+    # but scaffolding it here makes it visible up front so the operator can drop
+    # target files in before launching.
+    files_root = cwd / "zero_files"
+    files_root.mkdir(parents=True, exist_ok=True)
+    click.echo(f"created {files_root}/ (drop files here for the agent to read)")
+
 
 @main.command()
 @click.confirmation_option(prompt="Delete ./.pentest/ ?")

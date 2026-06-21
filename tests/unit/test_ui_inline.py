@@ -13,9 +13,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from prompt_toolkit.formatted_text import fragment_list_to_text
+
 from zero.orchestrator.approval import Decision
 from zero.ui.app import ZeroUI
 from zero.ui.events import ApprovalPrompt, AskUser
+
+
+def _msg(ui) -> str:
+    """The prompt message is styled FormattedText now — extract its plain text."""
+    return fragment_list_to_text(ui._prompt_message())
 
 
 class _StubOrch:
@@ -50,8 +57,9 @@ def test_construction_does_not_crash(tmp_path: Path):
     ui, _ = _make_ui(tmp_path)
     assert ui._pending_approval is None
     assert ui._pending_ask is None
-    # The prompt message reflects pending state.
-    assert ui._prompt_message() == "› "
+    # The prompt message reflects pending state. (It now starts with a violet
+    # rule + newline above the input — the Claude-style bar — then the "› ".)
+    assert _msg(ui).endswith("› ")
 
 
 def test_approval_single_key_yes(tmp_path: Path):
@@ -83,10 +91,10 @@ def test_empty_or_unknown_line_denies_approval(tmp_path: Path):
 def test_prompt_message_changes_with_pending_state(tmp_path: Path):
     ui, _ = _make_ui(tmp_path)
     ui._pending_approval = ApprovalPrompt(tool="t", risk_level="safe", call_id="c")
-    assert "approve?" in ui._prompt_message()
+    assert "approve?" in _msg(ui)
     ui._pending_approval = None
     ui._pending_ask = AskUser(question="q", options=[], ask_id="a")
-    assert "answer" in ui._prompt_message()
+    assert "answer" in _msg(ui)
 
 
 def test_ask_digit_selects_option(tmp_path: Path):

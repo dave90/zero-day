@@ -46,6 +46,15 @@ build-hint reason when the image isn't present. **Tests are async**
 sandbox test in `tests/e2e/test_tools_in_sandbox.py`; a registry-driven guard
 (`test_every_registered_tool_has_sandbox_coverage`) fails if a new tool lacks one.
 
+**Capability regression** (`tests/regression/`, marker `regression`, also `live`)
+stands known-vulnerable docker targets up (manifest in
+`tests/regression/manifest.py`) and asserts `zero` *confirms* the known vuln —
+guards finding ability, not just plumbing. Opt-in `uv run pytest -m regression`
+(runs ALL targets in one go — overrides the default `-m 'not live'`; add `-k
+<name>` to narrow to one), needs `claude` + the sandbox image; the offline matcher
+is unit-tested in `tests/unit/test_regression_assertions.py`. Add a target →
+append a `TargetSpec` (verify the image is pullable first).
+
 ## Architecture in one screen
 
 **The orchestrator and all agent loops run on the HOST. The Docker container is a

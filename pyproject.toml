@@ -57,6 +57,8 @@ markers = [
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
     "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + claude)",
+    "regression: capability regression vs vulnerable docker targets (slow, costs claude tokens, needs docker + claude). Opt-in: `pytest -m regression`.",
+    "regression_blind: blind capability benchmark vs vulnerable docker targets — never fails, prints coverage %. Opt-in: `pytest -m regression_blind`.",
 ]
 
 [tool.ruff]

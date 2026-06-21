@@ -4,7 +4,20 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+from prompt_toolkit.formatted_text import fragment_list_to_text
+
 from zero.ui.app import ZeroUI
+
+
+def _bar_text(ui) -> str:
+    """The toolbar is styled FormattedText now — flatten to plain text. The
+    selected-row marker is `›` followed by an animated spinner frame, so tests
+    assert on the marker + stable content, not the (rotating) spinner glyph."""
+    return fragment_list_to_text(ui._toolbar())
+
+
+def _selected_line(text: str, needle: str) -> str:
+    return next(ln for ln in text.splitlines() if needle in ln)
 
 
 class _FakeSubs:
@@ -36,22 +49,22 @@ def _snap():
 
 def test_toolbar_lists_running_with_default_selection(tmp_path: Path):
     ui = ZeroUI(_StubOrch(tmp_path, _FakeSubs(_snap())))
-    bar = ui._toolbar()
+    bar = _bar_text(ui)
     assert "#1 pentester /a" in bar
     assert "#2 pentester /b" in bar
-    assert "›⏳ #1" in bar          # first row selected by default
+    assert _selected_line(bar, "#1").startswith("›")   # first row selected by default
     assert "[↑/↓ select" in bar
 
 
 def test_toolbar_selection_and_expand(tmp_path: Path):
     ui = ZeroUI(_StubOrch(tmp_path, _FakeSubs(_snap())))
     ui._sel_idx = 1                  # ↓ moved selection to the 2nd subagent
-    bar = ui._toolbar()
-    assert "›⏳ #2" in bar
+    bar = _bar_text(ui)
+    assert _selected_line(bar, "#2").startswith("›")
     assert "goal:" not in bar        # collapsed
 
     ui._sel_expanded = True          # Enter expands
-    bar = ui._toolbar()
+    bar = _bar_text(ui)
     assert "↳ goal: auth bypass" in bar
     assert "turn 1" in bar
 
@@ -67,7 +80,7 @@ def test_expanded_description_wraps_not_truncated(tmp_path: Path, monkeypatch):
     ui = ZeroUI(_StubOrch(tmp_path, _FakeSubs(snap)))
     monkeypatch.setattr(ui, "_term_width", lambda: 40)
     ui._sel_expanded = True
-    bar = ui._toolbar()
+    bar = _bar_text(ui)
     # The full goal is present (the tail words would be cut if truncated).
     assert "inline script" in bar
     assert "attribute value" in bar
@@ -80,7 +93,7 @@ def test_toolbar_resets_when_no_subagents(tmp_path: Path):
     ui = ZeroUI(_StubOrch(tmp_path, _FakeSubs([])))
     ui._sel_idx = 5
     ui._sel_expanded = True
-    bar = ui._toolbar()
+    bar = _bar_text(ui)
     assert ui._sel_idx == 0 and ui._sel_expanded is False
     # only the status line remains (terse footer: turn/mode/approvals/findings)
     assert "approvals waiting:" in bar

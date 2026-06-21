@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from prompt_toolkit.formatted_text import fragment_list_to_text
+
 from zero.orchestrator.approval import Decision
 from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
 from zero.ui.app import _approval_lines
 from zero.ui.events import ApprovalPrompt
 from zero.ui.render import short_reason
+
+
+def _text(lines) -> list[str]:
+    """Approval lines are styled FormattedText now — flatten to plain strings."""
+    return [fragment_list_to_text(ln) for ln in lines]
 
 
 async def test_reason_reaches_the_gate(tmp_path: Path, monkeypatch):
@@ -47,11 +54,11 @@ def test_approval_lines_show_why():
             reason="Confirm reflected XSS in uid. Then weaponize.",
         )
     )
-    joined = "\n".join(lines)
+    joined = "\n".join(_text(lines))
     assert "why: Confirm reflected XSS in uid" in joined
     assert "weaponize" not in joined  # only the first clause is shown
 
 
 def test_approval_lines_omit_why_when_no_reason():
     lines = _approval_lines(ApprovalPrompt(tool="web_fetch", risk_level="safe"))
-    assert not any("why:" in ln for ln in lines)
+    assert not any("why:" in ln for ln in _text(lines))

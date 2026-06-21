@@ -42,10 +42,10 @@ def render_event(ev: UIEvent) -> Iterable[str]:
         yield f"> {ev.text}"
     elif isinstance(ev, GoalBanner):
         yield ""
-        yield f"╭─ goal ─────"
+        yield "╭─ goal ─────"
         for line in ev.text.splitlines() or [""]:
             yield f"│  {line}"
-        yield f"╰────────────"
+        yield "╰────────────"
     elif isinstance(ev, TurnStart):
         yield ""
         yield f"⋯ [{_agent_display(ev.agent)} · turn {ev.turn}] thinking…"
