@@ -300,10 +300,20 @@ def welcome_banner(cfg: "OrchestratorConfig", *, width: int = 80) -> FormattedTe
     line("banner.ink", "  autonomous web-app pentest agent")
 
     sandbox = "sandbox on" if getattr(cfg, "use_container", True) else "host exec"
+    backend = getattr(cfg, "backend", "claude")
     model = getattr(cfg, "model", None) or "account-default"
+    if backend == "codex":
+        # The shared --model default is a Claude id the Codex backend ignores (Codex
+        # rejects it) — show the model Codex will actually use, not the bare default.
+        from zero.llm.codex_cli import codex_model
+
+        model = codex_model(getattr(cfg, "model", None)) or "codex-default"
     ctxw = fmt_tokens(getattr(cfg, "context_window", 0) or 0)
     froot = getattr(cfg, "files_root", "zero_files")
-    config = f"  mode {getattr(cfg, 'execution_mode', 'c')} · {sandbox} · {model} · ctx {ctxw} · files {froot}"
+    config = (
+        f"  mode {getattr(cfg, 'execution_mode', 'c')} · {backend} · {sandbox} · "
+        f"{model} · ctx {ctxw} · files {froot}"
+    )
     line("banner.faint", config)
     line("banner.faint", "  /help · ↑↓ inspect agents · ^C cancel (×2 quit) · type a goal ↵")
     line("")

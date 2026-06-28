@@ -219,3 +219,8 @@ __marimo__/
 targets/*
 .pentest/*
 .DS_Store
+
+# BountyBench benchmark run outputs (pilot logs + scorecards) — generated per run,
+# not source. Keep the harness, ignore its results.
+benchmarks/bountybench/results/
+plan.md

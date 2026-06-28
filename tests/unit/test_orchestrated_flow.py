@@ -831,6 +831,33 @@ async def test_status_carries_context_window(tmp_path: Path, monkeypatch):
     assert all(s.context_window == 1_000_000 for s in statuses)  # wired from cfg
 
 
+async def test_context_window_resolved_backend_aware(tmp_path: Path, monkeypatch):
+    """When left on auto (None), the ctx denominator is resolved per backend at startup:
+    Claude infers it from the model id; Codex reads its real window from the model cache.
+    An explicit value is always honored."""
+    # Claude '[1m]' model → 1M; plain model → 200k.
+    o1m = Orchestrator(OrchestratorConfig(
+        cwd=tmp_path, backend="claude", model="claude-opus-4-8[1m]", use_container=False))
+    assert o1m.cfg.context_window == 1_000_000
+    o200 = Orchestrator(OrchestratorConfig(
+        cwd=tmp_path, backend="claude", model="claude-sonnet-4-6", use_container=False))
+    assert o200.cfg.context_window == 200_000
+
+    # Codex → read from a temp model cache (no dependency on the real ~/.codex).
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "models_cache.json").write_text(
+        json.dumps({"models": [{"slug": "gpt-5.5", "context_window": 272000}]}),
+        encoding="utf-8",
+    )
+    ocx = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="codex", use_container=False))
+    assert ocx.cfg.context_window == 272000
+
+    # Explicit value is left untouched.
+    oexp = Orchestrator(OrchestratorConfig(
+        cwd=tmp_path, backend="codex", context_window=50_000, use_container=False))
+    assert oexp.cfg.context_window == 50_000
+
+
 async def test_pentester_recovers_from_a_backend_turn_error(tmp_path: Path, monkeypatch):
     """A single backend error (e.g. claude error_max_turns) must NOT kill the
     subagent — it feeds the error back and retries the turn, then finishes normally."""

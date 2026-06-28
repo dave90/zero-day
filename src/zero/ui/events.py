@@ -95,6 +95,20 @@ class ApprovalPrompt:
 
 
 @dataclass
+class ToolRunning:
+    """A tool call was approved and is now EXECUTING (emitted just before the tool
+    runs, paired with the later ToolObservation by `call_id`). The UI keeps a live
+    'running' indicator with elapsed time in the toolbar until the observation lands,
+    so a long-running tool (e.g. a 300s ffuf) doesn't make the session look hung."""
+
+    kind: Literal["tool_running"] = "tool_running"
+    tool: str = ""
+    call_id: str = ""
+    label: str = ""              # subagent attribution (empty for the top-level agent)
+    timeout_seconds: int = 0     # the tool's wall-clock cap, if known (for "12s/300s")
+
+
+@dataclass
 class ToolObservation:
     """Result of a tool call."""
 
@@ -264,6 +278,7 @@ UIEvent = (
     | UserText
     | ToolProposal
     | ApprovalPrompt
+    | ToolRunning
     | ToolObservation
     | AskUser
     | Finding

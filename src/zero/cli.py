@@ -40,10 +40,11 @@ def main() -> None:
 @click.option("--goal", default=None, help="One-shot goal seeded as the first user message.")
 @click.option(
     "--backend",
-    type=click.Choice(["claude"]),
+    type=click.Choice(["claude", "codex"]),
     default="claude",
     show_default=True,
-    help="LLM backend. Shells out to the authenticated Claude Code CLI.",
+    help="LLM backend. Shells out to the authenticated Claude Code CLI ('claude') or"
+    " the OpenAI Codex CLI ('codex'). With 'codex', pass a Codex --model or omit it.",
 )
 @click.option(
     "--execution-mode",
@@ -238,7 +239,16 @@ def main() -> None:
     type=int,
     default=None,
     help="Context-window size for the UI's per-agent 'ctx used/window (%)' display."
-    " Default: inferred from --model (1M for a '[1m]' model, else 200k).",
+    " Default: resolved per backend at startup — Codex reads its real model window"
+    " (~272k) at runtime; Claude infers 1M for a '[1m]' model, else 200k.",
+)
+@click.option(
+    "--llm-log/--no-llm-log",
+    default=True,
+    show_default=True,
+    help="Trace the FULL model I/O (argv + system prompt + stdin in, stdout/stderr out)"
+    " to one file per agent under ./.pentest/llm/<actor>.log. ON by default; pass"
+    " --no-llm-log to disable. ($ZERO_LLM_LOG_DIR overrides the location.)",
 )
 def run(
     goal: str | None,
@@ -270,15 +280,19 @@ def run(
     thought_display: str,
     model: str,
     context_window: int | None,
+    llm_log: bool,
 ) -> None:
     """Run an interactive pentest session."""
     from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
 
-    # `--model ''` ⇒ account default. Infer the context-window denominator from the
-    # model when not given (1M for a '[1m]' variant, else the standard 200k).
+    # Per-agent LLM I/O tracing is ON by default; the orchestrator enables it from
+    # cfg.llm_log (→ ./.pentest/llm/<actor>.log). --no-llm-log turns it off.
+
+    # `--model ''` ⇒ account default. Leave the context-window denominator unset
+    # (None) so the orchestrator resolves it backend-aware at startup — Codex reports
+    # its real ~272k window at runtime, Claude infers 1M/200k from the model id. An
+    # explicit --context-window is passed through and always honored.
     model_or_none = model or None
-    if context_window is None:
-        context_window = 1_000_000 if (model and "[1m]" in model) else 200_000
 
     # No implicit auto-approve policy: every tool call (orchestrator's own and
     # its subagents') goes through the ApprovalGate and prompts unless the user
@@ -316,6 +330,7 @@ def run(
         thought_display=thought_display,
         model=model_or_none,
         context_window=context_window,
+        llm_log=llm_log,
     )
     orch = Orchestrator(cfg)
     asyncio.run(orch.run_interactive())

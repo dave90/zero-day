@@ -54,14 +54,28 @@ recovery**.
   independent tool calls run in ONE turn), `ask_user`, or `final` — with one-shot
   retry on malformed output. The parser tolerates trailing data after the first
   JSON object (a stray second object no longer kills a subagent).
-- **LLM backend**: a `ClaudeCodeBackend` that shells out to the authenticated
-  `claude` CLI. It **pins the model** (`--model`, default `claude-opus-4-8[1m]`)
-  and **locks the CLI down to zero real tools** (`--allowedTools ""` +
-  `--strict-mcp-config` + `--disable-slash-commands` + a denylist) and replaces
-  Claude Code's own identity (`--system-prompt`, `--setting-sources user`) so the
-  subagent acts purely as our envelope-driven pentester and never drifts into
-  calling a native CLI tool. (An internal scripted fake backend exists for the
-  offline test suite only; it is not user-selectable.)
+- **LLM backend** (`--backend`, default `claude`): a `ClaudeCodeBackend` that shells
+  out to the authenticated `claude` CLI. It **pins the model** (`--model`, default
+  `claude-opus-4-8[1m]`) and **locks the CLI down to zero real tools**
+  (`--allowedTools ""` + `--strict-mcp-config` + `--disable-slash-commands` + a
+  denylist) and replaces Claude Code's own identity (`--system-prompt`,
+  `--setting-sources user`) so the subagent acts purely as our envelope-driven
+  pentester and never drifts into calling a native CLI tool. (An internal scripted
+  fake backend exists for the offline test suite only; it is not user-selectable.)
+- **OpenAI Codex backend** (`--backend codex`): a `CodexCLIBackend` that drives the
+  authenticated `codex` CLI (`codex exec`) the same way — prompt on **stdin**, one
+  envelope per turn. It uses a persistent Codex **thread** (`codex exec resume`) so
+  the per-actor conversation is server-side **prompt-cached** across turns, just like
+  the Claude backend's `--session-id`/`--resume`. Differences: Codex mints the session
+  id itself (captured from its JSONL `thread.started` event), the agent identity is
+  folded into the first message (no separate system-prompt slot), and the tool
+  lock-down is **soft** (`sandbox_mode=read-only` + `approval_policy=never` + the
+  envelope instruction — Codex's shell tool can't be hard-removed like `--allowedTools ""`).
+  The shared `--model` default is a Claude id, which Codex rejects, so the Codex backend
+  **ignores any `claude*` model** and uses Codex's own default — `--backend codex` works
+  with no extra flags. Pass a real Codex `--model` to pin one. The UI's ctx-window
+  denominator is resolved per backend at startup — for Codex it's read from Codex's own
+  model cache at runtime (~272k), not the Claude 1M/200k default.
 - **ApprovalGate** — every tool call is gated (including the orchestrator's own).
   `--auto-approve {safe,active,exploit}` (repeatable), `--yolo` (safe + active,
   **not** exploit), and `--i-understand` compose into a decision matrix;
@@ -129,7 +143,8 @@ recovery**.
 - Python ≥ 3.11
 - [uv](https://docs.astral.sh/uv/) for environment / build management
 - The Claude Code CLI (`claude` on `PATH`, authenticated) — required, since
-  `zero` runs the Claude Code backend by default.
+  `zero` runs the Claude Code backend by default. (Or, for `--backend codex`, the
+  OpenAI Codex CLI — `codex` on `PATH`, authenticated.)
 - Docker, for the default sandboxed execution (build the `zero-sandbox` image
   below). Use `--no-container` to run on the host instead.
 
@@ -167,6 +182,15 @@ backend inside the Docker sandbox** (orchestrated mode), so you need the
 uv run zero run --goal "Find broken access control on http://localhost:3000"
 ```
 
+To drive the run with the **OpenAI Codex CLI** instead, add `--backend codex` (needs
+`codex` on `PATH`, authenticated). No other flags are required — the Codex backend
+ignores the Claude default model and uses Codex's own:
+
+```bash
+uv run zero run --backend codex \
+  --goal "Find broken access control on http://localhost:3000"
+```
+
 If Docker isn't available, the sandbox falls back to host execution (tool
 calls still pass through the approval gate). To force host execution
 explicitly, add `--no-container`.
@@ -183,8 +207,8 @@ orchestrator and every subagent (`thinking.log`).
 | Flag | Meaning |
 |---|---|
 | `--goal <text>` | One-shot goal seeded as the first user message. |
-| `--backend {claude}` | LLM backend (Claude Code CLI). Default `claude`. |
-| `--model <id>` | Model for **every** `claude -p` call (orchestrator + subagents + validators). Alias (`opus`/`sonnet`) or full id; default **`claude-opus-4-8[1m]`** (Opus, 1M context). Pass `''` for your account default. |
+| `--backend {claude,codex}` | LLM backend. Default `claude` (Claude Code CLI); `codex` shells out to the OpenAI Codex CLI (`codex exec`, with thread-based prompt caching). |
+| `--model <id>` | Model for **every** LLM call (orchestrator + subagents + validators). For `claude`: alias (`opus`/`sonnet`) or full id; default **`claude-opus-4-8[1m]`** (Opus, 1M context). Pass `''` for your account default. With `--backend codex` the Claude default is ignored (Codex uses its own default); pass a real **Codex** model id to pin one. |
 | `--execution-mode {a,b,c}` | `c` orchestrated (**default**), `a` single agent, `b` MCP delegated. |
 | `--auto-approve {safe,active,exploit}` | Auto-approve tools at this risk class. Repeatable. |
 | `--yolo` | Auto-approve `safe` + `active`. Does **not** cover `exploit` (use `--auto-approve exploit --i-understand`) or `destructive` (always prompts). |
@@ -195,7 +219,7 @@ orchestrator and every subagent (`thinking.log`).
 | `--max-subagents <n>` | Max concurrently-running subagents in mode `c` (default **10**). |
 | `--validator-max-turns <n>` | Validator investigation steps, separate from `--max-turns` (default **40**). |
 | `--validator-claude-max-turns <n>` | claude's INTERNAL per-call `--max-turns` for the Validator (default **1** — NOT its investigation budget, which is `--validator-max-turns`; we drive the loop, so a high value only lets the model drift into a native tool call). |
-| `--context-window <n>` | Model context-window size for the UI's per-agent `ctx used/window (%)` display (default inferred from `--model`: 1M for a `[1m]` model, else 200k). |
+| `--context-window <n>` | Model context-window size for the UI's per-agent `ctx used/window (%)` display. Default resolved per backend at startup: Codex reads its real model window at runtime (~272k); Claude infers 1M for a `[1m]` model, else 200k. |
 | `--llm-timeout <secs>` | Per-call `claude -p` wall-clock timeout (default **900**), shared by the orchestrator **and** the pentester/validator subagents — one value for all. Raise it for heavy iterative exploitation / large-context turns. |
 | `--pentester-max-turns <n>` | Per-pentester turn budget (default **14**). Pentesters no longer inherit `--max-turns`, so one attack idea can't run 40+ turns. |
 | `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--llm-timeout` only bounds a single `claude -p` call. |
@@ -288,7 +312,13 @@ uv run pytest -m regression -s               # same, but stream live agent outpu
 uv run pytest -m regression -k juice-shop    # just one target
 uv run pytest -m regression -k "easy or medium"   # only the easy+medium tiers
 uv run pytest -m regression -k hard          # only the hard HTB targets (long; 1h budget each)
+uv run pytest -m regression --regression-backend codex   # run the SAME targets on the Codex CLI
 ```
+
+By default the regression suite drives the `claude` backend. Pass
+`--regression-backend codex` to run the identical set of targets through the OpenAI
+Codex CLI instead (needs `codex` authenticated on `PATH`); the per-target scorecard
+line is tagged with the backend so the two runs are comparable.
 
 `-m regression` selects every regression target across the repo (it overrides the
 default `-m 'not live'` filter), so a single command runs the whole stable — no
@@ -341,6 +371,16 @@ Use the strict `-m regression` as a **pass/fail regression gate** and
 scores are lower (no hints) and a full run costs more tokens (it enumerates many
 vulns per target instead of stopping at the first). Both share the same target
 manifest, container fixture, and prerequisites.
+
+#### External benchmark: BountyBench (`benchmarks/bountybench/`)
+
+Run [BountyBench](https://github.com/bountybench/bountybench) (real-world systems +
+dollar-value scoring) with `zero` as the agent under test, on the Detect/Exploit task
+types. `zero` plugs into BountyBench's own runner as a drop-in executor and is scored by
+BountyBench's authoritative per-bounty verifiers. Setup, the pilot manifest, and the
+scorecard tooling live in [`benchmarks/bountybench/README.md`](benchmarks/bountybench/README.md);
+the offline (free) parts run in the default suite via
+`tests/unit/test_bountybench_*.py`.
 
 Lint:
 

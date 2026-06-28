@@ -48,6 +48,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Repo root on sys.path so the offline `benchmarks.*` tests (BountyBench harness)
+# can import the benchmark package, which lives outside the `src/zero` package.
+pythonpath = ["."]
 # Default run = unit (offline, free) + docker sandbox tests (free, need the built
 # image). Token-spending LIVE runs are excluded by default; opt in with
 # `-m live` (a command-line `-m` overrides this). See README / CLAUDE.md.
@@ -56,6 +59,7 @@ markers = [
     "live: real token-spending run against a live LLM (claude). Opt-in: `pytest -m live`.",
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
+    "live_codex: tests that shell out to the real `codex` CLI (slow, costs tokens, needs auth)",
     "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + claude)",
     "regression: capability regression vs vulnerable docker targets (slow, costs claude tokens, needs docker + claude). Opt-in: `pytest -m regression`.",
     "regression_blind: blind capability benchmark vs vulnerable docker targets — never fails, prints coverage %. Opt-in: `pytest -m regression_blind`.",

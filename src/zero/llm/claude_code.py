@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from zero.llm.backend import LLMBackend, LLMResponse, Message, Session
+from zero.llm.llm_trace import trace_call
 
 
 # claude's built-in tools that we must disable in Mode A: we route every
@@ -54,11 +55,21 @@ DEFAULT_DISALLOWED_TOOLS: tuple[str, ...] = (
     "WebFetch", "WebSearch",
     "Task", "TodoWrite", "NotebookEdit",
     # Newer built-ins the original list missed — `LSP` is the one that bit us.
-    "LSP", "ToolSearch", "Monitor", "Skill", "SlashCommand",
+    # NB: NOT "SlashCommand" — that's not a real tool name (slash commands are killed by
+    # the `--disable-slash-commands` flag), and listing it makes claude warn on EVERY call
+    # `Permission deny rule "SlashCommand" matches no known tool`. Only real built-ins here.
+    "LSP", "ToolSearch", "Monitor", "Skill",
     "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
     "CronCreate", "CronDelete", "CronList",
     "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
     "PushNotification", "RemoteTrigger", "DesignSync", "Agent",
+    # Newer agent-harness built-ins (Claude Code 2.1.x). `ScheduleWakeup`/`SendMessage`/
+    # `Workflow` were the ones a child `claude` (spawned from inside a Claude Code
+    # session) fell back to when the parent agent runtime leaked in — the model reported
+    # them as "the only executable tools", couldn't reach our pentest envelope tools, and
+    # gave up on turn 1 (the juice-shop regression failure). Scrubbing the parent env
+    # (see scrub_claude_code_env) removes the leak; these keep the denylist exhaustive.
+    "ScheduleWakeup", "SendMessage", "Workflow",
 )
 
 
@@ -140,6 +151,52 @@ def neutralize_nul(s: str) -> str:
     if "\x00" not in s:
         return s
     return _NUL_RUN.sub(lambda m: f"[NUL*{len(m.group())}]", s)
+
+
+# Env vars that mark a process as running *inside* a Claude Code agent session. When we
+# spawn `claude -p` from within one (e.g. running the regression suite from a Claude Code
+# session, or any nested invocation), the child INHERITS these and attaches to the parent
+# agent runtime — picking up the parent's harness tools (ScheduleWakeup/SendMessage/
+# Workflow/…) over an SSE/MCP side channel that our `--allowedTools ""` lockdown and
+# `--system-prompt-file` override do NOT cover. The orchestrator then sees Claude Code's
+# tools instead of our pentest envelope and bails on turn 1 (the juice-shop regression
+# failure: only the FIRST engagement attached, the rest ran clean). Scrubbing them makes
+# every spawned `claude` hermetic — identical behaviour whether launched from a bare
+# terminal or from inside Claude Code. We drop the whole CLAUDE_CODE_*/CLAUDECODE family
+# (incl. SSE_PORT, CHILD_SESSION, ENTRYPOINT, SSE/MCP handles) plus the generic AI_AGENT
+# marker; ANTHROPIC_*/auth vars are deliberately KEPT so OAuth/subscription auth still works.
+_CLAUDE_CODE_ENV_PREFIXES = ("CLAUDE_CODE_",)
+_CLAUDE_CODE_ENV_EXACT = frozenset({"CLAUDECODE", "AI_AGENT"})
+
+
+def scrub_claude_code_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a copy of `env` (default os.environ) with the Claude Code agent-session
+    markers removed, so a spawned `claude -p` cannot attach to a parent agent runtime."""
+    src = os.environ if env is None else env
+    return {
+        k: v for k, v in src.items()
+        if k not in _CLAUDE_CODE_ENV_EXACT
+        and not any(k.startswith(p) for p in _CLAUDE_CODE_ENV_PREFIXES)
+    }
+
+
+def close_proc_transport(proc) -> None:
+    """Explicitly close a finished subprocess's transport while the loop is still alive.
+
+    Otherwise the transport can be garbage-collected AFTER its event loop has closed —
+    `BaseSubprocessTransport.__del__` then calls `loop.call_soon` on the dead loop and
+    raises `RuntimeError: Event loop is closed`. It's harmless (the process already
+    exited) but surfaces as a noisy PytestUnraisableExceptionWarning under the regression
+    suite, which runs hundreds of `claude` subprocesses across many short-lived per-test
+    loops. Idempotent and never raises."""
+    if proc is None:
+        return
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        try:
+            transport.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 def build_mode_a_argv(
@@ -285,6 +342,7 @@ class ClaudeCodeBackend(LLMBackend):
         at 32,767 chars → `[WinError 206]`): the system prompt goes to a temp file
         (`--system-prompt-file`) and the conversation body is piped on STDIN."""
         sp_path = ""
+        proc = None
         if system_prompt:
             # Temp file deleted in `finally`. NamedTemporaryFile(delete=False) so the
             # child process can open it by name on Windows (can't share an open handle).
@@ -310,6 +368,7 @@ class ClaudeCodeBackend(LLMBackend):
             )
             proc = await asyncio.create_subprocess_exec(
                 *argv,
+                env=scrub_claude_code_env(),  # hermetic: no parent Claude Code agent attach
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -325,12 +384,17 @@ class ClaudeCodeBackend(LLMBackend):
                 raise TimeoutError(
                     f"claude -p timed out after {self.cfg.timeout_seconds}s"
                 )
-            return (
-                stdout.decode("utf-8", errors="replace").strip(),
-                proc.returncode,
-                stderr.decode("utf-8", errors="replace").strip(),
+            out_s = stdout.decode("utf-8", errors="replace").strip()
+            err_s = stderr.decode("utf-8", errors="replace").strip()
+            # Full per-actor I/O trace (no-op unless --llm-log / ZERO_LLM_LOG_DIR).
+            trace_call(
+                session.name if session else "default",
+                argv=argv, system_prompt=system_prompt, stdin_body=prompt,
+                stdout=out_s, stderr=err_s, returncode=proc.returncode, resume=resume,
             )
+            return (out_s, proc.returncode, err_s)
         finally:
+            close_proc_transport(proc)  # avoid "Event loop is closed" on later GC
             if sp_path:
                 try:
                     os.unlink(sp_path)
@@ -533,6 +597,7 @@ class ClaudeCodeBackendModeB:
         ) as fh:
             json.dump(mcp_cfg, fh)
             cfg_path = Path(fh.name)
+        proc = None
         try:
             argv = build_mode_b_argv(
                 binary=binary,
@@ -540,7 +605,10 @@ class ClaudeCodeBackendModeB:
                 disallowed_builtin_tools=self.cfg.disallowed_builtin_tools,
                 model=self.cfg.model or "",
             )
-            env = {**os.environ}
+            # Scrub Claude Code agent-session markers (see scrub_claude_code_env): a
+            # Mode B `claude` spawned from inside a Claude Code session would otherwise
+            # attach to the parent agent runtime and pick up its harness tools.
+            env = scrub_claude_code_env()
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 env=env,
@@ -559,14 +627,20 @@ class ClaudeCodeBackendModeB:
                 raise TimeoutError(
                     f"claude (Mode B) timed out after {self.cfg.timeout_seconds}s"
                 )
+            out_s = stdout.decode("utf-8", errors="replace")
+            err_s = stderr.decode("utf-8", errors="replace")
+            trace_call(
+                "modeb", argv=argv, system_prompt="", stdin_body=prompt,
+                stdout=out_s, stderr=err_s, returncode=proc.returncode, resume=False,
+            )
             if proc.returncode != 0:
-                err = stderr.decode("utf-8", errors="replace")
                 raise RuntimeError(
-                    f"claude (Mode B) exit {proc.returncode}: {err.strip()}"
+                    f"claude (Mode B) exit {proc.returncode}: {err_s.strip()}"
                 )
-            resp = parse_claude_json(stdout.decode("utf-8", errors="replace"))
+            resp = parse_claude_json(out_s)
             return resp.text
         finally:
+            close_proc_transport(proc)
             try:
                 cfg_path.unlink()
             except OSError:

@@ -10,6 +10,7 @@ from zero.llm.claude_code import (
     build_prompt,
     build_user_prompt,
     parse_claude_json,
+    scrub_claude_code_env,
 )
 
 
@@ -207,11 +208,75 @@ def test_mode_a_argv_includes_disallowed_builtins():
     # `LSP`/`ToolSearch`/`Monitor` are the newer built-ins the original list MISSED —
     # `LSP` is the one a subagent fell back to and called (the live-reproduced Guild
     # bug), so guard them explicitly to stop the recurrence.
+    # `ScheduleWakeup`/`SendMessage`/`Workflow` are the Claude Code 2.1.x agent built-ins
+    # the orchestrator fell back to in the juice-shop regression failure.
     for required in (
         "Bash", "Read", "Write", "WebFetch", "WebSearch",
         "LSP", "ToolSearch", "Monitor",
+        "ScheduleWakeup", "SendMessage", "Workflow",
     ):
         assert required in spec, f"{required} missing from disallowed list"
+
+
+def test_close_proc_transport_is_safe_on_none_and_missing():
+    from zero.llm.claude_code import close_proc_transport
+
+    # None proc (spawn failed before assignment) → no-op, no raise.
+    close_proc_transport(None)
+
+    # A proc-like object whose transport.close() raises must be swallowed.
+    class _T:
+        def close(self):
+            raise RuntimeError("Event loop is closed")
+
+    class _P:
+        _transport = _T()
+
+    close_proc_transport(_P())  # must not raise
+
+    # A proc with a normal transport gets closed exactly once.
+    calls = []
+
+    class _T2:
+        def close(self):
+            calls.append(1)
+
+    class _P2:
+        _transport = _T2()
+
+    close_proc_transport(_P2())
+    assert calls == [1]
+
+
+def test_scrub_claude_code_env_drops_agent_session_markers():
+    # Regression: a `claude -p` spawned from INSIDE a Claude Code session inherited these
+    # and attached to the parent agent runtime, picking up ScheduleWakeup/SendMessage/
+    # Workflow instead of our pentest envelope (the juice-shop blind-regression failure).
+    dirty = {
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_SSE_PORT": "16972",
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "AI_AGENT": "claude-code_2-1-187_agent",
+        # auth + ordinary vars MUST survive (OAuth/subscription auth depends on them)
+        "ANTHROPIC_API_KEY": "sk-keep",
+        "PATH": "/usr/bin",
+        "HOME": "/home/u",
+    }
+    clean = scrub_claude_code_env(dirty)
+    for leaked in ("CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_CHILD_SESSION",
+                   "CLAUDE_CODE_ENTRYPOINT", "AI_AGENT"):
+        assert leaked not in clean, f"{leaked} should be scrubbed"
+    assert clean["ANTHROPIC_API_KEY"] == "sk-keep"  # auth preserved
+    assert clean["PATH"] == "/usr/bin" and clean["HOME"] == "/home/u"
+
+
+def test_scrub_claude_code_env_defaults_to_os_environ(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_SSE_PORT", "9999")
+    monkeypatch.setenv("ZERO_KEEP_ME", "yes")
+    clean = scrub_claude_code_env()
+    assert "CLAUDE_CODE_SSE_PORT" not in clean
+    assert clean.get("ZERO_KEEP_ME") == "yes"
 
 
 def test_mode_a_internal_max_turns_has_small_headroom():

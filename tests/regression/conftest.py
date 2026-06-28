@@ -33,9 +33,14 @@ def _have(binary: str) -> bool:
 def _image_exists(tag: str) -> bool:
     if not _have("docker"):
         return False
-    return subprocess.run(
-        ["docker", "image", "inspect", tag], capture_output=True
-    ).returncode == 0
+    # `docker images -q`, NOT `docker image inspect`: the latter flakes on a short tag
+    # under Docker Desktop's containerd image store even when the image is present (it
+    # wants the fully-qualified ref), spuriously skipping targets. `images -q` matches
+    # how `docker run` resolves the name.
+    out = subprocess.run(
+        ["docker", "images", "-q", tag], capture_output=True, text=True
+    )
+    return out.returncode == 0 and bool(out.stdout.strip())
 
 
 def _server_responds(url: str, ok_status: tuple[int, ...]) -> bool:
@@ -69,6 +74,14 @@ def _record_skip(spec: TargetSpec, reason: str) -> None:
 
 
 # -------------------------------------------------------------------- fixtures
+
+@pytest.fixture
+def regression_backend(request) -> str:
+    """The LLM backend the run should use, from `--regression-backend` (default
+    'claude'). Both the strict and blind suites read this so a whole regression run
+    can be pointed at Codex with `pytest -m regression --regression-backend codex`."""
+    return request.config.getoption("--regression-backend")
+
 
 @pytest.fixture(scope="session")
 def regression_scorecard() -> list[TargetResult]:

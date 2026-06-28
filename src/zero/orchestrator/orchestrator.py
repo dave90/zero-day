@@ -76,6 +76,7 @@ from zero.ui.events import (
     TodoUpdate,
     ToolObservation,
     ToolProposal,
+    ToolRunning,
     TurnCancelled,
     TurnStart,
     UIEvent,
@@ -173,6 +174,11 @@ class OrchestratorConfig:
     use_container: bool = True
     container_image: str = "zero-sandbox:latest"
     host_network: bool = False
+    # Optional extra docker network the sandbox joins after start (via `docker
+    # network connect`), keeping the bridge-published RPC port intact. Used by the
+    # BountyBench benchmark harness to put the sandbox on BB's `shared_net` so it
+    # can reach the bounty target. None ⇒ default bridge only.
+    container_network: str | None = None
     burp_dir: Path | None = None
     # Root folder the read-only filesystem tools (list_dir/grep/read_file) are
     # JAILED to — they can never read outside it. Resolved against cwd; mounted at
@@ -195,14 +201,26 @@ class OrchestratorConfig:
     # (alias like 'sonnet', or a full id). None ⇒ account default.
     model: str | None = "claude-opus-4-8[1m]"
     # Model context-window size used ONLY for the UI's "ctx used/window (%)" display
-    # (per agent). We can't detect the window the `claude -p` model actually uses, so
-    # this is configurable: 200k (Sonnet, default) or 1_000_000 for Opus-1M.
-    context_window: int = 200_000
+    # (per agent). `None` ⇒ resolve it backend-aware at startup (Codex reports its real
+    # window at runtime; Claude infers 1M for a '[1m]' model else 200k) — see
+    # Orchestrator._resolve_context_window. An explicit int (e.g. from --context-window)
+    # is always honored.
+    context_window: int | None = None
+    # Per-agent LLM I/O trace → <cwd>/.pentest/llm/<actor>.log (full system prompt +
+    # stdin in, full stdout/stderr out). ON by default — it's the primary way to see
+    # what each agent actually received and replied. Disable with `--no-llm-log`, or
+    # point it elsewhere with $ZERO_LLM_LOG_DIR (which wins if set).
+    llm_log: bool = True
 
 
 class Orchestrator:
     def __init__(self, cfg: OrchestratorConfig) -> None:
         self.cfg = cfg
+        # Resolve the UI context-window denominator now (once) when left on auto, so the
+        # ctx% reflects the ACTUAL backend's window — Codex (~272k) is far below Claude's
+        # 1M, and a stale denominator would mislead. An explicit value is left untouched.
+        if self.cfg.context_window is None:
+            self.cfg.context_window = self._resolve_context_window()
         # Resolve the read-only-fs jail root to an absolute host path (relative to
         # cwd) and create it, so the mount target exists and the agent has a place
         # to drop loot. Export it so HOST-side tool instances jail to it too; in the
@@ -306,9 +324,23 @@ class Orchestrator:
         is off or the backend isn't claude (echo/replay are stateless — they must keep
         getting the full transcript). `id` is a UUID (`--session-id` requires one);
         `label` becomes the `-n` display name for debugging only."""
-        if not self.cfg.session_resume or self.cfg.backend != "claude":
+        if not self.cfg.session_resume or self.cfg.backend not in ("claude", "codex"):
             return None
         return Session(id=str(uuid.uuid4()), name=label)
+
+    def _resolve_context_window(self) -> int:
+        """The UI ctx denominator for the configured backend, resolved at startup.
+
+        Codex exposes its real per-model window in its on-disk model cache (read at
+        runtime) — typically ~272k, far below Claude's 1M; we fall back to 272k if the
+        cache is unreadable. Claude can't report its window, so we infer it from the
+        model id (1M for a '[1m]' variant, else the standard 200k)."""
+        if self.cfg.backend == "codex":
+            from zero.llm.codex_cli import codex_context_window
+
+            return codex_context_window(self.cfg.model) or 272_000
+        model = self.cfg.model or ""
+        return 1_000_000 if "[1m]" in model else 200_000
 
     def _build_backend(self) -> LLMBackend:
         if self.cfg.backend == "echo":
@@ -321,6 +353,15 @@ class Orchestrator:
             # Same per-call timeout as the subagents (`--llm-timeout`).
             return ClaudeCodeBackend(
                 ClaudeCodeConfig(
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
+                )
+            )
+        if self.cfg.backend == "codex":
+            from zero.llm.codex_cli import CodexCLIBackend, CodexCLIConfig
+
+            return CodexCLIBackend(
+                CodexCLIConfig(
                     timeout_seconds=self.cfg.llm_timeout_seconds,
                     model=self.cfg.model,
                 )
@@ -346,6 +387,15 @@ class Orchestrator:
                     model=self.cfg.model,
                 )
             )
+        if self.cfg.backend == "codex":
+            from zero.llm.codex_cli import CodexCLIBackend, CodexCLIConfig
+
+            return CodexCLIBackend(
+                CodexCLIConfig(
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
+                )
+            )
         return self.backend
 
     def _build_validator_backend(self) -> LLMBackend:
@@ -363,6 +413,18 @@ class Orchestrator:
                     model=self.cfg.model,
                 )
             )
+        if self.cfg.backend == "codex":
+            from zero.llm.codex_cli import CodexCLIBackend, CodexCLIConfig
+
+            # Codex has no per-call internal turn cap (codex exec runs to completion),
+            # so the validator backend is just a fresh Codex backend — the
+            # validator_claude_max_turns headroom is a Claude-only concern.
+            return CodexCLIBackend(
+                CodexCLIConfig(
+                    timeout_seconds=self.cfg.llm_timeout_seconds,
+                    model=self.cfg.model,
+                )
+            )
         return self.backend
 
     # ------------------------------------------------------------- public api
@@ -370,6 +432,13 @@ class Orchestrator:
     async def run_interactive(self) -> None:
         """Spawn agent + UI as concurrent tasks; await UI exit."""
         from zero.ui.app import run_ui
+
+        # Per-agent LLM I/O tracing (on by default). $ZERO_LLM_LOG_DIR overrides the
+        # location; it's honoured lazily by llm_trace, so only set a root here when the
+        # env var is absent — and only when not explicitly disabled via --no-llm-log.
+        if self.cfg.llm_log and not os.environ.get("ZERO_LLM_LOG_DIR"):
+            from zero.llm.llm_trace import set_llm_log_root
+            set_llm_log_root(self.cfg.cwd / ".pentest" / "llm")
 
         project_ctx = project_context_for(self.cfg.cwd)
         self.audit.write(
@@ -542,6 +611,7 @@ class Orchestrator:
             cpus=self.cfg.container_cpus,
             memory=self.cfg.container_memory,
             host_network=self.cfg.host_network,
+            network=self.cfg.container_network,
         )
         self._container = ContainerManager(spec)
         await self._container.start()
@@ -1015,6 +1085,16 @@ class Orchestrator:
             await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label))
             return ToolResult(ok=False, output=obs)
 
+        # Tell the UI the tool is now executing so a long run (e.g. a 300s ffuf in a
+        # batch) shows a live "running" indicator instead of looking hung. Prefer the
+        # per-call timeout from args, falling back to the tool class's wall-clock cap.
+        tv = args.get("timeout_seconds") if isinstance(args, dict) else None
+        timeout = int(tv) if isinstance(tv, (int, float)) and tv > 0 else int(
+            getattr(tool, "timeout_seconds", 0) or 0
+        )
+        await self._emit(
+            ToolRunning(tool=tool_name, call_id=call_id, label=label, timeout_seconds=timeout)
+        )
         result = await self._invoke_tool(tool, args, session_id=session_id)
         await self._emit(
             ToolObservation(

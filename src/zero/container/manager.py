@@ -50,6 +50,12 @@ class ContainerSpec:
     # If 0 (default) Docker picks an ephemeral host port; we discover it via
     # `docker port` after start. Override for deterministic local testing.
     rpc_port_host: int = 0
+    # Optional EXTRA docker network the sandbox joins *in addition to* its default
+    # bridge (via `docker network connect` after start) — so the RPC port stays
+    # published on the bridge while the container can also reach targets on this
+    # user-defined network. Used by the BountyBench benchmark to reach BB targets
+    # on `shared_net`. None ⇒ no extra network. Ignored under host_network.
+    network: str | None = None
 
     def resolved_name(self) -> str:
         return self.name or f"zero-{uuid.uuid4().hex[:8]}"
@@ -84,6 +90,14 @@ def build_run_args(spec: ContainerSpec, *, name: str) -> list[str]:
     if spec.host_network:
         args += ["--network", "host"]
     else:
+        # Join an extra user-defined network (e.g. BountyBench's `shared_net`) at
+        # CREATE time, not via a post-start `docker network connect` — only a
+        # container created on a user-defined network gets Docker's embedded DNS
+        # resolver (127.0.0.11), which is what lets the sandbox resolve target
+        # container names like `lunary-app`. Port publishing below still works on
+        # a user-defined network, so the host-RPC path is unaffected.
+        if spec.network:
+            args += ["--network", spec.network]
         # Linux: --add-host=host.docker.internal:host-gateway makes the host
         # reachable. On Docker Desktop the alias exists by default; passing
         # this flag is a no-op there.
@@ -123,6 +137,9 @@ class ContainerManager:
             if rc != 0:
                 raise ContainerError(f"docker run failed: {err.strip()}")
             self.name = name
+            # NOTE: an extra user-defined network (spec.network, e.g. BountyBench's
+            # `shared_net`) is joined at CREATE time in build_run_args, not here —
+            # see the comment there for why (embedded DNS for target name resolution).
             if self.spec.host_network:
                 # in host network mode the in-container port is reachable
                 # at 127.0.0.1:<port> directly.

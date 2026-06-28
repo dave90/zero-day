@@ -46,6 +46,7 @@ from zero.ui.events import (
     TodoUpdate,
     ToolObservation,
     ToolProposal,
+    ToolRunning,
 )
 from zero.ui.render import fmt_context, render_event, short_reason
 
@@ -67,6 +68,10 @@ class ZeroUI:
         # up, so the prompt stays put instead of scrolling away.
         self._interaction_queue: list = []
         self._output_buffer: list[str] = []
+        # call_id → {tool, label, start (monotonic), timeout}. A live "running"
+        # indicator in the toolbar (ticks via the 0.5s refresh) so a long tool call
+        # doesn't look like a hang. Populated on ToolRunning, cleared on ToolObservation.
+        self._running_tools: dict[str, dict] = {}
         # Live subagent list navigation (↑/↓ select, Enter expand/collapse).
         self._sel_idx = 0
         self._sel_expanded = False
@@ -184,6 +189,27 @@ class ZeroUI:
         else:
             self._sel_idx = 0
             self._sel_expanded = False
+
+        # Top-level (orchestrator / mode-a) tools currently executing. Labelled
+        # (subagent) tool runs are already implied by the animated subagent rows
+        # above, so we only surface the unlabelled ones here — that's the case that
+        # otherwise looks frozen (e.g. the orchestrator's own 300s ffuf during recon).
+        running = [r for r in self._running_tools.values() if not r.get("label")]
+        if running:
+            spin = theme.spinner_frame()
+            now = time.monotonic()
+            for r in running[:4]:
+                el = now - r["start"]
+                el_txt = f"{el:.0f}s" + (f"/{r['timeout']}s" if r.get("timeout") else "")
+                row(
+                    ("class:accent", f" {spin} "),
+                    ("class:dim", "running "),
+                    ("", r["tool"]),
+                    ("class:dim", f"  ({el_txt})"),
+                )
+            if len(running) > 4:
+                row(("class:dim", f"  … +{len(running) - 4} more tools running"))
+
         frags.extend(self._status_fragments())
         return FormattedText(frags)
 
@@ -475,6 +501,26 @@ class ZeroUI:
                 continue
 
             self._flush_stream(stream_buf)
+
+            # Maintain the live "running tool" set (a toolbar indicator), independent
+            # of whether the event reaches the chat. ToolRunning never prints; the
+            # paired ToolObservation clears it and then falls through to normal
+            # handling (labelled→hidden, top-level→chat).
+            if isinstance(ev, ToolRunning):
+                self._running_tools[ev.call_id] = {
+                    "tool": ev.tool, "label": ev.label,
+                    "start": time.monotonic(), "timeout": ev.timeout_seconds,
+                }
+                self._invalidate()
+                continue
+            if isinstance(ev, ToolObservation):
+                self._running_tools.pop(ev.call_id, None)
+                self._invalidate()
+            # A cancelled turn abandons any in-flight tool (its observation may never
+            # come), so drop the running indicators rather than let them hang.
+            if ev.kind == "turn_cancelled":
+                self._running_tools.clear()
+                self._invalidate()
 
             # Subagent start + per-turn progress stay out of the chat (the live
             # bottom toolbar shows what's running). A subagent FINISHING does

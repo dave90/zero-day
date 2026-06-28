@@ -121,7 +121,8 @@ async def _drive(orch: Orchestrator, *, deadline: float) -> None:
     indirect=["regression_target"],
 )
 async def test_regression_target(
-    regression_target, spec, tmp_path: Path, monkeypatch, regression_scorecard
+    regression_target, spec, tmp_path: Path, monkeypatch, regression_scorecard,
+    regression_backend,
 ):
     url = regression_target
     (tmp_path / "pentest.md").write_text(
@@ -135,7 +136,7 @@ async def test_regression_target(
     cfg = OrchestratorConfig(
         cwd=tmp_path,
         goal=spec.goal,
-        backend="claude",
+        backend=regression_backend,
         execution_mode="c",       # orchestrated — the production default
         use_container=True,
         yolo=True,                # auto-approve safe + active
@@ -170,7 +171,7 @@ async def test_regression_target(
     result = score_target(spec, store, audit)
     regression_scorecard.append(result)
 
-    print(f"\n[regression {spec.name}] {result.explain()}")
+    print(f"\n[regression {spec.name} backend={regression_backend}] {result.explain()}")
 
     # Plumbing sanity (deterministic — a failure here means the harness broke,
     # not the agent).

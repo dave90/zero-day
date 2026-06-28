@@ -6,10 +6,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-_DELIM_OPEN = "<project_context source=\"pentest.md\">"
-_DELIM_CLOSE = "</project_context>"
-
-
 def load_pentest_md(cwd: Path) -> str | None:
     """Return the raw contents of ./pentest.md, or None if absent/unreadable."""
     p = cwd / "pentest.md"
@@ -22,8 +18,13 @@ def load_pentest_md(cwd: Path) -> str | None:
 
 
 def wrap_for_prompt(raw: str) -> str:
-    """Wrap pentest.md contents in a delimited block for the system prompt."""
-    return f"{_DELIM_OPEN}\n{raw.rstrip()}\n{_DELIM_CLOSE}"
+    """Return the brief as plain markdown for the system prompt.
+
+    No XML-ish `<project_context>` wrapper: the caller's `load_system_prompt` already
+    prepends a `## Project context` markdown heading, which is the delimiter — wrapping
+    markdown content in an XML tag on top of that was redundant and unclear. The contents
+    ARE the full brief (scope/target URL/creds/goal); there's nothing extra to open."""
+    return raw.strip()
 
 
 def project_context_for(cwd: Path) -> str | None:

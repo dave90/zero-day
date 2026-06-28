@@ -38,9 +38,15 @@ from zero.ui.events import ApprovalPrompt, AskUser, SessionEnd, SessionSummary
 def _image_exists(tag: str) -> bool:
     if shutil.which("docker") is None:
         return False
-    return subprocess.run(
-        ["docker", "image", "inspect", tag], capture_output=True
-    ).returncode == 0
+    # Use `docker images -q`, NOT `docker image inspect`: under Docker Desktop's
+    # containerd image store, `inspect <short:tag>` flakes/false-negatives on the short
+    # name (it wants the fully-qualified docker.io/library/… ref) even though the image
+    # is present and `docker run` resolves it — which spuriously SKIPs the whole suite.
+    # `images -q` resolves the short name the same way `docker run` does.
+    out = subprocess.run(
+        ["docker", "images", "-q", tag], capture_output=True, text=True
+    )
+    return out.returncode == 0 and bool(out.stdout.strip())
 
 
 pytestmark = [
@@ -110,7 +116,8 @@ async def _drive(orch: Orchestrator, *, deadline: float) -> None:
     indirect=["regression_target"],
 )
 async def test_blind_coverage(
-    regression_target, spec, tmp_path: Path, monkeypatch, regression_blind_scorecard
+    regression_target, spec, tmp_path: Path, monkeypatch, regression_blind_scorecard,
+    regression_backend,
 ):
     url = regression_target
     (tmp_path / "pentest.md").write_text(
@@ -122,7 +129,7 @@ async def test_blind_coverage(
     cfg = OrchestratorConfig(
         cwd=tmp_path,
         goal="Black-box pentest: find and confirm as many distinct vulnerabilities as possible.",
-        backend="claude",
+        backend=regression_backend,
         execution_mode="c",
         use_container=True,
         yolo=True,

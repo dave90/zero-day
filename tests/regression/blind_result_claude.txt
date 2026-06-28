@@ -1,0 +1,14 @@
+tests/regression/test_regression_blind.py 
+[blind juice-shop] juice-shop: 2/2 (100%)  found[sqli-login,xss-search]
+.
+[blind sqli-labs] sqli-labs: 1/1 (100%)  found[sqli]
+.
+[blind vampi] vampi: 2/5 (40%)  found[sqli,mass-assignment]  missed[bola-idor,jwt-bypass,excessive-data]
+.
+[blind dvna] dvna: 3/4 (75%)  found[sqli,command-injection,xss]  missed[deserialization]
+.
+[blind dvwa] dvwa: 4/4 (100%)  found[command-injection,sqli,xss,file-inclusion]
+.
+  hard   guild: 1/1 (100%)  found[flag-via-web-defect]
+
+    hard   omniwatch: 0/4 (0%)  missed[cache-poisoning,stored-xss,jwt-forgery,sqli]

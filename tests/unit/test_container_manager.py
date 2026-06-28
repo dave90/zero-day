@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import zero.container.manager as mgr
 from zero.container.manager import (
     DEFAULT_IMAGE,
     DEFAULT_WORK_MOUNT,
     FILES_ROOT_IN_CONTAINER,
+    ContainerManager,
     ContainerSpec,
     build_run_args,
 )
@@ -152,3 +154,63 @@ def test_resolved_name_is_unique():
     assert a.startswith("zero-")
     assert b.startswith("zero-")
     assert a != b  # uuid-based
+
+
+def test_network_field_defaults_none(tmp_path: Path):
+    spec = ContainerSpec(cwd=tmp_path, claude_dir_host=None)
+    assert spec.network is None
+    assert "--network" not in build_run_args(spec, name="x")  # default bridge
+
+
+def test_extra_network_joined_at_create(tmp_path: Path):
+    """spec.network is joined at `docker run` time (so the sandbox gets Docker's
+    embedded DNS to resolve target container names), while RPC stays published."""
+    spec = ContainerSpec(cwd=tmp_path, claude_dir_host=None, network="shared_net")
+    args = build_run_args(spec, name="x")
+    i = _idx(args, "--network")
+    assert args[i + 1] == "shared_net"
+    # RPC publish is preserved on the user-defined network.
+    assert "-p" in args
+    assert "127.0.0.1::7333" in args
+    # host gateway alias still added.
+    assert "host.docker.internal:host-gateway" in args
+
+
+def test_extra_network_ignored_under_host_network(tmp_path: Path):
+    # host_network shares the host stack — the extra network is redundant/invalid.
+    spec = ContainerSpec(
+        cwd=tmp_path, claude_dir_host=None, network="shared_net", host_network=True
+    )
+    args = build_run_args(spec, name="x")
+    i = _idx(args, "--network")
+    assert args[i + 1] == "host"
+    assert "shared_net" not in args
+
+
+async def test_start_with_network_runs_clean(tmp_path: Path, monkeypatch):
+    """start() no longer issues a post-start `docker network connect`."""
+    calls: list[list[str]] = []
+
+    async def fake_run(argv):
+        calls.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(mgr, "_run", fake_run)
+    monkeypatch.setattr(mgr.shutil, "which", lambda _name: "/usr/bin/docker")
+
+    async def _no_discover(self):
+        return 12345
+
+    async def _no_wait(self, timeout: float = 15.0):
+        return None
+
+    monkeypatch.setattr(ContainerManager, "_discover_published_port", _no_discover)
+    monkeypatch.setattr(ContainerManager, "_wait_for_rpc_ready", _no_wait)
+
+    spec = ContainerSpec(cwd=tmp_path, claude_dir_host=None, network="shared_net")
+    cm = ContainerManager(spec)
+    await cm.start()
+    # The network is in `docker run` argv, not a separate connect call.
+    assert not any(c[:3] == ["docker", "network", "connect"] for c in calls)
+    run_call = next(c for c in calls if c[:2] == ["docker", "run"])
+    assert "shared_net" in run_call
