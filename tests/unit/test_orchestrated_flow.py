@@ -1022,3 +1022,68 @@ async def test_turn_limit_ends_after_waiting_for_running_subagent(tmp_path: Path
     assert any(isinstance(e, SubagentFinished) for e in capture)
     assert len(orch.subagents.attempts) == 1
     assert all(a.status != "running" for a in orch.subagents.attempts)
+
+
+async def test_orchestrator_authors_custom_tool_subagent_calls_it(tmp_path: Path, monkeypatch):
+    """The orchestrator-only create/modify/delete tools are intercepted (never in a
+    subagent's catalog), while a dispatched pentester can list and call the tool the
+    orchestrator authored. Proves the authority split + persistence end to end."""
+    from zero.ui.events import ToolObservation
+
+    monkeypatch.chdir(tmp_path)
+    body = 'import sys, json\na = json.load(sys.stdin)\nprint("marker ran", a["v"])'
+    orchestrator_backend = ScriptedBackend(
+        [
+            _action("custom_tool_create", {
+                "name": "marker",
+                "description": "Print a marker. args: {v}",
+                "script_body": body,
+            }),
+            _action("dispatch_pentester", {"attack_idea": "use the marker tool", "target": "/x"}),
+            _action("await_subagents", {"which": "all"}),
+            _action("finalize", {"summary": "done"}),
+        ]
+    )
+    orch = _make_orch(tmp_path, orchestrator_backend, _pentester_noop_final)
+    # The pentester discovers the authored tool, runs it, then reports nothing.
+    orch._subagent_backend_factory = lambda rec: ScriptedBackend(
+        [
+            _action("custom_tool_list", {}),
+            _action("custom_tool_call", {"name": "marker", "args": {"v": 7}}),
+            _pentester_noop_final(),
+        ]
+    )
+
+    capture: list = []
+    await _run_orchestrated(orch, ScriptedBackend([]), capture)
+
+    # The script was persisted under the files-root jail (survives across runs).
+    script = tmp_path / "zero_files" / "custom_tools" / "marker.py"
+    assert script.exists()
+    assert script.read_text(encoding="utf-8").startswith('"""Print a marker.')
+
+    records = read_audit(tmp_path / ".pentest" / "audit.jsonl")
+    kinds = [r["kind"] for r in records]
+    assert "custom_tool_created" in kinds
+    # The pentester (a subagent) actually proposed both shared tools.
+    called = {r.get("tool") for r in records if r["kind"] == "tool_proposal"}
+    assert {"custom_tool_list", "custom_tool_call"} <= called
+    # The call executed: stdin args reached the script and stdout came back.
+    obs = [e for e in capture if isinstance(e, ToolObservation) and e.tool == "custom_tool_call"]
+    assert obs and any("marker ran 7" in (e.output or "") for e in obs)
+
+
+async def test_subagent_cannot_see_custom_mgmt_tools(tmp_path: Path):
+    """A subagent's catalog excludes the orchestrator-only create/modify/delete
+    tools (same guarantee dispatch tools rely on), but includes list/call."""
+    from zero.tools.custom_tools import CUSTOM_MGMT_TOOL_NAMES
+    from zero.tools.dispatch import is_dispatch_tool
+
+    cfg = OrchestratorConfig(cwd=tmp_path, goal="g", backend="echo", execution_mode="c")
+    orch = Orchestrator(cfg)
+    subagent_names = {
+        t["name"] for t in orch.registry.catalog()
+        if not is_dispatch_tool(t["name"]) and t["name"] != "finding_submit"
+    }
+    assert not (CUSTOM_MGMT_TOOL_NAMES & subagent_names)
+    assert {"custom_tool_list", "custom_tool_call"} <= subagent_names

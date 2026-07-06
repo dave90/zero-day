@@ -305,9 +305,24 @@ class ClaudeCodeBackend(LLMBackend):
                 binary, prompt, max_turns, sys_for_call, session=session, resume=resuming
             )
             if returncode == 0:
+                resp = parse_claude_json(out_text)
+                # Native-tool drift: the call "succeeded" but the model tried to call
+                # tools natively (blocked by lock-down) and confabulated that tools are
+                # unavailable, instead of emitting an envelope. Treat it as a retryable
+                # turn error so the agent loop re-steers it — do NOT accept it as a real
+                # answer (that wastes the turn and, in Ralph mode, poisons progress.txt).
+                if self.cfg.lock_down_tools and looks_like_native_tool_drift(resp.text):
+                    if session is not None and not resuming:
+                        session.id = str(uuid.uuid4())  # this create claimed its id; free it
+                    raise RuntimeError(
+                        "claude tried to call tools NATIVELY under lock-down and reported "
+                        "'no such tool available' instead of using the envelope. Do NOT make "
+                        "native tool calls: reply with EXACTLY ONE JSON envelope naming one of "
+                        "the provided tools (or a final), and the runtime will run it."
+                    )
                 if session is not None and not resuming:
                     session.started = True  # create succeeded → continue with --resume
-                return parse_claude_json(out_text)
+                return resp
             # claude often reports structured errors on stdout even with
             # exit != 0. Extract a tight one-liner instead of dumping the
             # full JSON blob (which can be 1KB+).
@@ -433,6 +448,25 @@ def _extract_claude_error(stdout: str) -> str:
     return f"{bits[0]} (" + ", ".join(bits[1:]) + ")" if len(bits) > 1 else bits[0]
 
 
+# Claude Code's own message when the model emits a native `tool_use` for a tool that
+# isn't in the (empty) allow-list. Under our lock-down the model should NEVER call a
+# tool natively — it must emit a JSON envelope naming one of OUR tools. When it drifts
+# back into native tool_use it loops on this message and, given a few internal turns of
+# headroom, "recovers" to a giving-up TEXT final ("total tooling outage — every tool
+# returns 'No such tool available'"). That final has is_error=false, so it's returned as
+# a normal answer and accepted — wasting the turn AND (in Ralph mode) poisoning
+# progress.txt so later iterations give up too. We detect the signature and raise it as a
+# retryable error so the agent loop re-steers the model back to the envelope.
+_NATIVE_DRIFT_MARKER = "no such tool"
+
+
+def looks_like_native_tool_drift(text: str) -> bool:
+    """True if a lock-down response is actually the model confabulating about native
+    tools being unavailable (Claude's built-in 'No such tool available' message) rather
+    than emitting our envelope."""
+    return _NATIVE_DRIFT_MARKER in (text or "").lower()
+
+
 def parse_claude_json(stdout: str) -> LLMResponse:
     """Parse `claude -p --output-format json` output."""
     try:
@@ -473,7 +507,19 @@ def build_user_prompt(
     claude's session, so later turns send only the new conversation delta."""
     parts: list[str] = []
     if tools:
-        parts += ["## Available tools", _format_tools(tools), ""]
+        parts += ["## Available tools", _format_tools(tools)]
+        # Custom tools are dynamic engagement data (orchestrator-authored scripts in
+        # the files-root store), NOT static registry entries — so they're surfaced
+        # here, in the same create-turn-only catalog block, rather than baked into
+        # `tools`. This is the single render point shared by both backends and every
+        # agent, so each freshly-dispatched subagent (and the orchestrator on a fresh
+        # rerun) sees the live inventory up front without spending a turn on
+        # custom_tool_list. Gated on `if tools:` so it follows the catalog's
+        # create-turn-only lifetime (omitted on --resume deltas).
+        custom = _format_custom_tools()
+        if custom:
+            parts.append(custom)
+        parts.append("")
     if messages:
         parts.append("## Conversation")
         for m in messages:
@@ -506,6 +552,35 @@ def _format_tools(tools: list[dict[str, Any]]) -> str:
         if schema:
             lines.append(f"  args schema: {json.dumps(schema, separators=(',', ':'))}")
     return "\n".join(lines) if lines else "(no tools available)"
+
+
+def _format_custom_tools() -> str:
+    """Render the orchestrator-authored custom tools as a `### Custom tools`
+    subsection of the catalog, or "" when none exist.
+
+    Read from the files-root store host-side (the LLM loop always runs on the host),
+    so this also surfaces tools authored in a PRIOR run on a rerun — the store
+    persists under `zero_files/` across runs and survives `zero reset`. Framed
+    explicitly as NOT envelope-callable: they're run via `custom_tool_call`, so the
+    model doesn't try to emit them as a direct tool action. Wrapped broadly — a bad
+    store read must never crash prompt-building."""
+    try:
+        from zero.tools._customtools import list_tools
+
+        custom = list_tools()
+    except Exception:  # noqa: BLE001 - prompt-building must never fail on a store read
+        return ""
+    if not custom:
+        return ""
+    lines = [
+        "### Custom tools",
+        "Reusable tools the orchestrator authored for this engagement. These are NOT"
+        " envelope tools — do not name one as an action `tool`. Run one with"
+        " `custom_tool_call` (its `args` are delivered to the script as JSON on"
+        " stdin, per the usage below); `custom_tool_list` refreshes this list.",
+    ]
+    lines += [f"- {t['name']}: {t['description']}" for t in custom]
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------- Mode B

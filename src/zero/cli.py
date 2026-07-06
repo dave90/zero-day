@@ -250,6 +250,60 @@ def main() -> None:
     " to one file per agent under ./.pentest/llm/<actor>.log. ON by default; pass"
     " --no-llm-log to disable. ($ZERO_LLM_LOG_DIR overrides the location.)",
 )
+@click.option(
+    "--ralph",
+    is_flag=True,
+    help="Ralph mode: an analyzer/analyzer_validator build a PRD of pentest tasks,"
+    " then zero loops bounded orchestrated passes over it (each works the"
+    " top-priority task, records progress, snapshots+resets .pentest/). Wraps"
+    " mode c. Run with --yolo (and --auto-approve exploit --i-understand for"
+    " unattended exploitation).",
+)
+@click.option(
+    "--ralph-iterations",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Ralph: number of loop iterations (stops early when all PRD tasks complete)."
+    " With --ralph-resume these are ADDITIONAL iterations on top of the prior run.",
+)
+@click.option(
+    "--ralph-resume",
+    is_flag=True,
+    help="Ralph: resume the prior run from ./.ralph/ — load the existing prd.json"
+    " (keeping completed/pending task state) instead of re-planning, skip the PRD"
+    " discussion + approval, and continue iteration numbering from the last backup."
+    " Confirmed findings and progress.txt already persist.",
+)
+@click.option(
+    "--ralph-approve-prd/--no-ralph-approve-prd",
+    default=True,
+    show_default=True,
+    help="Ralph: pause for operator approval of the PRD after the analyzer↔validator"
+    " discussion, before the loop. The loop iterations always run unattended.",
+)
+@click.option(
+    "--ralph-discussion-rounds",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Ralph: max analyzer↔analyzer_validator review rounds before the PRD is"
+    " accepted as-is.",
+)
+@click.option(
+    "--analyzer-max-turns",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Ralph: turn budget for the analyzer (PRD authoring) agent.",
+)
+@click.option(
+    "--analyzer-validator-max-turns",
+    type=int,
+    default=6,
+    show_default=True,
+    help="Ralph: turn budget for the analyzer_validator (PRD review + completion check).",
+)
 def run(
     goal: str | None,
     backend: str,
@@ -281,6 +335,13 @@ def run(
     model: str,
     context_window: int | None,
     llm_log: bool,
+    ralph: bool,
+    ralph_iterations: int,
+    ralph_resume: bool,
+    ralph_approve_prd: bool,
+    ralph_discussion_rounds: int,
+    analyzer_max_turns: int,
+    analyzer_validator_max_turns: int,
 ) -> None:
     """Run an interactive pentest session."""
     from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
@@ -331,6 +392,13 @@ def run(
         model=model_or_none,
         context_window=context_window,
         llm_log=llm_log,
+        ralph=ralph,
+        ralph_iterations=ralph_iterations,
+        ralph_resume=ralph_resume,
+        ralph_approve_prd=ralph_approve_prd,
+        ralph_discussion_rounds=ralph_discussion_rounds,
+        analyzer_max_turns=analyzer_max_turns,
+        analyzer_validator_max_turns=analyzer_validator_max_turns,
     )
     orch = Orchestrator(cfg)
     asyncio.run(orch.run_interactive())

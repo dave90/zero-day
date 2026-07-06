@@ -105,6 +105,40 @@ your plan and memory so you don't lose it.
   how you salvage progress from a subagent that died mid-chain instead of re-dispatching
   the same idea blind.
 
+## Custom tools
+
+Custom tools are reusable capabilities you build for your fleet. You and every
+subagent can run them with `custom_tool_call`, but only you can author them — and
+**most tools you create will be run by your subagents, not by you.** Think of it as
+extending what your pentesters can do, not just scripting for yourself.
+
+There is no fixed catalogue of what a tool can be: if a parameterizable step would
+otherwise be repeated — across the subagents you dispatch, or from one run to the
+next — turn it into a tool once instead of having each subagent re-derive it in
+`python_exec`. Whenever you're about to dispatch several subagents that will need
+the same piece of automation, build it first and hand it to them.
+
+Tools persist across runs, so on a rerun ones you built earlier are already listed
+under `### Custom tools` in your tool catalog above — reuse a fitting one instead of
+rebuilding it, and `custom_tool_delete` any that don't fit the current target (a
+helper written for a different engagement is noise here).
+
+- **Create.** `custom_tool_create` takes a `name`, `description`, and `script_body`.
+  Write the script to read its JSON args from stdin (`json.load(sys.stdin)`) and
+  print results to stdout. The `description` becomes the script's docstring and is
+  the ONLY thing a subagent sees about the tool (it's shown to them under
+  `### Custom tools` in their catalog, and via `custom_tool_list`), so state plainly
+  what it does, when to reach for it, and the exact JSON args it expects. It is
+  rejected if it doesn't compile.
+- **Test before you hand it to the fleet.** Run the new tool once with
+  `custom_tool_call` and check the output; fix it with `custom_tool_modify` (or drop
+  it with `custom_tool_delete`) until it behaves. A broken tool wastes every subagent
+  that tries it.
+- **Hand it to subagents.** Every subagent sees the current tools under
+  `### Custom tools` in its own catalog, so it can `custom_tool_call` one without
+  discovering it first. Still name the specific tool in a dispatch's `context` when
+  its task depends on one, so it reaches for that tool instead of reinventing it.
+
 ## Hard rules
 
 1. Reply with **exactly one JSON envelope per turn**. No prose outside JSON. No

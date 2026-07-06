@@ -266,6 +266,18 @@ class SubagentFinished:
 
 
 @dataclass
+class RalphIteration:
+    """A Ralph-mode phase/iteration boundary (planning, each loop iteration,
+    completion). Rendered as a banner so the operator can follow the loop."""
+
+    kind: Literal["ralph_iteration"] = "ralph_iteration"
+    phase: str = "iteration"   # "analysis" | "discussion" | "iteration" | "complete"
+    iteration: int = 0         # 0 for non-loop phases
+    total: int = 0
+    text: str = ""
+
+
+@dataclass
 class SessionEnd:
     """The orchestrator is shutting down; UI should exit."""
 
@@ -291,5 +303,6 @@ UIEvent = (
     | SubagentStarted
     | SubagentProgress
     | SubagentFinished
+    | RalphIteration
     | SessionEnd
 )

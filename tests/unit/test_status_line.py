@@ -3,7 +3,7 @@ confirmed/rejected finding counts. The 'validating' counter, the live
 'subagents running' counter, and the leading agent ('pentest') word were
 removed to keep the footer terse."""
 from zero.ui.events import Status
-from zero.ui.render import status_line
+from zero.ui.render import ralph_status_label, status_line
 
 
 def test_status_line_shows_approvals_and_findings():
@@ -44,3 +44,13 @@ def test_status_line_defaults_to_zero_counts():
     line = status_line(Status())
     assert "approvals waiting: 0" in line
     assert "0 confirmed / 0 rejected" in line
+
+
+def test_ralph_status_label():
+    # Before the loop (analyzer discussion): planning.
+    assert ralph_status_label(0, 5, "analysis") == "ralph · planning"
+    assert ralph_status_label(0, 5, "discussion") == "ralph · planning"
+    # During the loop: current iteration / total.
+    assert ralph_status_label(2, 5, "iteration") == "ralph · iter 2/5"
+    # After the loop.
+    assert ralph_status_label(3, 3, "complete") == "ralph · done (3 iters)"

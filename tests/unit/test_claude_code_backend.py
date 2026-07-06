@@ -5,10 +5,13 @@ import pytest
 from zero.llm.backend import Message
 from zero.llm.claude_code import (
     DEFAULT_DISALLOWED_TOOLS,
+    ClaudeCodeBackend,
+    ClaudeCodeConfig,
     _extract_claude_error,
     build_mode_a_argv,
     build_prompt,
     build_user_prompt,
+    looks_like_native_tool_drift,
     parse_claude_json,
     scrub_claude_code_env,
 )
@@ -89,6 +92,37 @@ def test_build_user_prompt_omits_catalog_when_no_tools():
         [], [{"name": "curl_raw", "risk_level": "active", "description": "d"}]
     )
     assert "## Available tools" in with_tools and "curl_raw" in with_tools
+
+
+def test_build_user_prompt_surfaces_custom_tools(tmp_path, monkeypatch):
+    """Orchestrator-authored custom tools appear as a `### Custom tools` subsection
+    of the create-turn catalog — read live from the files-root store, so a tool from
+    a PRIOR run is surfaced on a rerun. Framed as run-via-custom_tool_call (not a
+    direct envelope tool)."""
+    from zero.tools._customtools import write_tool
+
+    monkeypatch.setenv("ZERO_FILES_ROOT", str(tmp_path))
+    write_tool("jwt_forge", "Forge a JWT. args: {claims}", "print('x')")
+
+    tools = [{"name": "curl_raw", "risk_level": "active", "description": "d"}]
+    body = build_user_prompt([], tools)
+    assert "### Custom tools" in body
+    assert "jwt_forge" in body and "Forge a JWT" in body
+    assert "custom_tool_call" in body
+    # The subsection rides the catalog's create-turn-only lifetime: on a --resume
+    # delta (no tools) neither the catalog nor the custom subsection is sent.
+    assert "### Custom tools" not in build_user_prompt(
+        [Message(role="observation", content="HTTP 200")], []
+    )
+
+
+def test_build_user_prompt_no_custom_tools_subsection_when_store_empty(tmp_path, monkeypatch):
+    """No `### Custom tools` block when the engagement has authored none."""
+    monkeypatch.setenv("ZERO_FILES_ROOT", str(tmp_path))
+    body = build_user_prompt(
+        [], [{"name": "curl_raw", "risk_level": "active", "description": "d"}]
+    )
+    assert "## Available tools" in body and "### Custom tools" not in body
 
 
 def test_build_user_prompt_excludes_system_prompt():
@@ -499,3 +533,54 @@ async def test_run_keeps_command_line_tiny_with_huge_prompt(monkeypatch):
     assert sum(len(a) for a in argv) < 4000       # whole command line << 32,767
     # The system prompt is referenced by FILE path, not inlined.
     assert "--system-prompt-file" in argv and "--system-prompt" not in argv
+
+
+# --- native-tool-drift guard (regression: the diennea "TOTAL TOOLING OUTAGE") -------
+
+def test_looks_like_native_tool_drift():
+    # The confabulated giving-up final quotes Claude's built-in lock-down message.
+    assert looks_like_native_tool_drift(
+        "TOTAL TOOLING OUTAGE: every tool returns 'No such tool available'."
+    )
+    assert looks_like_native_tool_drift("No such tool: curl_raw")
+    # A real envelope / final never contains it.
+    assert not looks_like_native_tool_drift('{"type":"final","answer":"confirmed XSS"}')
+    assert not looks_like_native_tool_drift("")
+
+
+async def _fake_backend(monkeypatch, result_text: str, *, lock_down: bool = True):
+    import zero.llm.claude_code as cc
+
+    monkeypatch.setattr(cc.shutil, "which", lambda _b: "/usr/bin/claude")
+    out = json.dumps({"subtype": "success", "is_error": False, "result": result_text,
+                      "num_turns": 6, "usage": {}})
+
+    async def fake_once(self, *a, **k):
+        return (out, 0, "")
+
+    monkeypatch.setattr(cc.ClaudeCodeBackend, "_run_once", fake_once)
+    return ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=lock_down))
+
+
+async def test_run_raises_on_native_tool_drift(monkeypatch):
+    # A "successful" call whose text is the drift confabulation must NOT be accepted —
+    # it's raised as a retryable error so the loop re-steers back to the envelope.
+    be = await _fake_backend(
+        monkeypatch,
+        "No work this iteration — every tool returns 'No such tool available'.",
+    )
+    with pytest.raises(RuntimeError, match="envelope"):
+        await be.run("sys", [Message(role="user", content="go")], [])
+
+
+async def test_run_returns_clean_envelope(monkeypatch):
+    be = await _fake_backend(monkeypatch, '{"type":"final","answer":"done"}')
+    resp = await be.run("sys", [Message(role="user", content="go")], [])
+    assert "done" in resp.text
+
+
+async def test_run_does_not_flag_drift_when_lockdown_off(monkeypatch):
+    # Mode B (native tools intended) must not trip the guard.
+    be = await _fake_backend(monkeypatch, "No such tool available", lock_down=False)
+    resp = await be.run("sys", [Message(role="user", content="go")], [])
+    assert "No such tool available" in resp.text

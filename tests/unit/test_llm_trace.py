@@ -79,3 +79,53 @@ def test_actor_name_sanitized_for_filename(tmp_path, monkeypatch):
     # No path traversal: a single flat file inside the root.
     files = [p.name for p in tmp_path.iterdir()]
     assert files == ["weird_._name.log"] or all("/" not in f for f in files)
+
+
+def test_trace_self_heals_after_log_dir_wiped(tmp_path, monkeypatch):
+    """Regression (production Ralph crash): backup_and_reset wiped .pentest/llm/
+    between iterations, and the next iteration's NEW actor crashed the turn with
+    FileNotFoundError when opening its trace file. trace_call must self-heal the dir
+    and never raise."""
+    import shutil
+
+    monkeypatch.delenv("ZERO_LLM_LOG_DIR", raising=False)
+    m = _fresh_module()
+    log_dir = tmp_path / ".pentest" / "llm"
+    m.set_llm_log_root(log_dir)
+    m.trace_call("orchestrator_iter_1", argv=["claude"], system_prompt="s", stdin_body="i",
+                 stdout="OUT1", stderr="", returncode=0, resume=False)
+    assert (log_dir / "orchestrator_iter_1.log").exists()
+
+    # Simulate the between-iteration wipe of .pentest/ (llm/ removed under our feet).
+    shutil.rmtree(log_dir)
+    m.reset_llm_loggers()  # drop stale handlers, as the Ralph driver now does
+
+    # A NEW actor must NOT raise and must recreate the dir + its file.
+    m.trace_call("orchestrator_iter_2", argv=["claude"], system_prompt="s", stdin_body="i",
+                 stdout="OUT2", stderr="", returncode=0, resume=False)
+    assert (log_dir / "orchestrator_iter_2.log").exists()
+    assert "OUT2" in (log_dir / "orchestrator_iter_2.log").read_text()
+
+
+def test_trace_never_raises_when_file_uncreatable(tmp_path, monkeypatch):
+    """Even if the per-actor log file genuinely can't be opened, a turn must not die
+    (llm_trace's documented 'never raises' contract)."""
+    monkeypatch.delenv("ZERO_LLM_LOG_DIR", raising=False)
+    m = _fresh_module()
+    root = tmp_path / "llm"
+    m.set_llm_log_root(root)
+    # Put a DIRECTORY where the actor's log file should go → FileHandler open raises.
+    (root / "actor.log").mkdir()
+    m.trace_call("actor", argv=["claude"], system_prompt="s", stdin_body="i",
+                 stdout="o", stderr="", returncode=0, resume=False)  # must be a no-op
+
+
+def test_reset_llm_loggers_clears_cache(tmp_path, monkeypatch):
+    monkeypatch.delenv("ZERO_LLM_LOG_DIR", raising=False)
+    m = _fresh_module()
+    m.set_llm_log_root(tmp_path)
+    m.trace_call("a", argv=["claude"], system_prompt="s", stdin_body="i",
+                 stdout="o", stderr="", returncode=0, resume=False)
+    assert m._loggers  # cached
+    m.reset_llm_loggers()
+    assert m._loggers == {}

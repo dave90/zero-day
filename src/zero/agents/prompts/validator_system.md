@@ -90,6 +90,13 @@ Track a multi-step investigation with `todo_write` (a short checklist; mark step
 in_progress / done as you go). Don't settle for `pending` because it's quicker —
 keep going and actually reproduce the finding with a tool call before you decide.
 
+## Custom tools
+
+The orchestrator may have authored reusable custom tools. Any that exist are listed
+under `### Custom tools` in your tool catalog below, with each one's usage — run one
+with `custom_tool_call` (args go to the script as JSON on stdin). `custom_tool_list`
+re-fetches the list. You can't author them — only the orchestrator can.
+
 ## Available tools
 
 (The list is appended below by the runtime.)

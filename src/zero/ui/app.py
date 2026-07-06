@@ -36,6 +36,7 @@ from zero.ui.events import (
     ActivityLine,
     ApprovalPrompt,
     AskUser,
+    RalphIteration,
     ReasoningSummary,
     SessionEnd,
     SessionSummary,
@@ -48,7 +49,7 @@ from zero.ui.events import (
     ToolProposal,
     ToolRunning,
 )
-from zero.ui.render import fmt_context, render_event, short_reason
+from zero.ui.render import fmt_context, ralph_status_label, render_event, short_reason
 
 if TYPE_CHECKING:
     from zero.orchestrator.orchestrator import Orchestrator
@@ -61,6 +62,11 @@ class ZeroUI:
     def __init__(self, orch: "Orchestrator") -> None:
         self.orch = orch
         self._status = Status()
+        # Ralph-mode footer indicator: latest iteration/total/phase from the
+        # RalphIteration events. Shown in the status bar only while mode == "ralph".
+        self._ralph_iter = 0
+        self._ralph_total = 0
+        self._ralph_phase = ""
         self._pending_approval: ApprovalPrompt | None = None
         self._pending_ask: AskUser | None = None
         # Concurrent subagents can raise several approvals at once. We show one
@@ -218,9 +224,20 @@ class ZeroUI:
         ctx usage bar. (render.status_line stays plain; tests pin its text.)"""
         st = self._status
         appr_cls = "class:warn" if st.pending_approvals else "class:dim"
+        # In Ralph mode, replace the plain "mode ralph" with a live iteration
+        # indicator (planning / iter N/total / done); other modes are unchanged.
+        if st.mode == "ralph":
+            mode_frags = [
+                ("class:dim", " · "),
+                ("class:accent", ralph_status_label(
+                    self._ralph_iter, self._ralph_total, self._ralph_phase)),
+                ("class:dim", " · "),
+            ]
+        else:
+            mode_frags = [("class:dim", f" · mode {st.mode} · ")]
         out: list = [
             ("class:accent", f" turn {st.turn}"),
-            ("class:dim", f" · mode {st.mode} · "),
+            *mode_frags,
             (appr_cls, f"approvals waiting: {st.pending_approvals}"),
             ("class:dim", " · findings: "),
             ("class:ok", f"{st.validations_confirmed}✓"),
@@ -554,6 +571,16 @@ class ZeroUI:
                 # The report, shown in the chat at `finalize`. The session does
                 # NOT end here — the orchestrator goes idle for the next prompt.
                 self._emit_chat(list(render_event(ev)))
+            elif isinstance(ev, RalphIteration):
+                # Track the current iteration for the footer indicator, and still
+                # print the boundary banner to the chat.
+                if ev.phase == "iteration":
+                    self._ralph_iter, self._ralph_total = ev.iteration, ev.total
+                elif ev.phase == "complete" and ev.total:
+                    self._ralph_total = ev.total
+                self._ralph_phase = ev.phase
+                self._emit_chat(list(render_event(ev)))
+                self._invalidate()
             else:
                 self._emit_chat(list(render_event(ev)))
 

@@ -11,6 +11,7 @@ from zero.ui.events import (
     AskUser,
     Finding,
     GoalBanner,
+    RalphIteration,
     ReasoningSummary,
     SessionEnd,
     SessionSummary,
@@ -106,6 +107,15 @@ def render_event(ev: UIEvent) -> Iterable[str]:
         return  # too chatty for the scrollback; feeds the live /running view
     elif isinstance(ev, Status):
         return
+    elif isinstance(ev, RalphIteration):
+        yield ""
+        if ev.iteration:
+            yield f"╭─ ralph · iteration {ev.iteration}/{ev.total} ({ev.phase}) ─────"
+        else:
+            yield f"╭─ ralph · {ev.phase} ─────"
+        for line in (ev.text.splitlines() or [""]):
+            yield f"│  {line}"
+        yield "╰────────────"
     elif isinstance(ev, SessionEnd):
         yield "  (session ended)"
 
@@ -274,6 +284,16 @@ def status_line(st: Status) -> str:
         f" · findings: {st.validations_confirmed} confirmed / {st.validations_rejected} rejected"
         f"{ctx_seg} "
     )
+
+
+def ralph_status_label(iteration: int, total: int, phase: str) -> str:
+    """The Ralph-mode footer segment: which iteration is running (or planning/done).
+    Shown in the status bar only while mode == 'ralph' (see ZeroUI._status_fragments)."""
+    if phase == "complete":
+        return f"ralph · done ({total} iters)"
+    if iteration <= 0:  # analysis / discussion, before the loop starts
+        return "ralph · planning"
+    return f"ralph · iter {iteration}/{total}"
 
 
 def _short(s: str, n: int) -> str:

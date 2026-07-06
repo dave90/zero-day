@@ -52,6 +52,8 @@ from zero.tools.dispatch import (
     is_dispatch_tool,
     is_inspect_tool,
 )
+from zero.tools.custom_tools import custom_mgmt_tools, is_custom_mgmt_tool
+from zero.tools._customtools import delete_tool, write_tool
 from zero.tools._memroot import memory_root
 from zero.tools.memory import read_memory, write_memory
 from zero.tools.web_fetch import WebFetchTool
@@ -211,6 +213,28 @@ class OrchestratorConfig:
     # what each agent actually received and replied. Disable with `--no-llm-log`, or
     # point it elsewhere with $ZERO_LLM_LOG_DIR (which wins if set).
     llm_log: bool = True
+    # ---- Ralph mode (iterative loop wrapping the orchestrated pass) ----------
+    # Opt-in; OFF by default. When True, run_interactive drives RalphDriver instead
+    # of the a/b/c agent loop. The analyzer/analyzer_validator build the PRD, then
+    # `ralph_iterations` bounded orchestrated passes work it (each capped at the
+    # orchestrator's own `max_turns`). See zero/ralph/.
+    ralph: bool = False
+    ralph_iterations: int = 5
+    # Resume a prior Ralph run from `.ralph/` in the engagement folder: load the
+    # existing prd.json (honouring prior task statuses/notes) instead of re-planning,
+    # skip the analyzer discussion + PRD checkpoint, and continue iteration numbering
+    # from the last `.ralph_logs/.pentest_N`. Findings + progress.txt already persist.
+    ralph_resume: bool = False
+    # Pause for operator approval of the PRD after the analyzer↔validator discussion,
+    # before the loop. Default on; the loop iterations themselves always run unattended.
+    ralph_approve_prd: bool = True
+    # Max analyzer↔analyzer_validator back-and-forth rounds before the PRD is accepted
+    # as-is (with a warning) even if not approved.
+    ralph_discussion_rounds: int = 4
+    # Per-role turn budgets for the planning agents (the per-iteration orchestrator
+    # reuses `max_turns`).
+    analyzer_max_turns: int = 8
+    analyzer_validator_max_turns: int = 6
 
 
 class Orchestrator:
@@ -501,7 +525,13 @@ class Orchestrator:
             session_factory=self._make_session,
         )
 
-        if self.cfg.execution_mode == "b":
+        if self.cfg.ralph:
+            from zero.ralph.driver import RalphDriver
+
+            agent_task = asyncio.create_task(
+                RalphDriver(self, project_ctx).run(), name="ralph"
+            )
+        elif self.cfg.execution_mode == "b":
             agent_task = asyncio.create_task(
                 self._agent_main_mode_b(project_ctx), name="agent_mode_b"
             )
@@ -1114,6 +1144,186 @@ class Orchestrator:
 
     # ===================================================== orchestrated mode (c)
 
+    def _recon_catalog(self) -> list[dict]:
+        """The safe+active registry tools an agent recons with (no finding_submit,
+        no dispatch). Shared by the orchestrator and the Ralph analyzer roles."""
+        return [
+            t for t in self.registry.catalog()
+            if t["risk_level"] in ("safe", "active") and t["name"] != "finding_submit"
+        ]
+
+    def _orchestrator_catalog(self) -> list[dict]:
+        """Orchestrator tool catalog: recon (safe+active) registry tools + the
+        intercepted-only dispatch / memory-inspect / custom-tool-mgmt tools. The
+        latter are NOT in default_registry, so modes a/b never see them; they're
+        handled in _do_orchestrator_action and never run()/remoted."""
+        disp = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "risk_level": t.risk_level.value,
+                "schema": t.json_schema(),
+            }
+            for t in dispatch_tools() + inspect_tools() + custom_mgmt_tools()
+        ]
+        return self._recon_catalog() + disp
+
+    async def _drive_agent_to_final(
+        self, loop, *, agent_label: str, session_id: str, deadline_seconds: int | None = None
+    ) -> str:
+        """Drive a simple (non-orchestrating) agent loop to its `final`, running any
+        tool calls, and return the final answer text. Used by Ralph's analyzer /
+        analyzer_validator. Unattended: an `ask_user` is auto-answered to proceed.
+        Bounded by the loop's own turn cap plus a wall-clock deadline; on repeated
+        backend errors it returns a short diagnostic string instead of crashing."""
+        start = time.monotonic()
+        deadline = start + (deadline_seconds or self.cfg.subagent_deadline_seconds)
+        consecutive = 0
+        while True:
+            if time.monotonic() > deadline:
+                return f"(deadline reached after {loop.turn} turns; no final emitted)"
+            try:
+                env = await self._do_turn(loop, agent=agent_label, mode="ralph")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — a backend glitch must not crash the loop
+                consecutive += 1
+                self.audit.write(
+                    "ralph_agent_turn_error", agent=agent_label,
+                    error=f"{type(e).__name__}: {e}", consecutive=consecutive,
+                )
+                if consecutive >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    return f"(stopped after {consecutive} backend errors: {type(e).__name__}: {e})"
+                loop.add_observation(
+                    "(system)", False,
+                    f"your previous turn failed: {e}. Reply with EXACTLY ONE JSON envelope.",
+                )
+                continue
+            consecutive = 0
+            if isinstance(env, FinalEnvelope):
+                return env.answer
+            if isinstance(env, AskUserEnvelope):
+                loop.add_ask_user_answer(
+                    "No operator is available (Ralph unattended planning). Proceed"
+                    " autonomously with your best judgment and emit your final."
+                )
+                continue
+            if isinstance(env, ActionEnvelope):
+                result = await self._run_one_tool(
+                    env.tool, env.args, reason=env.thought, session_id=session_id
+                )
+                loop.add_observation(env.tool, result.ok, result.output)
+                continue
+            if isinstance(env, ActionsEnvelope):
+                async def _one(c, _env=env):
+                    return await self._run_one_tool(
+                        c.tool, c.args, reason=c.thought or _env.thought, session_id=session_id
+                    )
+                results = await self._run_action_batch(env.calls, _one)
+                for c, r in zip(env.calls, results):
+                    loop.add_observation(c.tool, r.ok, r.output)
+                continue
+
+    async def _run_orchestrated_pass(
+        self, *, seed_messages: list[str], max_turns: int, session_label: str
+    ) -> str:
+        """Drive ONE bounded orchestrated pass to finalize / turn-cap and return the
+        orchestrator's closing summary. Reuses the exact same per-turn machinery as
+        `_orchestrator_main` (_do_turn, _do_orchestrator_action, dispatch handling,
+        SubagentManager) but WITHOUT the interactive idle / operator-input loop — it
+        terminates and returns instead of going idle. This is Ralph's per-iteration
+        worker; mode c's own loop is unchanged."""
+        self._go_idle = False
+        # Per-pass strict-validation counters so the finalize guard is scoped to THIS
+        # iteration, not the whole run.
+        self._pentester_candidates = 0
+        self._validators_dispatched = 0
+        self.subagents = SubagentManager(
+            max_concurrent=self.cfg.max_concurrent_subagents,
+            max_total=self.cfg.max_total_subagents,
+            runner=self._run_subagent,
+            emit=self._emit,
+        )
+        loop = build_orchestrator_loop(
+            backend=self.backend,
+            tools=self._orchestrator_catalog(),
+            project_context=self._project_ctx,
+            max_turns=max_turns,
+            session=self._make_session(session_label),
+        )
+        self._active_loop = loop
+        base_system_prompt = loop.system_prompt
+        for msg in seed_messages:
+            loop.add_user_message(msg)
+        await self._emit_status(turn=0, mode="ralph")
+
+        final_summary = ""
+        consecutive_turn_errors = 0
+        try:
+            while True:
+                loop.system_prompt = base_system_prompt + _orchestrator_turn_note(
+                    loop.turn, loop.max_turns
+                )
+                try:
+                    env = await self._do_turn(loop, agent="orchestrator", mode="ralph")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    consecutive_turn_errors += 1
+                    self.audit.write(
+                        "turn_error", error=f"{type(e).__name__}: {e}",
+                        consecutive=consecutive_turn_errors,
+                    )
+                    loop.add_observation(
+                        "(system)", False,
+                        f"your previous turn failed: {e}. Reply with EXACTLY ONE valid JSON"
+                        " envelope (action / actions / final).",
+                    )
+                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                        final_summary = f"(pass aborted after {consecutive_turn_errors} errors: {e})"
+                        break
+                    continue
+                consecutive_turn_errors = 0
+
+                if isinstance(env, FinalEnvelope):
+                    if loop.turn >= loop.max_turns:
+                        await self._emit_report(
+                            loop,
+                            summary=f"Ralph iteration hit the {loop.max_turns}-turn budget.",
+                        )
+                    final_summary = env.answer
+                    break
+                if isinstance(env, AskUserEnvelope):
+                    answer = (
+                        "No operator is available (Ralph unattended iteration). Proceed"
+                        " autonomously: dispatch/validate as needed and call finalize when"
+                        " this task is adequately covered."
+                    )
+                    loop.add_ask_user_answer(answer)
+                    self.audit.write("ask_user_auto_answered", question=env.question)
+                    continue
+                if isinstance(env, (ActionEnvelope, ActionsEnvelope)):
+                    await self._do_orchestrator_action(loop, env)
+                    if self._go_idle:
+                        # finalize fired and already wrote the report; the pass is done.
+                        self._go_idle = False
+                        final_summary = (
+                            getattr(env, "thought", "") or "iteration finalized."
+                        )
+                        break
+                    continue
+        finally:
+            # Always let this pass's subagents finish so nothing leaks into the next
+            # iteration (their findings are what the completion check reads).
+            if self.subagents is not None:
+                try:
+                    await asyncio.wait_for(
+                        self.subagents.await_("all", timeout=None), timeout=600
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        return final_summary
+
     async def _orchestrator_main(self, project_ctx: str | None) -> None:
         """Senior-pentester Orchestrator loop (M8): recon directly, dispatch
         concurrent pentester/validator subagents, chain results, then finalize.
@@ -1126,28 +1336,9 @@ class Orchestrator:
             runner=self._run_subagent,
             emit=self._emit,
         )
-        # Orchestrator catalog: recon (safe+active) registry tools + dispatch
-        # tools. Dispatch tools are NOT in default_registry, so modes a/b never
-        # see them.
-        recon = [
-            t for t in self.registry.catalog()
-            if t["risk_level"] in ("safe", "active") and t["name"] != "finding_submit"
-        ]
-        disp = [
-            {
-                "name": t.name,
-                "description": t.description,
-                "risk_level": t.risk_level.value,
-                "schema": t.json_schema(),
-            }
-            # dispatch tools + the orchestrator-only memory inspection tools
-            # (read_subagent_memory / list_memories). Both are intercepted in
-            # _do_orchestrator_action and never run() or remoted.
-            for t in dispatch_tools() + inspect_tools()
-        ]
         loop = build_orchestrator_loop(
             backend=self.backend,
-            tools=recon + disp,
+            tools=self._orchestrator_catalog(),
             project_context=project_ctx,
             max_turns=self.cfg.max_turns,
             session=self._make_session("orchestrator"),
@@ -1331,6 +1522,10 @@ class Orchestrator:
             obs = await self._handle_inspect(env)
             loop.add_observation(env.tool, True, obs)
             return
+        if is_custom_mgmt_tool(env.tool):
+            obs = await self._handle_custom_mgmt(env)
+            loop.add_observation(env.tool, True, obs)
+            return
         # A recon tool the orchestrator runs directly.
         result = await self._run_one_tool(env.tool, env.args, reason=env.thought)
         loop.add_observation(env.tool, result.ok, result.output)
@@ -1358,6 +1553,40 @@ class Orchestrator:
         if not body:
             return f"no memory on record for {a.agent_id!r} (it may not have saved any)."
         return f"=== memory of {a.agent_id} ===\n{body}"
+
+    async def _handle_custom_mgmt(self, env: ActionEnvelope) -> str:
+        """Orchestrator-only custom-tool management (create/modify/delete). Like
+        the dispatch tools it is handled here — the scripts are written host-side
+        into the files-root jail (mounted into the sandbox), never remoted. Wrapped
+        broadly so a bad script (SyntaxError, bad name) can never crash the loop."""
+        name = (env.args or {}).get("name", "")
+        try:
+            if env.tool == "custom_tool_delete":
+                deleted = delete_tool(name)
+                await self._emit(ActivityLine(text=f"  ▸ deleting custom tool {name!r}"))
+                self.audit.write("custom_tool_delete", name=name, deleted=deleted)
+                return (
+                    f"deleted custom tool {name!r}."
+                    if deleted
+                    else f"no custom tool named {name!r} to delete."
+                )
+            # create / modify share the same write path (write_tool overwrites).
+            description = (env.args or {}).get("description", "")
+            body = (env.args or {}).get("script_body", "")
+            p = write_tool(name, description, body)
+            verb = "modified" if env.tool == "custom_tool_modify" else "created"
+            await self._emit(ActivityLine(text=f"  ▸ {verb} custom tool {p.stem!r}"))
+            self.audit.write("custom_tool_" + verb, name=p.stem)
+            return (
+                f"{verb} custom tool {p.stem!r}. Test it with custom_tool_call"
+                " before relying on it; your subagents can now list and call it."
+            )
+        except SyntaxError as e:
+            self.audit.write("custom_tool_error", name=name, error=f"SyntaxError: {e}")
+            return f"script for {name!r} does not compile — fix and retry: {e}"
+        except (ValueError, OSError) as e:
+            self.audit.write("custom_tool_error", name=name, error=f"{type(e).__name__}: {e}")
+            return f"could not save custom tool {name!r}: {e}"
 
     async def _handle_dispatch(self, loop, env: ActionEnvelope) -> str | None:
         """Handle an orchestrator dispatch tool. Returns the observation string

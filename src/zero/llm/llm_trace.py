@@ -63,6 +63,19 @@ def _resolve_root() -> Path | None:
     return _log_root
 
 
+def reset_llm_loggers() -> None:
+    """Close and drop every cached per-actor logger. The next trace_call re-opens
+    fresh file handlers (against the current root). Call this when the log directory
+    has been recreated under the process's feet — e.g. Ralph mode snapshots+wipes
+    `.pentest/` between iterations — so stale handlers (which hold open fds to the
+    now-unlinked old files) don't leak and new actors open clean files."""
+    for lg in _loggers.values():
+        for h in list(lg.handlers):
+            lg.removeHandler(h)
+            h.close()
+    _loggers.clear()
+
+
 def _logger_for(actor: str) -> logging.Logger | None:
     root = _resolve_root()
     if root is None:
@@ -71,14 +84,23 @@ def _logger_for(actor: str) -> logging.Logger | None:
     cached = _loggers.get(safe)
     if cached is not None:
         return cached
-    logger = logging.getLogger(f"zero.llm.trace.{safe}")
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False  # don't leak full prompts to the app's root logger/UI
-    handler = logging.FileHandler(root / f"{safe}.log", encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    logger.addHandler(handler)
-    _loggers[safe] = logger
-    return logger
+    try:
+        # Self-heal the log dir: it may have been removed since startup (Ralph wipes
+        # `.pentest/` between iterations), and FileHandler does NOT create parents —
+        # without this, opening the handler raises FileNotFoundError. A logging
+        # failure must never break a turn, so swallow any error and disable tracing
+        # for this actor instead.
+        root.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(f"zero.llm.trace.{safe}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False  # don't leak full prompts to the app's root logger/UI
+        handler = logging.FileHandler(root / f"{safe}.log", encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+        _loggers[safe] = logger
+        return logger
+    except Exception:  # noqa: BLE001 — tracing must never break the engagement
+        return None
 
 
 def trace_call(

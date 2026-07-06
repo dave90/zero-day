@@ -56,6 +56,7 @@ def default_registry() -> ToolRegistry:
     """Registry pre-populated with the M2 + M5 tool surface."""
     from zero.tools.burp_traffic import BurpTrafficTool
     from zero.tools.curl_raw import CurlRawTool
+    from zero.tools.custom_tools import CustomToolCallTool, CustomToolListTool
     from zero.tools.ffuf import FfufTool
     from zero.tools.finding_submit import FindingSubmitTool
     from zero.tools.grep import GrepTool
@@ -92,6 +93,10 @@ def default_registry() -> ToolRegistry:
     # Per-agent task plan / checklist (host-side, never remoted).
     reg.register(TodoReadTool())
     reg.register(TodoWriteTool())
+    # Custom tools authored by the orchestrator (list/call visible to all agents;
+    # create/modify/delete are orchestrator-only and appended to its catalog).
+    reg.register(CustomToolListTool())
+    reg.register(CustomToolCallTool())
     # M5 traffic + binary tools
     reg.register(BurpTrafficTool())
     reg.register(HttpReplayTool())

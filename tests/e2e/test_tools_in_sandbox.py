@@ -52,6 +52,11 @@ EXEC_ARGS: dict[str, dict] = {
     "list_dir": {"path": "."},
     "grep": {"pattern": "x", "path": "."},
     "read_file": {"path": "anything.txt"},
+    # Custom tools: list over an empty store runs cleanly; call of a missing tool
+    # RUNS and returns "no such custom tool" (a positive end-to-end run that
+    # actually executes an authored script is test_custom_tool_runs_in_sandbox).
+    "custom_tool_list": {},
+    "custom_tool_call": {"name": "does_not_exist", "args": {}},
 }
 # Tools covered by a non-execution check instead of a full run:
 PRESENCE_ONLY = {"nuclei"}        # binary on PATH; a real run downloads templates (slow/network)
@@ -273,6 +278,34 @@ async def test_fs_tools_jailed_to_files_root_in_sandbox(sandbox_url):
         # Jail: must NOT be able to read outside the root.
         esc = await rpc.call("read_file", {"path": "/etc/passwd"})
         assert esc.ok is False and "outside the files root" in esc.output, esc.output
+
+
+@pytest.mark.docker
+@_NEEDS_IMAGE
+async def test_custom_tool_runs_in_sandbox(sandbox_url):
+    """A custom tool authored into the files-root store executes in the sandbox:
+    custom_tool_call delivers its args as JSON on stdin and returns its stdout.
+    (The orchestrator writes the script host-side; here we drop it via python_exec
+    into the same mounted /zero_files store the remoted tool reads.)"""
+    script = (
+        '"""Echo the who arg. args: {who}"""\n'
+        "import sys, json\n"
+        "print('hello', json.load(sys.stdin)['who'])\n"
+    )
+    async with ContainerRPC(sandbox_url) as rpc:
+        w = await rpc.call("python_exec", {
+            "code": (
+                "import os; os.makedirs('/zero_files/custom_tools', exist_ok=True);"
+                f"open('/zero_files/custom_tools/greet.py','w').write({script!r})"
+            )
+        })
+        assert w.ok, w.output
+
+        lst = await rpc.call("custom_tool_list", {})
+        assert lst.ok and "greet" in lst.output and "Echo the who arg" in lst.output, lst.output
+
+        r = await rpc.call("custom_tool_call", {"name": "greet", "args": {"who": "gino"}})
+    assert r.ok and "hello gino" in r.output, r.output
 
 
 @pytest.mark.docker

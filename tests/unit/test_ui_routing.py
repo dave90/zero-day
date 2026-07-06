@@ -79,6 +79,36 @@ async def test_chat_routing_shows_orchestrator_hides_subagents(tmp_path: Path):
     assert "report.md" in blob
 
 
+async def test_ralph_iteration_shows_in_footer_only_in_ralph_mode(tmp_path: Path):
+    from zero.ui.events import RalphIteration, SessionEnd, Status
+
+    ui = ZeroUI(_StubOrch(tmp_path))
+    ui._print = lambda lines: None  # type: ignore  # swallow the boundary banners
+
+    for ev in [
+        RalphIteration(phase="analysis", iteration=0, total=5, text="planning"),
+        RalphIteration(phase="iteration", iteration=2, total=5, text="working t2"),
+        SessionEnd(),
+    ]:
+        ui.orch.ui_queue.put_nowait(ev)
+    await asyncio.wait_for(ui.pump_events(), timeout=5)
+
+    # The iteration/total/phase were captured from the events.
+    assert (ui._ralph_iter, ui._ralph_total, ui._ralph_phase) == (2, 5, "iteration")
+
+    # In ralph mode the footer shows the live iteration (replacing "mode ralph").
+    ui._status = Status(mode="ralph", turn=3)
+    ralph_txt = "".join(t for _, t in ui._status_fragments())
+    assert "ralph · iter 2/5" in ralph_txt
+    assert "mode ralph" not in ralph_txt
+
+    # Outside ralph mode the indicator is hidden and the mode shows as before.
+    ui._status = Status(mode="c", turn=3)
+    c_txt = "".join(t for _, t in ui._status_fragments())
+    assert "mode c" in c_txt
+    assert "ralph" not in c_txt
+
+
 async def test_concurrent_approvals_are_queued_one_at_a_time(tmp_path: Path):
     from zero.orchestrator.approval import Decision
     from zero.ui.events import ApprovalPrompt
