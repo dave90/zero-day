@@ -214,3 +214,33 @@ async def test_start_with_network_runs_clean(tmp_path: Path, monkeypatch):
     assert not any(c[:3] == ["docker", "network", "connect"] for c in calls)
     run_call = next(c for c in calls if c[:2] == ["docker", "run"])
     assert "shared_net" in run_call
+
+
+async def test_recreate_removes_old_and_starts_fresh(tmp_path: Path, monkeypatch):
+    """recreate() force-removes the (dead) container and starts a NEW one — new name,
+    so the sandbox-loss recovery path gets a working endpoint."""
+    calls: list[list[str]] = []
+
+    async def fake_run(argv):
+        calls.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(mgr, "_run", fake_run)
+    monkeypatch.setattr(mgr.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(ContainerManager, "_discover_published_port", lambda self: _aval(23456))
+    monkeypatch.setattr(ContainerManager, "_wait_for_rpc_ready", lambda self, timeout=15.0: _aval(None))
+
+    cm = ContainerManager(ContainerSpec(cwd=tmp_path, claude_dir_host=None))
+    await cm.start()
+    first_name = cm.name
+    assert first_name is not None
+
+    await cm.recreate()
+    # old container force-removed, and a fresh one created with a DIFFERENT name.
+    assert ["docker", "rm", "-f", first_name] in calls
+    assert cm.name is not None and cm.name != first_name
+    assert cm.rpc_port == 23456
+
+
+async def _aval(v):
+    return v

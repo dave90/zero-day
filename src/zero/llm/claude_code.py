@@ -132,6 +132,14 @@ class ClaudeCodeConfig:
     # clear a transient accounting trip without giving it room to loop.
     retry_on_max_turns: bool = True
     max_turns_retry_bonus: int = 2
+    # Native-tool-drift RE-STEER budget. Under lock-down the model sometimes reaches for a
+    # NATIVE tool (Read/Grep/Bash), hits "No such tool available", and confabulates a
+    # giving-up final instead of emitting our envelope (worst on source-review prompts —
+    # the Swiss Post run burned dozens of subagent turns this way). Rather than fail the
+    # whole turn, the backend RESUMES the same claude session with a terse "envelope only"
+    # correction up to this many times, so the model — now seeing its own failed attempt —
+    # recovers to a real envelope. 0 ⇒ raise immediately (the old, lossy behavior).
+    max_native_resteers: int = 2
 
 
 _NUL_RUN = re.compile("\x00+")
@@ -289,13 +297,73 @@ class ClaudeCodeBackend(LLMBackend):
         # tools ⇒ build_user_prompt drops the catalog). On the create turn (or with no
         # session at all) we send the full body + identity, pinning `--session-id`.
         resuming = session is not None and session.started
+        started_as_create = session is not None and not resuming
         body_tools = [] if resuming else tools
         sys_for_call = "" if resuming else system_prompt
         prompt = build_user_prompt(messages, body_tools)
 
-        # claude's internal turn counter inflates on long prompts and can trip
-        # `error_max_turns` even though we never let it execute a tool — so on that
-        # failure, retry ONCE with extra headroom rather than crashing the turn.
+        # Native-tool-drift RE-STEER loop. Under lock-down the model sometimes tries to
+        # call a tool NATIVELY (Claude Code's own Read/Grep/Bash), hits "No such tool
+        # available", and confabulates a giving-up final instead of emitting our envelope —
+        # worst on source-review prompts, which is exactly where it bit us. Instead of
+        # failing the whole turn, we re-steer IN-BACKEND: RESUME the same claude session
+        # with a terse "envelope only" correction so the model — now seeing its own failed
+        # native attempt — converts to a real envelope. Bounded by `max_native_resteers`;
+        # only when that is exhausted do we surface the retryable error to the agent loop.
+        for resteer in range(self.cfg.max_native_resteers + 1):
+            resp, drift, detail = await self._run_turn(
+                binary, prompt, sys_for_call, session, resuming
+            )
+            if resp is not None:
+                if session is not None:
+                    session.started = True  # this call created/continued the session
+                return resp
+            if not drift:
+                raise RuntimeError(detail)  # a hard (non-drift) error — surface as-is
+            if resteer < self.cfg.max_native_resteers:
+                # The drifting call already created/continued the session in claude, so
+                # resume IT with only the correction delta (drop system prompt + catalog);
+                # the model sees its own failed native attempt plus the fix. Sessionless
+                # backends can't resume, so re-send the full body with the correction.
+                if session is not None:
+                    session.started = True
+                    resuming = True
+                    sys_for_call = ""
+                    prompt = build_user_prompt(
+                        [Message(role="user", content=_RESTEER_BODY)], []
+                    )
+                else:
+                    prompt = build_user_prompt(
+                        [*messages, Message(role="user", content=_RESTEER_BODY)], body_tools
+                    )
+                continue
+            # Re-steers exhausted: void a create's claimed session id so the loop's NEXT
+            # attempt is a clean create (a resume keeps its id), then surface the drift as
+            # a retryable error naming the fix.
+            if started_as_create and session is not None:
+                session.id = str(uuid.uuid4())
+                session.started = False
+            raise RuntimeError(_DRIFT_ERROR_MSG)
+        # Unreachable — the loop always returns or raises.
+        raise RuntimeError(_DRIFT_ERROR_MSG)
+
+    async def _run_turn(
+        self,
+        binary: str,
+        prompt: str,
+        sys_for_call: str,
+        session: Session | None,
+        resuming: bool,
+    ) -> tuple[LLMResponse | None, bool, str | None]:
+        """One logical LLM turn: the `claude -p` call plus the `error_max_turns` headroom
+        ladder (claude's internal turn counter inflates on long prompts and can trip the
+        cap even though we never let it execute a tool — so we retry once with more turns).
+
+        Returns (resp, drift, detail):
+          * (LLMResponse, False, None) — a clean answer to return
+          * (None, True, reason)       — native-tool drift under lock-down (re-steerable)
+          * (None, False, error)       — a hard error to surface
+        """
         caps = [self.cfg.max_turns]
         if self.cfg.retry_on_max_turns:
             caps.append(self.cfg.max_turns + self.cfg.max_turns_retry_bonus)
@@ -306,40 +374,22 @@ class ClaudeCodeBackend(LLMBackend):
             )
             if returncode == 0:
                 resp = parse_claude_json(out_text)
-                # Native-tool drift: the call "succeeded" but the model tried to call
-                # tools natively (blocked by lock-down) and confabulated that tools are
-                # unavailable, instead of emitting an envelope. Treat it as a retryable
-                # turn error so the agent loop re-steers it — do NOT accept it as a real
-                # answer (that wastes the turn and, in Ralph mode, poisons progress.txt).
-                if self.cfg.lock_down_tools and looks_like_native_tool_drift(resp.text):
-                    if session is not None and not resuming:
-                        session.id = str(uuid.uuid4())  # this create claimed its id; free it
-                    raise RuntimeError(
-                        "claude tried to call tools NATIVELY under lock-down and reported "
-                        "'no such tool available' instead of using the envelope. Do NOT make "
-                        "native tool calls: reply with EXACTLY ONE JSON envelope naming one of "
-                        "the provided tools (or a final), and the runtime will run it."
-                    )
-                if session is not None and not resuming:
-                    session.started = True  # create succeeded → continue with --resume
-                return resp
-            # claude often reports structured errors on stdout even with
-            # exit != 0. Extract a tight one-liner instead of dumping the
-            # full JSON blob (which can be 1KB+).
+                if self.cfg.lock_down_tools and _is_native_tool_drift(resp):
+                    return None, True, "native tool_use under lock-down"
+                return resp, False, None
+            # claude often reports structured errors on stdout even with exit != 0.
+            # Extract a tight one-liner instead of dumping the full JSON blob (1KB+).
             detail = _extract_claude_error(out_text) or err or "(no output)"
             last_error = f"claude -p exit {returncode}: {detail}"
-            is_max_turns = "error_max_turns" in detail
-            if is_max_turns and attempt + 1 < len(caps):
-                # A create that errored has ALREADY claimed its `--session-id`, so
-                # retrying the create with the same id fails "Session ID already in
-                # use". Give the session a FRESH id (the stdin body still carries the
-                # full seed) so the retry is a clean create. (Resume keeps its id.)
+            if "error_max_turns" in detail and attempt + 1 < len(caps):
+                # A create that errored ALREADY claimed its `--session-id`, so retrying
+                # with the same id fails "Session ID already in use". Give it a FRESH id
+                # (stdin still carries the full seed) for a clean create. (Resume keeps id.)
                 if session is not None and not resuming:
                     session.id = str(uuid.uuid4())
                 continue  # retry with more turns
-            raise RuntimeError(last_error)
-        # Unreachable (the loop always returns or raises), but keeps types happy.
-        raise RuntimeError(last_error or "claude -p failed")
+            break
+        return None, False, last_error
 
     async def _run_once(
         self,
@@ -465,6 +515,43 @@ def looks_like_native_tool_drift(text: str) -> bool:
     tools being unavailable (Claude's built-in 'No such tool available' message) rather
     than emitting our envelope."""
     return _NATIVE_DRIFT_MARKER in (text or "").lower()
+
+
+def _is_native_tool_drift(resp: LLMResponse) -> bool:
+    """True when a lock-down turn 'succeeded' but is really native-tool drift: the model
+    either quoted Claude's built-in 'No such tool available' (the confabulated giving-up
+    final) OR the result carries a native `tool_use` stop_reason (the structured,
+    language-independent signal that it reached for a native tool). Either way the turn
+    must be re-steered to the envelope, not accepted as a real answer."""
+    if looks_like_native_tool_drift(resp.text):
+        return True
+    raw = resp.raw or {}
+    return raw.get("stop_reason") == "tool_use"
+
+
+# The correction we RESUME the drifting claude session with: it sees its own failed native
+# attempt, then this terse "envelope only" nudge, and converts to a real envelope. Kept
+# short because it's a resume delta (the system prompt + tool catalog already live in the
+# session). Names the common file-review tools since source review is where drift peaks.
+_RESTEER_BODY = (
+    "STOP — your previous reply tried to call a tool NATIVELY (Claude Code's own "
+    "Read/Grep/Glob/Bash). Those tools DO NOT EXIST here; every native call returns "
+    "'No such tool available'. The ONLY way to act is to emit EXACTLY ONE JSON envelope "
+    "naming one of the tools from your instructions — e.g. "
+    '{"type":"action","tool":"grep","args":{"pattern":"...","path":"..."}} to search, '
+    '{"type":"action","tool":"read_file","args":{"path":"..."}} to read a file, or '
+    '{"type":"final","answer":"..."} to finish. Re-issue your intended action NOW as one '
+    "such envelope, with no prose and no native tool call."
+)
+
+# Surfaced to the agent loop only after re-steering is exhausted. Keeps the word
+# "envelope" so the loop's own re-prompt (and the unit tests) can key off it.
+_DRIFT_ERROR_MSG = (
+    "claude kept calling tools NATIVELY under lock-down and reported 'no such tool "
+    "available' instead of using the envelope, and did not recover after re-steering. Do "
+    "NOT make native tool calls: reply with EXACTLY ONE JSON envelope naming one of the "
+    "provided tools (or a final), and the runtime will run it."
+)
 
 
 def parse_claude_json(stdout: str) -> LLMResponse:

@@ -27,6 +27,11 @@ from messages.agent_messages.executor_agent_message import ExecutorAgentMessage
 from resources.resource_type import ResourceType
 from utils.logger import get_main_logger
 
+from .zero_detect_oracle import (
+    build_detect_retry_goal,
+    patch_dest_basenames,
+    should_retry_detect,
+)
 from .zero_driver import (
     build_bountybench_goal,
     run_zero_engagement,
@@ -139,6 +144,15 @@ class ZeroExecutorAgent(BaseAgent):
         )
 
         wrote = self._stage_exploit(result)
+
+        # Detect discrimination oracle: a blind attempt often proves a REAL but ungraded
+        # bug (wrong endpoint). If the staged exploit doesn't exercise an endpoint the
+        # compatible patch guards, it won't discriminate patched-vs-unpatched → BB scores
+        # it a non-detection. Run ONE guided retry that tells zero its attempt missed and
+        # where the fix lives (never names the graded endpoint). Degrades gracefully.
+        if wrote and self.cfg.task_type == "detect" and self._detect_oracle_enabled():
+            result, wrote = await self._maybe_guided_retry(result, goal, target, settings)
+
         confirmed = len(result.confirmed)
         if wrote:
             msg.set_submission(True)
@@ -154,6 +168,43 @@ class ZeroExecutorAgent(BaseAgent):
             )
             logger.status("zero produced no exploit.sh", False)
         return msg
+
+    def _detect_oracle_enabled(self) -> bool:
+        # On by default for detect; ZERO_BB_DETECT_ORACLE=0 disables.
+        return os.environ.get("ZERO_BB_DETECT_ORACLE", "1").lower() not in ("0", "false", "no")
+
+    async def _maybe_guided_retry(self, result, goal: str, target: str, settings: dict):
+        """If the staged exploit doesn't hit a patch-guarded endpoint, run ONE guided
+        retry and stage its exploit instead. Returns (result_to_report, wrote). Never
+        raises — any failure keeps attempt 1."""
+        try:
+            exploit_text = (self.exploit_files_dir / "exploit.sh").read_text(encoding="utf-8")
+            if not should_retry_detect(exploit_text, Path(self.cfg.task_dir), self.cfg.bounty_number):
+                logger.info("[zero] detect oracle: attempt 1 targets a guarded endpoint — no retry")
+                return result, True
+            basenames = patch_dest_basenames(Path(self.cfg.task_dir), self.cfg.bounty_number)
+            retry_goal = build_detect_retry_goal(goal, exploit_text, basenames)
+            logger.status("zero detect oracle: attempt 1 non-discriminating — guided retry", True)
+            retry_cwd = self.engagement_dir.parent / f"{self.engagement_dir.name}_retry"
+            retry = await run_zero_engagement(
+                cwd=retry_cwd,
+                target_host=target,
+                writeup=self.cfg.writeup,
+                goal=retry_goal,
+                system=self.cfg.system,
+                bounty_number=self.cfg.bounty_number,
+                cwe=self.cfg.cwe,
+                info=self.cfg.info,
+                verify_files=None,
+                **settings,
+            )
+            if self._stage_exploit(retry):   # overwrites exploit_files/exploit.sh
+                logger.status("zero detect oracle: guided retry produced a new exploit.sh", True)
+                return retry, True
+            logger.info("[zero] detect oracle: retry produced no exploit — keeping attempt 1")
+        except Exception as e:  # noqa: BLE001 — the oracle must never block submission
+            logger.error(f"[zero] detect oracle failed ({type(e).__name__}: {e}); keeping attempt 1")
+        return result, True
 
     # Exploit-only verifier files. Stock BB exposes these to Exploit agents and tells
     # them to inspect them; stock Detect does not receive verifier files.

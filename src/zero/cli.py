@@ -288,14 +288,15 @@ def main() -> None:
     default=4,
     show_default=True,
     help="Ralph: max analyzer↔analyzer_validator review rounds before the PRD is"
-    " accepted as-is.",
+    " accepted as-is (reused for both the epic and task phases).",
 )
 @click.option(
-    "--analyzer-max-turns",
-    type=int,
-    default=8,
+    "--ralph-epics/--no-ralph-epics",
+    default=True,
     show_default=True,
-    help="Ralph: turn budget for the analyzer (PRD authoring) agent.",
+    help="Ralph: two-phase planning — first agree a set of EPICS that partition the"
+    " attack surface, then decompose each into atomic tasks (every epic gets >=1 task,"
+    " checked by the validator). --no-ralph-epics uses single-phase task planning.",
 )
 @click.option(
     "--analyzer-validator-max-turns",
@@ -340,7 +341,7 @@ def run(
     ralph_resume: bool,
     ralph_approve_prd: bool,
     ralph_discussion_rounds: int,
-    analyzer_max_turns: int,
+    ralph_epics: bool,
     analyzer_validator_max_turns: int,
 ) -> None:
     """Run an interactive pentest session."""
@@ -397,7 +398,7 @@ def run(
         ralph_resume=ralph_resume,
         ralph_approve_prd=ralph_approve_prd,
         ralph_discussion_rounds=ralph_discussion_rounds,
-        analyzer_max_turns=analyzer_max_turns,
+        ralph_epics=ralph_epics,
         analyzer_validator_max_turns=analyzer_validator_max_turns,
     )
     orch = Orchestrator(cfg)

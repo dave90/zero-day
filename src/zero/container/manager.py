@@ -148,6 +148,21 @@ class ContainerManager:
                 self.rpc_port = await self._discover_published_port()
             await self._wait_for_rpc_ready()
 
+    async def recreate(self) -> None:
+        """Tear down the (likely dead) container record and start a FRESH sandbox with
+        the same spec — new name + new ephemeral port, same cwd/files_root mounts. Used
+        by the RPC recovery hook when the sandbox is lost mid-run (crash / OOM / an
+        operator `docker rm`). The new container is a clean slate: in-container state
+        (python_exec globals, python_bg jobs, /work-only files) does NOT survive; the
+        host-side .pentest/ and bind-mounted zero_files/ do."""
+        old = self.name
+        async with self._lock:
+            self.name = None
+            self.rpc_port = 0
+        if old:  # best-effort: the container may already be gone
+            await _run(["docker", "rm", "-f", old])
+        await self.start()  # re-acquires the lock, creates a fresh container
+
     async def stop(self) -> None:
         """Stop + remove the container. Idempotent."""
         async with self._lock:

@@ -2,12 +2,15 @@ import json
 
 import pytest
 
-from zero.llm.backend import Message
+from zero.llm.backend import LLMResponse, Message, Session
 from zero.llm.claude_code import (
     DEFAULT_DISALLOWED_TOOLS,
     ClaudeCodeBackend,
     ClaudeCodeConfig,
+    _DRIFT_ERROR_MSG,
+    _RESTEER_BODY,
     _extract_claude_error,
+    _is_native_tool_drift,
     build_mode_a_argv,
     build_prompt,
     build_user_prompt,
@@ -584,3 +587,137 @@ async def test_run_does_not_flag_drift_when_lockdown_off(monkeypatch):
     be = await _fake_backend(monkeypatch, "No such tool available", lock_down=False)
     resp = await be.run("sys", [Message(role="user", content="go")], [])
     assert "No such tool available" in resp.text
+
+
+# --- native-tool-drift RE-STEER (solution #3) -------------------------------
+#
+# The overnight Swiss Post run burned dozens of subagent turns to
+# `subagent_turn_error: claude tried to call tools NATIVELY under lock-down`.
+# Each was a source-review subagent whose native Read/Grep instinct hit
+# "No such tool available"; the backend then RAISED, killing the whole turn.
+# Solution #3 re-steers IN-BACKEND (resume the same session with an
+# envelope-only correction) so the model recovers instead of the turn dying,
+# and only surfaces the error once the re-steer budget is spent.
+
+# giving-up final that quotes Claude's built-in lock-down message (rc=0 "success")
+_DRIFT = (
+    json.dumps({"subtype": "success", "is_error": False,
+                "result": "I can't proceed — every tool returns 'No such tool available'.",
+                "usage": {}}),
+    0, "",
+)
+# a benign-looking success whose STRUCTURED stop_reason reveals a native tool_use attempt
+_DRIFT_STRUCTURED = (
+    json.dumps({"subtype": "success", "is_error": False,
+                "result": "Let me read crypto-primitives-ts to check the challenge hash.",
+                "stop_reason": "tool_use", "usage": {}}),
+    0, "",
+)
+# a clean envelope the model emits once re-steered
+_OK_ENVELOPE = (
+    json.dumps({"result": '{"type":"action","tool":"grep","args":{"pattern":"computeChallenge"}}',
+                "usage": {}}),
+    0, "",
+)
+
+
+def _script_run_once(monkeypatch, outputs):
+    """Patch `_run_once` to yield (stdout, rc, err) from `outputs` in order, recording the
+    (prompt, resume, max_turns) of each call. Returns the recorded-calls list."""
+    import zero.llm.claude_code as cc
+
+    monkeypatch.setattr(cc.shutil, "which", lambda _b: "/usr/bin/claude")
+    seq = list(outputs)
+    calls: list[dict] = []
+
+    async def fake_once(self, binary, prompt, max_turns, system_prompt="", *,
+                        session=None, resume=False):
+        calls.append({"prompt": prompt, "resume": resume, "max_turns": max_turns,
+                      "sys": system_prompt})
+        return seq.pop(0)
+
+    monkeypatch.setattr(cc.ClaudeCodeBackend, "_run_once", fake_once)
+    return calls
+
+
+def test_is_native_tool_drift_substring_and_structured():
+    # confabulated giving-up text
+    assert _is_native_tool_drift(LLMResponse(text="every tool: No such tool available", raw={}))
+    # structured signal even when the prose looks benign
+    assert _is_native_tool_drift(LLMResponse(text="reading the file now",
+                                             raw={"stop_reason": "tool_use"}))
+    # a real envelope / final is NOT drift
+    assert not _is_native_tool_drift(
+        LLMResponse(text='{"type":"final","answer":"confirmed"}', raw={"stop_reason": "end_turn"})
+    )
+    assert not _is_native_tool_drift(LLMResponse(text="clean", raw=None))
+
+
+def test_config_has_resteer_budget():
+    assert ClaudeCodeConfig().max_native_resteers >= 1
+
+
+async def test_native_drift_is_resteered_then_recovers(monkeypatch):
+    # drift once, then (after the correction) a real envelope → the turn RECOVERS instead
+    # of dying, and the re-steer resumes the SAME session with the correction delta only.
+    calls = _script_run_once(monkeypatch, [_DRIFT, _OK_ENVELOPE])
+    be = ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=True, max_native_resteers=2))
+    sess = Session(id="U1", name="pentester", started=False)
+    resp = await be.run("sys", [Message(role="user", content="audit the source")], [],
+                        session=sess)
+    assert "grep" in resp.text                         # recovered to a real envelope
+    assert len(calls) == 2                              # one drift + one re-steer
+    # the re-steer RESUMED the session with the correction, not the original prompt
+    assert calls[1]["resume"] is True
+    assert calls[1]["sys"] == ""                        # no system prompt on the resume delta
+    assert "envelope" in calls[1]["prompt"].lower()
+    assert "audit the source" not in calls[1]["prompt"]
+    assert _RESTEER_BODY[:24] in calls[1]["prompt"]
+    assert sess.started is True                         # session left usable for next turn
+
+
+async def test_structured_tool_use_stop_is_treated_as_drift(monkeypatch):
+    # The structured `stop_reason=="tool_use"` signal (pillar a) must be caught even when
+    # the prose contains no "no such tool" string.
+    calls = _script_run_once(monkeypatch, [_DRIFT_STRUCTURED, _OK_ENVELOPE])
+    be = ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=True, max_native_resteers=2))
+    sess = Session(id="U1", started=False)
+    resp = await be.run("sys", [Message(role="user", content="go")], [], session=sess)
+    assert "grep" in resp.text
+    assert len(calls) == 2                              # detected + re-steered + recovered
+
+
+async def test_native_drift_exhausts_budget_then_raises_and_voids_create(monkeypatch):
+    # Persistent drift: after 1 initial + N re-steers it gives up with a retryable error,
+    # and voids the CREATE's claimed session id so the loop's next attempt is a clean create.
+    calls = _script_run_once(monkeypatch, [_DRIFT, _DRIFT, _DRIFT])
+    be = ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=True, max_native_resteers=2))
+    sess = Session(id="U1", started=False)
+    with pytest.raises(RuntimeError) as exc:
+        await be.run("sys", [Message(role="user", content="go")], [], session=sess)
+    assert str(exc.value) == _DRIFT_ERROR_MSG           # the exact retryable drift error
+    assert len(calls) == 3                              # initial + exactly 2 re-steers
+    assert sess.id != "U1"                             # create voided → fresh id
+    assert sess.started is False                        # ...and marked not-started
+
+
+async def test_resteer_budget_zero_raises_immediately(monkeypatch):
+    # max_native_resteers=0 reproduces the OLD lossy behavior: drift → immediate raise.
+    calls = _script_run_once(monkeypatch, [_DRIFT])
+    be = ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=True, max_native_resteers=0))
+    with pytest.raises(RuntimeError, match="envelope"):
+        await be.run("sys", [Message(role="user", content="go")], [], session=Session(id="U1"))
+    assert len(calls) == 1                              # no re-steer attempts
+
+
+async def test_resteer_sessionless_resends_full_body_with_correction(monkeypatch):
+    # With no Session (stateless caller) the backend can't --resume, so it re-sends the
+    # full body with the correction appended rather than a bare delta.
+    calls = _script_run_once(monkeypatch, [_DRIFT, _OK_ENVELOPE])
+    be = ClaudeCodeBackend(ClaudeCodeConfig(lock_down_tools=True, max_native_resteers=2))
+    resp = await be.run("sys", [Message(role="user", content="find the bug")], [])
+    assert "grep" in resp.text
+    assert len(calls) == 2
+    assert calls[1]["resume"] is False                 # no session ⇒ no resume
+    assert "find the bug" in calls[1]["prompt"]         # full body re-sent...
+    assert "envelope" in calls[1]["prompt"].lower()     # ...with the correction appended

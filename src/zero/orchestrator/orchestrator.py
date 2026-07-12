@@ -97,6 +97,21 @@ _MAX_CONSECUTIVE_TURN_ERRORS = 3
 _SERIAL_BATCH_TOOLS = {"python_exec", "pip_install"}
 
 
+def _seed_memory_message(own_memory: str) -> str:
+    """Frame the orchestrator's re-seeded memory. The memory may be from a PRIOR
+    process (same folder → stable "orchestrator" session id), so any subagent it calls
+    dispatched/running is gone — its process died with it. Warn the model NOT to await
+    those ghosts (an `await_subagents` with nothing in flight would otherwise hang); it
+    must re-dispatch to continue that work."""
+    return (
+        "## Your memory from earlier\n\n"
+        "NOTE: this may be from an earlier session. Any subagents it describes as"
+        " dispatched/running are NO LONGER running (they ended with that session) — to"
+        " continue that work, re-dispatch; do NOT call await_subagents for them.\n\n"
+        f"{own_memory}"
+    )
+
+
 def _orchestrator_turn_note(turns_done: int, max_turns: int) -> str:
     """A per-turn 'turns remaining' reminder appended to the orchestrator's
     system prompt so it paces itself and stops opening new attack ideas as the
@@ -229,11 +244,15 @@ class OrchestratorConfig:
     # before the loop. Default on; the loop iterations themselves always run unattended.
     ralph_approve_prd: bool = True
     # Max analyzer↔analyzer_validator back-and-forth rounds before the PRD is accepted
-    # as-is (with a warning) even if not approved.
+    # as-is (with a warning) even if not approved. Reused for BOTH planning phases.
     ralph_discussion_rounds: int = 4
-    # Per-role turn budgets for the planning agents (the per-iteration orchestrator
-    # reuses `max_turns`).
-    analyzer_max_turns: int = 8
+    # Two-phase planning: first agree a set of EPICS that partition the attack surface,
+    # then decompose each into atomic tasks (every epic gets >=1 task, checked by the
+    # validator). On -> structural coverage; off -> legacy single-phase task planning.
+    ralph_epics: bool = True
+    # The analyzer (PRD authoring) reuses the main `max_turns` budget so recon depth
+    # scales with the run's budget — a big target needs many recon turns before it can
+    # decompose the surface into atomic tasks. The validator review keeps its own cap.
     analyzer_validator_max_turns: int = 6
 
 
@@ -331,6 +350,11 @@ class Orchestrator:
         # Set by the `finalize` tool: emit the report, then go idle and wait for
         # the next user prompt (Claude-Code style — the session does NOT close).
         self._go_idle = False
+        # The most recent finalize summary — surfaced as a Ralph pass's return value.
+        self._last_finalize_summary = ""
+        # Set by the RPC recovery hook when a lost sandbox is re-created, so the next tool
+        # observation warns the agent its in-container session state was reset.
+        self._sandbox_reset_pending = False
 
     # ------------------------------------------------------------------ setup
 
@@ -651,7 +675,9 @@ class Orchestrator:
             image=spec.image,
             rpc_url=self._container.rpc_base_url(),
         )
-        self._rpc = ContainerRPC(self._container.rpc_base_url())
+        self._rpc = ContainerRPC(
+            self._container.rpc_base_url(), recover=self._recover_sandbox
+        )
         await self._rpc.connect()
 
         # Always proxy python_exec (the M4 acceptance test). With
@@ -670,6 +696,34 @@ class Orchestrator:
             local = self.registry.get(name)
             self.registry.replace(wrap_with_remote(local, self._rpc))
         self.audit.write("tools_remoted", names=names_to_remote)
+
+    async def _recover_sandbox(self, failed_url: str) -> str | None:
+        """RPC recovery hook (see ContainerRPC): a tool call hit a transport error, so the
+        sandbox is unreachable. If the container is still up it was a transient drop —
+        return the same url to reconnect. If it's gone (crash / OOM / operator `docker
+        rm`), re-create a fresh sandbox and return its new url. Returns None (give up) when
+        there's no container manager or re-creation fails. Best-effort; never raises."""
+        if self._container is None:
+            return None
+        try:
+            if await self._container.is_running():
+                return self._container.rpc_base_url()  # alive → transient; just reconnect
+            self.audit.write("sandbox_recover", reason="container not running")
+            await self._container.recreate()
+            new_url = self._container.rpc_base_url()
+            # RemoteTools share this one ContainerRPC, so updating its base_url (the caller
+            # does that with our return) fixes them all — no re-remoting needed. But the new
+            # container is a clean slate, so flag a one-time notice for the agent's next
+            # observation (its python_exec globals / python_bg jobs are gone).
+            self._sandbox_reset_pending = True
+            self.audit.write("sandbox_recreated", name=self._container.name, url=new_url)
+            await self._emit(ActivityLine(
+                text="  ⚠ sandbox was lost — re-created a fresh one (in-container state reset)"
+            ))
+            return new_url
+        except Exception as e:  # noqa: BLE001 — recovery must not raise into the RPC client
+            self.audit.write("sandbox_recover_failed", error=f"{type(e).__name__}: {e}")
+            return None
 
     async def _teardown_container(self) -> None:
         if self._rpc is not None:
@@ -693,8 +747,6 @@ class Orchestrator:
         import secrets
         from zero.llm.claude_code import ClaudeCodeBackendModeB
         from zero.llm.mcp_bridge import BridgeHandlers, BridgeServer
-
-        from zero.tools.base import ToolResult
 
         await self._emit_status(turn=0, mode="b")
 
@@ -1126,6 +1178,23 @@ class Orchestrator:
             ToolRunning(tool=tool_name, call_id=call_id, label=label, timeout_seconds=timeout)
         )
         result = await self._invoke_tool(tool, args, session_id=session_id)
+        # If the sandbox was re-created mid-call (RPC recovery), tell the agent ONCE so it
+        # doesn't assume its in-container state (python_exec globals, python_bg jobs, files
+        # written only under /work) survived. Host-side state (.pentest/, zero_files/) did.
+        if self._sandbox_reset_pending:
+            self._sandbox_reset_pending = False
+            result = ToolResult(
+                ok=result.ok,
+                output=(
+                    "[system: the sandbox was lost and re-created as a fresh container; "
+                    "in-container session state (python_exec globals/imports, python_bg "
+                    "jobs, /work-only files) was RESET — re-establish anything you relied "
+                    "on. Files under your files-root and findings are intact.]\n"
+                    + result.output
+                ),
+                truncated=result.truncated,
+                meta=result.meta,
+            )
         await self._emit(
             ToolObservation(
                 tool=tool_name, call_id=call_id,
@@ -1234,6 +1303,7 @@ class Orchestrator:
         terminates and returns instead of going idle. This is Ralph's per-iteration
         worker; mode c's own loop is unchanged."""
         self._go_idle = False
+        self._last_finalize_summary = ""
         # Per-pass strict-validation counters so the finalize guard is scoped to THIS
         # iteration, not the whole run.
         self._pentester_candidates = 0
@@ -1308,7 +1378,9 @@ class Orchestrator:
                         # finalize fired and already wrote the report; the pass is done.
                         self._go_idle = False
                         final_summary = (
-                            getattr(env, "thought", "") or "iteration finalized."
+                            self._last_finalize_summary
+                            or getattr(env, "thought", "")
+                            or "iteration finalized."
                         )
                         break
                     continue
@@ -1351,7 +1423,7 @@ class Orchestrator:
         # which is rewritten every turn (and to keep the prompt cacheable).
         own_memory = read_memory("orchestrator")
         if own_memory:
-            loop.add_user_message(f"## Your memory from earlier\n\n{own_memory}")
+            loop.add_user_message(_seed_memory_message(own_memory))
         if self.cfg.goal:
             loop.add_user_message(self.cfg.goal)
             self.audit.write("user_message", text=self.cfg.goal, source="cli")
@@ -1672,6 +1744,21 @@ class Orchestrator:
                 a = AwaitSubagentsArgs(**args)
             except Exception as e:  # noqa: BLE001
                 return f"bad await_subagents args: {e}"
+            # Guard against a permanent hang: with NOTHING running and no completed
+            # result queued, `await_("any", timeout=None)` blocks forever on the empty
+            # done-queue (no subagent will ever complete). This bites on resume — the
+            # re-seeded orchestrator memory may claim a subagent is "running" from a
+            # PRIOR process whose subagents died with it, so the model awaits a ghost.
+            # spawn() registers in `_running` synchronously, so an empty manager here
+            # means nothing was actually dispatched: return immediately instead.
+            p, v = self.subagents.running_counts()
+            if p == 0 and v == 0 and not self.subagents.has_pending_results():
+                await self._emit(ActivityLine(text="  ▸ no subagents running — nothing to await"))
+                return (
+                    "no subagents are running (none dispatched, or any from a prior "
+                    "session are gone). Dispatch a pentester/validator first, THEN call "
+                    "await_subagents — do not await when nothing is in flight."
+                )
             await self._emit(ActivityLine(
                 text=f"  ▸ waiting for subagents ({self.subagents.running_summary()})"
             ))
@@ -1724,6 +1811,10 @@ class Orchestrator:
                     "for each real candidate, await the verdict, THEN finalize."
                 )
             await self._emit(ActivityLine(text="  ▸ finalizing — writing report"))
+            # Stash the substantive summary so the Ralph pass returns IT (not the bare
+            # action `thought`) — this is what flows to progress.txt and the per-task
+            # evidence dossier, so it must carry the orchestrator's actual account.
+            self._last_finalize_summary = a.summary
             report_path = await self._emit_report(loop, summary=a.summary)
             self._go_idle = True  # show report, then wait for the next prompt
             return (

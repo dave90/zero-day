@@ -23,6 +23,22 @@ from pydantic import BaseModel, Field
 TaskStatus = Literal["pending", "completed"]
 
 
+class Epic(BaseModel):
+    """One high-level attack-surface area. The planning phase agrees a small set of
+    epics that *partition the whole enumerated surface*, then decomposes each into
+    atomic tasks (every task carries the `epic_id` of its epic). Fields mirror
+    `PRDTask`; an epic has no stored status — its progress is derived from its tasks.
+    `priority` 1 = highest."""
+
+    id: str
+    priority: int = 3
+    title: str = ""
+    description: str = ""
+    # Prose "definition of done" for the area — what thorough coverage of this
+    # surface means. Coverage is the analyzer_validator's judgement, not a checklist.
+    acceptanceCriteria: str = ""
+
+
 class PRDTask(BaseModel):
     """One pentest task / user story. `priority` 1 = highest."""
 
@@ -40,10 +56,16 @@ class PRDTask(BaseModel):
     # How many iterations have worked this task (Ralph's "passes" — a stuck task
     # that keeps getting picked is visible here).
     passes: int = 0
+    # The epic (attack-surface area) this task decomposes. Empty when the two-phase
+    # epic planning is disabled or on a pre-feature PRD (backward-compatible).
+    epic_id: str = ""
 
 
 class PRD(BaseModel):
     goal: str = ""
+    # The agreed attack-surface areas. Empty on a pre-feature PRD or when the epic
+    # phase is off — every existing path treats an epic-less PRD exactly as before.
+    epics: list[Epic] = Field(default_factory=list)
     tasks: list[PRDTask] = Field(default_factory=list)
 
     def incomplete(self) -> list[PRDTask]:
@@ -61,6 +83,14 @@ class PRD(BaseModel):
             if t.id == task_id:
                 return t
         return None
+
+    def tasks_for_epic(self, epic_id: str) -> list[PRDTask]:
+        return [t for t in self.tasks if t.epic_id == epic_id]
+
+    def epic_progress(self, epic_id: str) -> tuple[int, int]:
+        """(completed, total) tasks under an epic — derived, for banners/reports."""
+        ts = self.tasks_for_epic(epic_id)
+        return sum(t.status == "completed" for t in ts), len(ts)
 
 
 class TaskVerdict(BaseModel):
@@ -113,9 +143,13 @@ def _first_json(text: str):
 # uses `targets`/`user_stories` instead of `tasks` — so we search for a list-of-dicts
 # under any of these, descending into wrappers, rather than only checking the top level.
 _TASK_LIST_KEYS = ("tasks", "targets", "user_stories", "stories", "backlog", "items")
+# Keys under which the analyzer may put the epic list (Job A of the two-phase plan).
+_EPIC_LIST_KEYS = ("epics", "areas", "themes", "components", "surfaces")
 # Per-task field aliases → our schema fields (the model varies its wording).
 _DESC_KEYS = ("description", "approach", "hypothesis", "summary", "where", "details")
 _AC_KEYS = ("acceptanceCriteria", "acceptance_criteria", "success", "done_when", "acceptance")
+# The epic a task belongs to (Job B tags each task with its epic's id).
+_EPIC_ID_KEYS = ("epic_id", "epicId", "epic", "area")
 _SEVERITY = {"critical": 1, "high": 2, "medium": 3, "med": 3, "low": 4, "info": 5, "informational": 5}
 
 
@@ -141,6 +175,32 @@ def _find_tasks(obj) -> list:
     elif isinstance(obj, list):
         for v in obj:
             found = _find_tasks(v)
+            if found:
+                return found
+    return []
+
+
+def _find_epics(obj) -> list:
+    """Recursively locate the epic list — like `_find_tasks` but preferring
+    `_EPIC_LIST_KEYS`, descending into wrapper dicts (e.g. `{"plan": {"epics": [...]}}`).
+    Prefers a keyed epic list over a bare list of dicts, so `{"epics": [...]}` never
+    resolves to some other list-of-dicts under the same object. Reuses `_is_task_list`
+    so a bare string list is never mistaken for epics. Only ever called on epic-phase
+    output, so a bare list of dicts IS the epics."""
+    if isinstance(obj, dict):
+        for key in _EPIC_LIST_KEYS:
+            if _is_task_list(obj.get(key)):
+                return obj[key]
+        for v in obj.values():
+            found = _find_epics(v)
+            if found:
+                return found
+        return []
+    if _is_task_list(obj):
+        return obj
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_epics(v)
             if found:
                 return found
     return []
@@ -185,10 +245,20 @@ def _coerce_priority(pr) -> int:
 
 
 def _first_str(data: dict, keys) -> str:
+    """First non-empty value among `keys`, coerced to a string. The analyzer very
+    commonly emits `acceptanceCriteria` (and sometimes `description`) as a LIST of
+    bullet strings; without list-handling those tasks fail `PRDTask` construction (the
+    field is `str`) and get silently dropped, yielding an empty PRD that the validator
+    rejects forever — a phase-1 discussion loop. So flatten a list/tuple into a
+    newline bullet list here."""
     for k in keys:
         v = data.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
+        if isinstance(v, (list, tuple)):
+            parts = [str(x).strip() for x in v if str(x).strip()]
+            if parts:
+                return "\n".join(f"- {p}" for p in parts)
     return ""
 
 
@@ -221,11 +291,46 @@ def parse_prd(text: str, *, goal: str = "") -> PRD:
             data["acceptanceCriteria"] = ac
         st = str(data.get("status", "pending")).strip().lower()
         data["status"] = "completed" if st in ("completed", "complete", "done") else "pending"
+        eid = _first_str(data, _EPIC_ID_KEYS)
+        if eid:
+            data["epic_id"] = eid
         try:
             tasks.append(PRDTask(**{k: data[k] for k in PRDTask.model_fields if k in data}))
         except Exception:  # noqa: BLE001 — skip a malformed task, keep the rest
             continue
     return PRD(goal=prd_goal, tasks=tasks)
+
+
+def parse_epics(text: str, *, goal: str = "") -> list[Epic]:
+    """Tolerantly parse an analyzer Job-A final into a list of epics.
+
+    Mirrors `parse_prd`'s tolerance: handles a bare `{"goal":..., "epics":[...]}`, a
+    bare epic list `[...]`, wrapped `{"plan": {"epics": [...]}}`, and alias list keys
+    (`areas`, `themes`, …). Priorities may be ints/`P0`/severity words; bodies may use
+    alias field names; a list-valued `acceptanceCriteria` is flattened (not dropped).
+    Auto-assigns ids (`e1`, `e2`, …). A completely unparseable answer yields `[]` (the
+    caller falls back to epic-free task planning)."""
+    obj = _first_json(text)
+    raw_epics = _find_epics(obj)
+
+    epics: list[Epic] = []
+    for i, raw in enumerate(raw_epics, start=1):
+        if not isinstance(raw, dict):
+            continue
+        data = dict(raw)
+        data["id"] = str(data.get("id") or f"e{i}")
+        data["priority"] = _coerce_priority(data.get("priority", 3))
+        desc = _first_str(data, _DESC_KEYS)
+        if desc:
+            data["description"] = desc
+        ac = _first_str(data, _AC_KEYS)
+        if ac:
+            data["acceptanceCriteria"] = ac
+        try:
+            epics.append(Epic(**{k: data[k] for k in Epic.model_fields if k in data}))
+        except Exception:  # noqa: BLE001 — skip a malformed epic, keep the rest
+            continue
+    return epics
 
 
 def parse_critique(text: str) -> PRDCritique:

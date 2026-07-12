@@ -14,7 +14,7 @@ PROMPT_PATH = Path(__file__).parent / "prompts" / "analyzer_validator_system.md"
 
 ANALYZER_VALIDATOR_WRAPUP_PROMPT = (
     "You have reached your turn limit — this is your LAST message. Emit your FINAL"
-    " JSON verdict now (the shape the active job requires: a PRD review"
+    " JSON verdict now (the shape the active job requires: an epic review or PRD review"
     ' {"approved":..., "feedback":..., "missing":[...]} or completion verdicts'
     ' {"verdicts":[...]}). Do NOT return a bare "out of turns" message.'
 )

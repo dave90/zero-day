@@ -5,9 +5,11 @@ import json
 
 from zero.ralph.prd import (
     PRD,
+    Epic,
     PRDTask,
     load_prd,
     parse_critique,
+    parse_epics,
     parse_prd,
     parse_task_verdicts,
     save_prd,
@@ -72,6 +74,36 @@ def test_parse_prd_wrapped_under_prd_key_with_p_priorities():
     assert prd.tasks[0].priority == 0                 # "P0" → 0
     assert prd.tasks[1].priority == 1                 # "P1" → 1
     assert prd.tasks[0].description == "spider the app"  # from "approach"
+
+
+def test_parse_prd_list_valued_acceptance_criteria_not_dropped():
+    # Regression (evoting phase-1 loop): the analyzer emitted every task with
+    # `acceptanceCriteria` as a LIST of bullet strings (plus "P0" priority and extra
+    # fields like attack_class/objective). The parser dropped ALL such tasks (PRDTask
+    # rejects a list for a str field), yielding an empty PRD the validator rejected
+    # forever. A list body must be flattened, not dropped.
+    text = json.dumps({
+        "goal": "break the e-voting system",
+        "tasks": [
+            {"id": "T1", "title": "return-code bypass", "priority": "P0",
+             "attack_class": "client integrity", "objective": "individual-verifiability",
+             "description": ["trace the casting sequence", "enumerate server checks"],
+             "acceptanceCriteria": [
+                 "full casting sequence traced end-to-end",
+                 "every acceptance check tested for a bypass",
+             ]},
+            {"id": "T2", "title": "mixnet integrity", "priority": "P1",
+             "acceptanceCriteria": ["every verification equation checked"]},
+        ],
+    })
+    prd = parse_prd(text)
+    assert [t.id for t in prd.tasks] == ["T1", "T2"]      # neither dropped
+    assert prd.tasks[0].priority == 0
+    assert "full casting sequence" in prd.tasks[0].acceptanceCriteria
+    assert "every acceptance check" in prd.tasks[0].acceptanceCriteria
+    assert "trace the casting sequence" in prd.tasks[0].description
+    # flattened to a bullet list (not a stringified python list)
+    assert "['" not in prd.tasks[0].acceptanceCriteria
 
 
 def test_parse_prd_wrapped_targets_key_with_severity_priority():
@@ -144,3 +176,95 @@ def test_save_and_load_roundtrip(tmp_path):
     assert loaded is not None
     assert loaded.goal == "g" and loaded.tasks[0].id == "t1"
     assert load_prd(tmp_path / "missing.json") is None
+
+
+# ------------------------------------------------------------------- epics (Job A)
+
+def test_parse_epics_full_and_wrapper_keys():
+    # Bare {"goal","epics":[...]} and a wrapped {"plan":{"areas":[...]}} both resolve,
+    # with auto-ids and coerced priorities.
+    bare = parse_epics(json.dumps({"goal": "g", "epics": [
+        {"id": "e1", "priority": "P1", "title": "Uploads", "acceptanceCriteria": "all upload endpoints"},
+        {"title": "Authz", "priority": "high"},   # no id → auto e2; "high" → 2
+    ]}))
+    assert [e.id for e in bare] == ["e1", "e2"]
+    assert bare[0].priority == 1 and bare[1].priority == 2
+    assert bare[1].title == "Authz"
+    # wrapper key "areas" under a "plan" wrapper
+    wrapped = parse_epics(json.dumps({"plan": {"areas": [{"id": "a1", "title": "Tally"}]}}))
+    assert [e.id for e in wrapped] == ["a1"]
+
+
+def test_parse_epics_list_valued_acceptance_not_dropped():
+    # Same regression class as tasks: a list-valued acceptanceCriteria must flatten to
+    # bullets, not drop the epic.
+    epics = parse_epics(json.dumps({"epics": [
+        {"id": "e1", "title": "Uploads", "acceptanceCriteria": [
+            "every upload endpoint checked for signature verification",
+            "authz enforced before persistence",
+        ]},
+    ]}))
+    assert [e.id for e in epics] == ["e1"]
+    assert "signature verification" in epics[0].acceptanceCriteria
+    assert "authz enforced" in epics[0].acceptanceCriteria
+    assert "['" not in epics[0].acceptanceCriteria       # flattened, not a python list repr
+
+
+def test_parse_epics_malformed_skipped_and_garbage_empty():
+    epics = parse_epics(json.dumps({"epics": [
+        {"id": "e1", "title": "ok"},
+        ["not", "an", "epic"],                 # non-dict entry skipped
+        {"id": "e2", "title": "also ok"},
+    ]}))
+    assert [e.id for e in epics] == ["e1", "e2"]
+    assert parse_epics("the model wrote prose, no json") == []
+    # a wrapper whose only list is strings is NOT mistaken for epics
+    assert parse_epics(json.dumps({"plan": {"priority_order": ["a", "b"]}})) == []
+
+
+def test_parse_prd_captures_epic_id_aliases():
+    text = json.dumps({"tasks": [
+        {"id": "t1", "title": "a", "epic_id": "e1"},
+        {"id": "t2", "title": "b", "epicId": "e2"},
+        {"id": "t3", "title": "c", "epic": "e3"},
+        {"id": "t4", "title": "d"},                 # none → empty
+    ]})
+    prd = parse_prd(text)
+    assert [t.epic_id for t in prd.tasks] == ["e1", "e2", "e3", ""]
+
+
+def test_epic_roundtrip_and_progress_helpers():
+    prd = PRD(goal="g",
+              epics=[Epic(id="e1", title="Uploads", priority=1),
+                     Epic(id="e2", title="Tally", priority=2)],
+              tasks=[PRDTask(id="t1", epic_id="e1", status="completed"),
+                     PRDTask(id="t2", epic_id="e1", status="pending"),
+                     PRDTask(id="t3", epic_id="e2", status="pending")])
+    assert prd.epic_progress("e1") == (1, 2)
+    assert [t.id for t in prd.tasks_for_epic("e2")] == ["t3"]
+
+
+def test_epic_bearing_prd_save_load_roundtrip(tmp_path):
+    prd = PRD(goal="g", epics=[Epic(id="e1", title="Uploads", acceptanceCriteria="all uploads")],
+              tasks=[PRDTask(id="t1", epic_id="e1", title="x")])
+    p = tmp_path / ".ralph" / "prd.json"
+    save_prd(p, prd)
+    loaded = load_prd(p)
+    assert loaded is not None
+    assert [e.id for e in loaded.epics] == ["e1"]
+    assert loaded.tasks[0].epic_id == "e1"
+
+
+def test_load_legacy_epicless_prd_is_backward_compatible(tmp_path):
+    # A pre-feature prd.json (no `epics`, no per-task `epic_id`) must load unchanged.
+    p = tmp_path / ".ralph" / "prd.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "goal": "legacy run",
+        "tasks": [{"id": "t1", "priority": 1, "title": "old task", "status": "pending"}],
+    }), encoding="utf-8")
+    loaded = load_prd(p)
+    assert loaded is not None
+    assert loaded.epics == []
+    assert loaded.tasks[0].epic_id == ""
+    assert loaded.incomplete()[0].id == "t1"       # existing paths still work
