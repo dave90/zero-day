@@ -1,7 +1,7 @@
 """Ralph on-disk layout + the per-iteration backup/reset.
 
 Two roots beside the engagement `.pentest/`:
-- `.ralph/`      — durable loop state (`prd.json`, `progress.txt`). NEVER reset.
+- `.ralph/`      — durable loop state (`prd.json`, `progress.txt`, `dossiers/`). NEVER reset.
 - `.ralph_logs/`  — per-iteration snapshots `.pentest_<n>/` + the final report.
 
 The reset between iterations gives each pass a fresh `.pentest/` (the Ralph
@@ -20,8 +20,12 @@ automatically.
 """
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
+
+# Task ids come from an LLM-authored PRD, so sanitize before using one as a filename.
+_UNSAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 # Names directly under `.pentest/` that the reset PRESERVES (see module docstring).
@@ -54,12 +58,26 @@ def progress_path(cwd: Path) -> Path:
     return ralph_dir(cwd) / "progress.txt"
 
 
+def dossiers_dir(cwd: Path) -> Path:
+    return ralph_dir(cwd) / "dossiers"
+
+
+def dossier_path(cwd: Path, task_id: str) -> Path:
+    """The durable per-task evidence dossier. Lives under `.ralph/` (never reset), so
+    the accumulated testing evidence for a task survives the per-iteration wipe of
+    `.pentest/` — the fix for Ralph re-picking the same task forever because each
+    fresh orchestrator session inherited only a bare claim, not the actual work."""
+    name = _UNSAFE_ID.sub("_", task_id.strip()).strip("._-") or "task"
+    return dossiers_dir(cwd) / f"{name}.md"
+
+
 def final_report_path(cwd: Path) -> Path:
     return logs_dir(cwd) / "ralph_report.md"
 
 
 def ensure_dirs(cwd: Path) -> None:
     ralph_dir(cwd).mkdir(parents=True, exist_ok=True)
+    dossiers_dir(cwd).mkdir(parents=True, exist_ok=True)
     logs_dir(cwd).mkdir(parents=True, exist_ok=True)
 
 

@@ -220,6 +220,12 @@ class SubagentManager:
             results.append(self._done.get_nowait())
         return results
 
+    def has_pending_results(self) -> bool:
+        """True if ≥1 completed result is queued but not yet drained. Non-draining —
+        used by the `await_subagents` guard to tell 'nothing to collect' (return now)
+        from 'results waiting' (drain them) without consuming the queue."""
+        return not self._done.empty()
+
     def collect_done(self) -> list[SubagentResult]:
         """Non-blocking: drain and return any results that have already
         completed. Used when a blocking await is interrupted (e.g. the operator

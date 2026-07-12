@@ -57,7 +57,7 @@ async def test_discussion_converges_on_approval(tmp_path, monkeypatch):
         ]
     )
     orch = _make_orch(tmp_path, backend, ralph_discussion_rounds=3)
-    prd = await RalphDriver(orch, None)._build_prd("find a web bug")
+    prd = await RalphDriver(orch, None)._build_prd("find a web bug", [])
     assert [t.id for t in prd.tasks] == ["t1", "t2"]   # revised PRD adopted
     assert backend.calls == 4                          # bounded, stopped on approval
 
@@ -71,7 +71,7 @@ async def test_discussion_proceeds_when_not_converged(tmp_path, monkeypatch):
         ]
     )
     orch = _make_orch(tmp_path, backend, ralph_discussion_rounds=1)
-    prd = await RalphDriver(orch, None)._build_prd("find a web bug")
+    prd = await RalphDriver(orch, None)._build_prd("find a web bug", [])
     # Did not converge, but we proceed with the latest PRD rather than looping forever.
     assert [t.id for t in prd.tasks] == ["t1"]
     assert backend.calls == 2

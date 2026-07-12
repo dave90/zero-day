@@ -12,19 +12,21 @@ from zero.llm.backend import LLMBackend, Session
 
 PROMPT_PATH = Path(__file__).parent / "prompts" / "analyzer_system.md"
 
-# Spent when the analyzer hits its turn cap: force it to emit the PRD it has so far
-# rather than a bare "out of turns" (which would yield an empty backlog).
+# Spent when the analyzer hits its turn cap: force it to emit what it has so far
+# rather than a bare "out of turns". Job-agnostic — the analyzer serves BOTH planning
+# jobs (epics, then tasks) on different sessions, so name both shapes and let the
+# active job pick (a task-shaped wrapup here would force tasks during the epic phase).
 ANALYZER_WRAPUP_PROMPT = (
     "You have reached your turn limit — this is your LAST message. Emit your FINAL"
-    " PRD now: a `final` whose `answer` is ONLY the JSON object"
-    ' {"goal":..., "tasks":[...]}. Include every task you have identified so far;'
-    " do NOT return a bare 'out of turns' message."
+    " JSON now — the shape the active job requires: an epic list"
+    ' {"goal":..., "epics":[...]} or the PRD {"goal":..., "tasks":[...]}. Include'
+    " everything you have identified so far; do NOT return a bare 'out of turns' message."
 )
 
 ANALYZER_REMINDER = (
     "<system-reminder> Keep recon focused on PLANNING, not exploiting — enumerate"
-    " the surface, then produce the prioritized task backlog. When you have enough"
-    " to plan, emit the PRD JSON in a `final`. </system-reminder>"
+    " the surface, then produce the epics or the prioritized task backlog for the"
+    " active job. When you have enough to plan, emit the JSON in a `final`. </system-reminder>"
 )
 
 

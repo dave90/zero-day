@@ -24,10 +24,13 @@ from zero.agents.analyzer_validator import build_analyzer_validator_loop
 from zero.findings.report import write_report
 from zero.llm.llm_trace import reset_llm_loggers
 from zero.ralph import state
+from zero.ralph.dossier import append_evidence, read_dossier
 from zero.ralph.prd import (
     PRD,
+    Epic,
     load_prd,
     parse_critique,
+    parse_epics,
     parse_prd,
     parse_task_verdicts,
     save_prd,
@@ -99,6 +102,18 @@ class RalphDriver:
             # The top task was the one actually worked this pass — count the pass.
             top.passes += 1
 
+            # Persist this pass's evidence into the task's durable dossier BEFORE the
+            # judge runs and BEFORE the reset wipes .pentest/memory/. This is the whole
+            # fix: the orchestrator's actual work (finalize summary + the notes it wrote
+            # to its memory scratchpad) now survives to the validator and to the next
+            # iteration, instead of only a bare claim in progress.txt.
+            append_evidence(
+                state.dossier_path(self.cwd, top.id),
+                iteration=i,
+                summary=summary,
+                memory_notes=self._orchestrator_memory_notes(),
+            )
+
             verdicts = await self._judge_completion(i, prd, progress_text, summary)
             notes: list[str] = []
             for v in verdicts:
@@ -159,7 +174,18 @@ class RalphDriver:
             )
 
         await self._banner("analysis", 0, "Building the PRD from the goal + target recon.")
-        prd = await self._build_prd(goal)
+        # Phase 1a: agree a set of epics that partition the attack surface (skipped
+        # when --no-ralph-epics). The task phase then decomposes each into atomic
+        # tasks, so no surface area silently drops out of the backlog.
+        epics = await self._build_epics(goal)
+        if self.cfg.ralph_epics and not epics:
+            await self._banner(
+                "analysis", 0,
+                "Epic phase produced no epics — proceeding without epic structure"
+                " (task coverage will not be epic-checked this run).",
+            )
+        # Phase 1b: decompose the epics into atomic tasks.
+        prd = await self._build_prd(goal, epics)
         save_prd(state.prd_path(self.cwd), prd)
         if not prd.tasks:
             await self._banner(
@@ -170,8 +196,9 @@ class RalphDriver:
             return None
         await self._banner(
             "analysis", 0,
-            f"PRD ready: {len(prd.tasks)} task(s).\n"
-            + "\n".join(f"  [{t.priority}] {t.id} {t.title}" for t in prd.incomplete()),
+            f"PRD ready: {len(prd.tasks)} task(s)"
+            + (f" across {len(prd.epics)} epic(s)" if prd.epics else "") + ".\n"
+            + self._prd_outline(prd),
         )
         if self.cfg.ralph_approve_prd:
             if not await self._checkpoint(prd):
@@ -180,20 +207,80 @@ class RalphDriver:
             prd = load_prd(state.prd_path(self.cwd)) or prd
         return prd
 
-    async def _build_prd(self, goal: str) -> PRD:
-        """Analyzer drafts a PRD; analyzer_validator reviews; iterate up to
-        ralph_discussion_rounds until approved (else proceed with the best PRD)."""
+    async def _build_epics(self, goal: str) -> list[Epic]:
+        """Phase 1a: the analyzer proposes epics that partition the attack surface;
+        the analyzer_validator re-enumerates the surface and rejects any set that
+        leaves a component unclaimed. Iterate up to ralph_discussion_rounds. Returns
+        [] when disabled or nothing parseable was produced (caller falls back to
+        epic-free task planning). Uses its OWN sessions so the epic-phase turn budget
+        and wrap-up state never bleed into the task phase."""
+        if not self.cfg.ralph_epics:
+            return []
         orch = self.orch
         recon = orch._recon_catalog()
         analyzer = build_analyzer_loop(
             orch.backend, recon, project_context=self.project_ctx,
-            max_turns=self.cfg.analyzer_max_turns, session=orch._make_session("analyzer"),
+            max_turns=self.cfg.max_turns, session=orch._make_session("analyzer_epics"),
         )
-        analyzer.add_user_message(self._analyzer_brief(goal))
+        analyzer.add_user_message(self._epic_brief(goal))
+        text = await orch._drive_agent_to_final(
+            analyzer, agent_label="analyzer", session_id="analyzer_epics"
+        )
+        epics = parse_epics(text, goal=goal)
+
+        validator = build_analyzer_validator_loop(
+            orch.backend, recon, project_context=self.project_ctx,
+            max_turns=self.cfg.analyzer_validator_max_turns,
+            session=orch._make_session("analyzer_validator_epics"),
+        )
+        for rnd in range(1, self.cfg.ralph_discussion_rounds + 1):
+            self._reset_loop(validator)
+            validator.add_user_message(self._epic_critique_brief(goal, epics))
+            crit = parse_critique(await orch._drive_agent_to_final(
+                validator, agent_label="analyzer_validator",
+                session_id="analyzer_validator_epics",
+            ))
+            await self._banner(
+                "discussion", 0,
+                f"Epic review round {rnd}: "
+                f"{'APPROVED' if crit.approved else 'changes requested'}"
+                f" ({len(epics)} epic(s))."
+                + (f"\n  {crit.feedback.strip()[:300]}" if crit.feedback.strip() else ""),
+            )
+            if crit.approved and epics:
+                break
+            if rnd == self.cfg.ralph_discussion_rounds:
+                await self._banner(
+                    "discussion", 0,
+                    "Epic discussion did not converge — proceeding with the latest epics.",
+                )
+                break
+            self._reset_loop(analyzer)
+            analyzer.add_user_message(self._epic_revise_brief(crit))
+            revised = parse_epics(await orch._drive_agent_to_final(
+                analyzer, agent_label="analyzer", session_id="analyzer_epics",
+            ), goal=goal)
+            if revised:
+                epics = revised
+        return epics
+
+    async def _build_prd(self, goal: str, epics: list[Epic]) -> PRD:
+        """Phase 1b: analyzer decomposes the approved epics into atomic tasks (each
+        tagged with its epic_id); analyzer_validator reviews; iterate up to
+        ralph_discussion_rounds until approved (else proceed with the best PRD). When
+        `epics` is empty (epic phase off/failed) this is the legacy single-phase build."""
+        orch = self.orch
+        recon = orch._recon_catalog()
+        analyzer = build_analyzer_loop(
+            orch.backend, recon, project_context=self.project_ctx,
+            max_turns=self.cfg.max_turns, session=orch._make_session("analyzer"),
+        )
+        analyzer.add_user_message(self._analyzer_brief(goal, epics))
         prd_text = await orch._drive_agent_to_final(
             analyzer, agent_label="analyzer", session_id="analyzer"
         )
         prd = parse_prd(prd_text, goal=goal)
+        prd.epics = epics
 
         validator = build_analyzer_validator_loop(
             orch.backend, recon, project_context=self.project_ctx,
@@ -228,6 +315,7 @@ class RalphDriver:
             )
             revised = parse_prd(revised_text, goal=goal)
             if revised.tasks:
+                revised.epics = epics
                 prd = revised
         return prd
 
@@ -251,7 +339,7 @@ class RalphDriver:
             recon = orch._recon_catalog()
             analyzer = build_analyzer_loop(
                 orch.backend, recon, project_context=self.project_ctx,
-                max_turns=self.cfg.analyzer_max_turns,
+                max_turns=self.cfg.max_turns,
                 session=orch._make_session("analyzer"),
             )
             analyzer.add_user_message(self._revise_brief_from_text(prd, msg))
@@ -260,12 +348,12 @@ class RalphDriver:
             )
             revised = parse_prd(revised_text, goal=self.cfg.goal or "")
             if revised.tasks:
+                revised.epics = prd.epics  # operator revises tasks; keep approved epics
                 prd = revised
                 save_prd(state.prd_path(self.cwd), prd)
             await self._banner(
                 "analysis", 0,
-                "Revised PRD:\n"
-                + "\n".join(f"  [{t.priority}] {t.id} {t.title}" for t in prd.incomplete()),
+                "Revised PRD:\n" + self._prd_outline(prd),
             )
 
     # ----------------------------------------------- phase 2: completion check
@@ -283,12 +371,23 @@ class RalphDriver:
         )
         judge.add_user_message(
             f"JOB: judge task completion (iteration {iteration}).\n\n"
-            "Decide, for EACH task below, whether it is adequately completed given the"
-            " orchestrator's summary, the progress journal, and the findings so far."
-            " Completion = acceptance criteria met OR the task was thoroughly attempted"
-            " and exhausted (rejected findings count as coverage). If not complete, say"
-            " briefly why / what remains.\n\n"
+            "Decide, for EACH task below, whether it is adequately completed. Each task"
+            " has an EVIDENCE DOSSIER — the accumulated testing the orchestrator recorded"
+            " across all iterations that worked it. Judge from the dossier, NOT from the"
+            " one-line summary: does the recorded evidence actually satisfy the task's"
+            " acceptance criteria (or show it was thoroughly attempted and exhausted —"
+            " rejected findings count as coverage)?\n\n"
+            "Do NOT trust the dossier's conclusions — VERIFY them. Use your own tools"
+            " (`read_file`/`grep`/`web_fetch`) to spot-check the concrete claims (that the"
+            " cited code really behaves as stated, that the tests described were possible)"
+            " before you sign off. A confident-sounding but unverifiable dossier is a"
+            " REJECT.\n\n"
+            "When a task is NOT complete, make `reason` a precise, actionable statement of"
+            " the SPECIFIC evidence still missing (what to test or read next) — it is fed"
+            " back verbatim to the next iteration as its directive. Do not ask it to"
+            " 'reproduce a table'; ask for the missing test/analysis.\n\n"
             "## Incomplete tasks\n" + incomplete_json + "\n\n"
+            "## Evidence dossiers (per task)\n" + self._dossiers_context(prd) + "\n\n"
             "## This iteration's orchestrator summary\n" + (summary.strip() or "(none)") + "\n\n"
             "## progress.txt (prior iterations)\n" + (progress_text.strip() or "(empty)") + "\n\n"
             + self._findings_context() + "\n\n"
@@ -347,18 +446,88 @@ class RalphDriver:
 
     # ----------------------------------------------------------- prompt briefs
 
-    def _analyzer_brief(self, goal: str) -> str:
+    def _epic_brief(self, goal: str) -> str:
         return (
-            "Plan this engagement. Recon the target, then emit the PRD as your final"
-            " (JSON only).\n\n"
+            "JOB: produce the EPICS. Recon the target to build an EXHAUSTIVE surface"
+            " inventory — every endpoint/controller/route, every component and trust"
+            " boundary, every ingest/upload and admin/config path — then group that"
+            " whole inventory into a small set of EPICS (attack-surface areas). The"
+            " epics must PARTITION the surface: every enumerated item belongs to exactly"
+            " one epic, and nothing is dropped. Each epic's acceptanceCriteria is a prose"
+            " statement of what thorough coverage of that area means. Do NOT write tasks"
+            " yet. Emit a final whose answer is ONLY JSON"
+            ' {"goal":"...","epics":[{"id":"e1","priority":1,"title":"...",'
+            '"description":"...","acceptanceCriteria":"..."}]}.\n\n'
             f"ENGAGEMENT GOAL: {goal or '(no explicit goal — infer from pentest.md)'}"
         )
 
-    def _critique_brief(self, goal: str, prd: PRD) -> str:
+    def _epic_critique_brief(self, goal: str, epics: list[Epic]) -> str:
         return (
-            "JOB: review this PRD. Does it cover ALL plausible attacks needed to"
-            " satisfy the goal? Emit a final whose answer is ONLY JSON"
+            "JOB: review this EPIC list. Independently re-enumerate the attack surface"
+            " (endpoints/controllers/components/trust boundaries) and verify the epics"
+            " form a COMPLETE PARTITION of it: reject if ANY enumerated endpoint or"
+            " component is not claimed by some epic, or if epics overlap/duplicate. A"
+            " plan that merely 'sounds comprehensive' is NOT enough — check the actual"
+            " inventory against the epics and name every uncovered area in `missing`."
+            " Also reject epics that are too coarse to be a distinct area or too narrow"
+            " to be more than a single task. Emit a final whose answer is ONLY JSON"
             ' {"approved":bool,"feedback":"...","missing":[...]}.\n\n'
+            f"ENGAGEMENT GOAL: {goal}\n\n## Epics under review\n"
+            + json.dumps([e.model_dump() for e in epics], indent=2)
+        )
+
+    def _epic_revise_brief(self, crit) -> str:
+        missing = "\n".join(f"- {m}" for m in crit.missing) or "(none listed)"
+        return (
+            "The reviewer did NOT approve the epics. Revise them to address this"
+            " feedback (add epics for the uncovered areas; split/merge as directed),"
+            " then emit the FULL updated epic JSON again (same schema).\n\n"
+            f"FEEDBACK: {crit.feedback}\n\nUNCOVERED / MISSING:\n{missing}"
+        )
+
+    def _analyzer_brief(self, goal: str, epics: list[Epic]) -> str:
+        if not epics:
+            return (
+                "Plan this engagement. Recon the target to build a concrete surface"
+                " inventory, then emit the PRD as your final (JSON only). Decompose the"
+                " surface into ATOMIC tasks — one concrete testable hypothesis per single"
+                " endpoint/parameter/component, NOT broad buckets — because the loop works"
+                " one task per iteration and skips the hard part of a coarse task. Produce"
+                " as many small tasks as the surface warrants.\n\n"
+                f"ENGAGEMENT GOAL: {goal or '(no explicit goal — infer from pentest.md)'}"
+            )
+        return (
+            "JOB: produce the TASKS. You are given the APPROVED epics (attack-surface"
+            " areas). Decompose EACH epic into ATOMIC tasks — one concrete testable"
+            " hypothesis per single endpoint/parameter/component, NOT broad buckets"
+            " (the loop works one task per iteration and skips the hard part of a coarse"
+            " task). Rules: every task MUST set `epic_id` to one of the epic ids below;"
+            " every epic MUST receive at least one task; do NOT invent new epics or leave"
+            " any epic empty. Produce as many small tasks per epic as its surface"
+            " warrants. Emit the PRD as your final (JSON only):"
+            ' {"goal":"...","tasks":[{"id":"t1","priority":1,"epic_id":"e1","title":"...",'
+            '"description":"...","acceptanceCriteria":"...","status":"pending"}]}.\n\n'
+            f"ENGAGEMENT GOAL: {goal or '(no explicit goal — infer from pentest.md)'}\n\n"
+            "## Approved epics\n" + json.dumps([e.model_dump() for e in epics], indent=2)
+        )
+
+    def _critique_brief(self, goal: str, prd: PRD) -> str:
+        epic_check = ""
+        if prd.epics:
+            epic_check = (
+                " (3) every epic in the PRD has AT LEAST ONE task whose `epic_id` matches"
+                " it, and the tasks under each epic adequately cover that epic's"
+                " acceptanceCriteria — REJECT if any epic is unserved or thinly covered."
+            )
+        return (
+            "JOB: review this PRD. Check: (1) does it cover ALL plausible attacks"
+            " needed to satisfy the goal AND the actual attack surface; (2) is every"
+            " task ATOMIC — one concrete surface/hypothesis each (a specific"
+            " endpoint+method, parameter, or component), not a broad bucket like 'test"
+            " the web app' or 'review the mixnet' — REJECT coarse buckets and require"
+            " them split into per-surface tasks (the loop works one task per iteration,"
+            " so a coarse task gets only its easy part done)." + epic_check + " Emit a"
+            ' final whose answer is ONLY JSON {"approved":bool,"feedback":"...","missing":[...]}.\n\n'
             f"ENGAGEMENT GOAL: {goal}\n\n## PRD under review\n"
             + json.dumps(prd.model_dump(), indent=2)
         )
@@ -379,10 +548,39 @@ class RalphDriver:
             + json.dumps(prd.model_dump(), indent=2)
         )
 
+    def _prd_outline(self, prd: PRD) -> str:
+        """Human banner: tasks grouped under their epic (with completed/total), or a
+        flat priority-ordered list when the PRD has no epics."""
+        if not prd.epics:
+            return "\n".join(f"  [{t.priority}] {t.id} {t.title}" for t in prd.incomplete())
+        lines: list[str] = []
+        for e in sorted(prd.epics, key=lambda e: (e.priority, e.id)):
+            done, total = prd.epic_progress(e.id)
+            lines.append(f"  [{e.priority}] {e.id} {e.title} — {done}/{total} task(s)")
+            for t in sorted(prd.tasks_for_epic(e.id), key=lambda t: (t.priority, t.id)):
+                lines.append(f"      [{t.priority}] {t.id} {t.title} — {t.status}")
+        orphans = [t for t in prd.tasks if t.epic_id not in {e.id for e in prd.epics}]
+        for t in sorted(orphans, key=lambda t: (t.priority, t.id)):
+            lines.append(f"  (no epic) [{t.priority}] {t.id} {t.title} — {t.status}")
+        return "\n".join(lines)
+
     @staticmethod
     def _trunc(text: str, n: int) -> str:
         text = (text or "").strip()
         return text if len(text) <= n else text[:n].rstrip() + " …"
+
+    def _dossiers_context(self, prd: PRD) -> str:
+        """The accumulated evidence dossier for each still-incomplete task, so the judge
+        evaluates completion against the real work (not the one-line summary). Bounded
+        per task by `read_dossier`. Tasks with no dossier yet are listed as untouched."""
+        blocks: list[str] = []
+        for t in prd.incomplete():
+            dossier = read_dossier(state.dossier_path(self.cwd, t.id)).strip()
+            if dossier:
+                blocks.append(f"### {t.id} — {t.title}\n{dossier}")
+            else:
+                blocks.append(f"### {t.id} — {t.title}\n(no evidence recorded yet — not started.)")
+        return "\n\n".join(blocks) if blocks else "(no incomplete tasks.)"
 
     def _findings_context(self) -> str:
         """All findings carried across iterations (confirmed / rejected / pending),
@@ -423,6 +621,21 @@ class RalphDriver:
                 )
         return "\n".join(lines)
 
+    def _orchestrator_memory_notes(self) -> str:
+        """The working notes the orchestrator wrote to its memory scratchpad this pass.
+        Keyed by the `session_id` the orchestrator injects for its own tools — always
+        the literal "orchestrator" (see `Orchestrator._invoke_tool`) — so the file is
+        deterministically `.pentest/memory/orchestrator.md`. Read here, before the reset
+        recreates `memory/` empty. Missing/unreadable → empty (best-effort capture must
+        never crash the loop)."""
+        path = state.pentest_dir(self.cwd) / "memory" / "orchestrator.md"
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
     def _iteration_seed(self, iteration: int, prd: PRD, progress_text: str) -> str:
         incomplete_json = json.dumps([t.model_dump() for t in prd.incomplete()], indent=2)
         return (
@@ -435,13 +648,45 @@ class RalphDriver:
             " count). When the task is adequately covered (confirmed OR thoroughly"
             " exhausted), call `finalize` with a summary that NAMES the task id you worked"
             " and states what you established and what (if anything) remains.\n\n"
-            "Do NOT re-investigate completed tasks. Reuse the confirmed findings below"
+            "Your finalize summary, plus the working notes you leave in `memory_write`, are"
+            " saved to that task's DURABLE evidence dossier and handed to an independent"
+            " validator who will VERIFY your claims against the code with its own tools —"
+            " so record concrete, checkable evidence (endpoints, payloads, observed"
+            " responses, the guard/behavior you found, subagent verdicts), not bare"
+            " conclusions. A claim the validator cannot verify is rejected.\n\n"
+            + self._resume_directive(prd)
+            + "Do NOT re-investigate completed tasks. Reuse the confirmed findings below"
             " (their reproducers/creds) to chain further, skip the rejected dead-ends,"
             " and pick up pending leads — and use the progress journal too.\n\n"
             "## PRD — incomplete tasks (highest priority first)\n" + incomplete_json + "\n\n"
             + self._findings_context() + "\n\n"
             "## progress.txt (what earlier iterations did)\n"
             + (progress_text.strip() or "(empty — this is the first iteration)")
+        )
+
+    def _resume_directive(self, prd: PRD) -> str:
+        """If the top task already has accumulated evidence (a prior iteration worked it
+        and the validator sent it back), put that dossier + the validator's 'what's
+        missing' note front-and-centre as this iteration's directive — so the fresh
+        session BUILDS ON real evidence and closes the specific gap, instead of starting
+        blank and re-asserting what the journal claims (the old livelock)."""
+        incomplete = prd.incomplete()
+        if not incomplete:
+            return ""
+        top = incomplete[0]
+        dossier = read_dossier(state.dossier_path(self.cwd, top.id))
+        if not dossier.strip():
+            return ""
+        note = top.note.strip() or "(no specific gap recorded — review the evidence for weaknesses)"
+        return (
+            f"## RESUME: task {top.id} already has evidence — build on it, do not restate\n"
+            f"The validator reviewed prior work on {top.id} and did NOT accept it. Its"
+            " reason / what is still missing:\n"
+            f"> {note}\n\n"
+            "Your job THIS iteration: produce exactly the missing evidence above and add"
+            " it to the dossier. Read the accumulated evidence, find the gap, close it"
+            " with real testing — do not merely repeat prior conclusions.\n\n"
+            f"### Accumulated evidence for {top.id}\n{dossier.strip()}\n\n"
         )
 
     # ----------------------------------------------------------------- ui

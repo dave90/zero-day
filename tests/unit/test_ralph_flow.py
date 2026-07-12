@@ -100,7 +100,7 @@ async def test_ralph_loop_end_to_end(tmp_path: Path, monkeypatch):
     cfg = OrchestratorConfig(
         cwd=tmp_path, goal="find a web bug", backend="echo",
         ralph=True, ralph_iterations=1, ralph_approve_prd=False,
-        ralph_discussion_rounds=1, yolo=True,
+        ralph_discussion_rounds=1, ralph_epics=False, yolo=True,
     )
     orch = Orchestrator(cfg)
     orch.backend = orch_backend
@@ -166,7 +166,7 @@ async def test_ralph_stops_early_when_all_tasks_complete(tmp_path: Path, monkeyp
     cfg = OrchestratorConfig(
         cwd=tmp_path, goal="g", backend="echo",
         ralph=True, ralph_iterations=3, ralph_approve_prd=False,
-        ralph_discussion_rounds=1, yolo=True,
+        ralph_discussion_rounds=1, ralph_epics=False, yolo=True,
     )
     orch = Orchestrator(cfg)
     orch.backend = orch_backend
