@@ -34,6 +34,7 @@ import json
 import os
 import shutil
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,30 @@ def codex_model(model: str | None) -> str:
     return model
 
 
+def codex_configured_model() -> str:
+    """Return the model selected by the Codex CLI config, if one is pinned.
+
+    Zero deliberately drops its shared Claude model default for the Codex backend. In
+    that case Codex resolves the model from ``$CODEX_HOME/config.toml`` (normally
+    ``~/.codex/config.toml``). Reading the same value lets startup diagnostics report
+    the model that will actually run instead of the discarded Claude placeholder.
+    """
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    try:
+        with (Path(home) / "config.toml").open("rb") as fh:
+            config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+
+    model = config.get("model")
+    return model if isinstance(model, str) else ""
+
+
+def codex_effective_model(model: str | None) -> str:
+    """Return the model name an invocation will use, suitable for diagnostics."""
+    return codex_model(model) or codex_configured_model() or "codex-default"
+
+
 def codex_context_window(model: str | None = None) -> int | None:
     """The active Codex model's context window (tokens), read at runtime from Codex's
     own model-metadata cache (`$CODEX_HOME/models_cache.json`, default `~/.codex`).
@@ -182,9 +207,10 @@ def codex_context_window(model: str | None = None) -> int | None:
             windows[str(slug)] = cw
     if not windows:
         return None
-    if model:
+    effective_model = codex_effective_model(model)
+    if effective_model:
         for slug, cw in windows.items():
-            if model == slug or model.startswith(slug):
+            if effective_model == slug or effective_model.startswith(slug):
                 return cw
     return max(windows.values())
 

@@ -14,7 +14,9 @@ from zero.llm.codex_cli import (
     CodexCLIBackend,
     _extract_codex_error,
     build_codex_argv,
+    codex_configured_model,
     codex_context_window,
+    codex_effective_model,
     codex_model,
     parse_codex_output,
 )
@@ -91,6 +93,18 @@ def test_codex_model_drops_claude_ids():
     assert codex_model("gpt-5-codex") == "gpt-5-codex"
 
 
+def test_codex_effective_model_reads_cli_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(
+        'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "max"\n',
+        encoding="utf-8",
+    )
+
+    assert codex_configured_model() == "gpt-5.6-sol"
+    assert codex_effective_model("claude-opus-5[1m]") == "gpt-5.6-sol"
+    assert codex_effective_model("gpt-5.6-terra") == "gpt-5.6-terra"
+
+
 def _write_models_cache(tmp_path, models):
     import json as _j
     (tmp_path / "models_cache.json").write_text(_j.dumps({"models": models}), encoding="utf-8")
@@ -106,6 +120,17 @@ def test_codex_context_window_reads_cache(tmp_path, monkeypatch):
     assert codex_context_window("gpt-5.5") == 272000      # exact model match
     assert codex_context_window("gpt-5.4-mini") == 128000
     assert codex_context_window() == 272000               # no model → largest cached
+
+
+def test_codex_context_window_uses_configured_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
+    _write_models_cache(tmp_path, [
+        {"slug": "gpt-5.6-sol", "context_window": 272000},
+        {"slug": "gpt-5.6-luna", "context_window": 128000},
+    ])
+
+    assert codex_context_window("claude-opus-5[1m]") == 128000
 
 
 def test_codex_context_window_none_when_cache_missing(tmp_path, monkeypatch):

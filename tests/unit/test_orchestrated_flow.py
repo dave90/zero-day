@@ -939,6 +939,17 @@ def test_default_execution_mode_is_orchestrated():
     assert cfg.thought_display == "condensed"  # one-line thought in chat by default
 
 
+def test_codex_startup_model_is_resolved_from_codex_config(tmp_path: Path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    orch = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="codex", use_container=False))
+
+    assert orch._effective_model_name() == "gpt-5.6-sol"
+
+
 def test_llm_timeout_is_shared_by_orchestrator_and_subagents(tmp_path: Path):
     """`--llm-timeout` sets the SAME per-call claude timeout on the orchestrator's
     own backend AND the pentester/validator subagent backends — one value for all."""

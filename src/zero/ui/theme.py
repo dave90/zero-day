@@ -305,9 +305,9 @@ def welcome_banner(cfg: "OrchestratorConfig", *, width: int = 80) -> FormattedTe
     if backend == "codex":
         # The shared --model default is a Claude id the Codex backend ignores (Codex
         # rejects it) — show the model Codex will actually use, not the bare default.
-        from zero.llm.codex_cli import codex_model
+        from zero.llm.codex_cli import codex_effective_model
 
-        model = codex_model(getattr(cfg, "model", None)) or "codex-default"
+        model = codex_effective_model(getattr(cfg, "model", None))
     ctxw = fmt_tokens(getattr(cfg, "context_window", 0) or 0)
     froot = getattr(cfg, "files_root", "zero_files")
     config = (

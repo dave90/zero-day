@@ -7,6 +7,8 @@ thresholds, and the ctx usage bar.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from prompt_toolkit.formatted_text import fragment_list_to_text
 
 from zero.ui import theme
@@ -47,6 +49,26 @@ SAMPLE_LINES = [
 def test_stylize_never_mutates_text():
     for line in SAMPLE_LINES:
         assert fragment_list_to_text(theme.stylize(line)) == line
+
+
+def test_welcome_banner_shows_effective_codex_model(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    cfg = SimpleNamespace(
+        backend="codex",
+        model="claude-opus-5[1m]",
+        execution_mode="c",
+        use_container=True,
+        context_window=272_000,
+        files_root="zero_files",
+    )
+
+    banner = fragment_list_to_text(theme.welcome_banner(cfg))
+
+    assert "gpt-5.6-sol" in banner
+    assert "claude-opus" not in banner
 
 
 # ----------------------------------------------------- marker → class map

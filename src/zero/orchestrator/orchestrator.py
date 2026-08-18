@@ -388,6 +388,16 @@ class Orchestrator:
         model = self.cfg.model or ""
         return 1_000_000 if "[1m]" in model else 200_000
 
+    def _effective_model_name(self) -> str:
+        """Return the model the selected backend will actually receive."""
+        backend_cfg = getattr(self.backend, "cfg", None)
+        model = getattr(backend_cfg, "model", None)
+        if self.cfg.backend == "codex":
+            from zero.llm.codex_cli import codex_effective_model
+
+            return codex_effective_model(model)
+        return model or "account-default"
+
     def _build_backend(self) -> LLMBackend:
         if self.cfg.backend == "echo":
             from zero.llm.echo import EchoBackend
@@ -487,6 +497,7 @@ class Orchestrator:
             set_llm_log_root(self.cfg.cwd / ".pentest" / "llm")
 
         project_ctx = project_context_for(self.cfg.cwd)
+        effective_model = self._effective_model_name()
         self.audit.write(
             "session_start",
             cwd=str(self.cfg.cwd),
@@ -495,7 +506,7 @@ class Orchestrator:
             has_project_context=project_ctx is not None,
             use_container=self.cfg.use_container,
             execution_mode=self.cfg.execution_mode,
-            model=self.cfg.model,
+            model=effective_model,
             context_window=self.cfg.context_window,
         )
 
@@ -505,7 +516,7 @@ class Orchestrator:
         # the #1 cause of "subagents can't use tools" after a fix — this makes it
         # obvious whether the fix is live (model / tool lock-down / context window).
         be_cfg = getattr(self.backend, "cfg", None)
-        model = getattr(be_cfg, "model", None) or "account-default"
+        model = effective_model
         locked = "locked-down" if getattr(be_cfg, "lock_down_tools", False) else "default"
         await self._emit(AgentTextDelta(
             text=(
