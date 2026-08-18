@@ -71,14 +71,14 @@ def test_mode_a_argv_session_resume():
     argv = build_mode_a_argv(
         binary="claude", max_turns=4, disallowed_tools=("LSP",),
         system_prompt_path="", setting_sources="", lock_down_tools=True,
-        model="claude-opus-4-8[1m]", session_id="UUID-1", resume=True,
+        model="claude-opus-5[1m]", session_id="UUID-1", resume=True,
     )
     assert _argval(argv, "--resume") == "UUID-1"
     assert "--session-id" not in argv
     assert "--system-prompt-file" not in argv
     assert "--setting-sources" not in argv
     assert "-n" not in argv
-    assert _argval(argv, "--model") == "claude-opus-4-8[1m]"
+    assert _argval(argv, "--model") == "claude-opus-5[1m]"
     assert "--allowedTools" in argv  # lock-down still enforced on resume
 
 
@@ -172,9 +172,9 @@ def test_lock_down_omitted_when_disabled():
 def test_mode_a_argv_pins_model():
     argv = build_mode_a_argv(
         binary="claude", max_turns=5, disallowed_tools=(),
-        model="claude-opus-4-8[1m]",
+        model="claude-opus-5[1m]",
     )
-    assert _argval(argv, "--model") == "claude-opus-4-8[1m]"
+    assert _argval(argv, "--model") == "claude-opus-5[1m]"
 
 
 def test_mode_a_argv_no_model_flag_when_empty():
@@ -186,7 +186,7 @@ def test_orchestrator_config_defaults_to_opus_1m():
     from zero.orchestrator.orchestrator import OrchestratorConfig
     from pathlib import Path
 
-    assert OrchestratorConfig(cwd=Path(".")).model == "claude-opus-4-8[1m]"
+    assert OrchestratorConfig(cwd=Path(".")).model == "claude-opus-5[1m]"
 
 
 def test_parse_result_field():

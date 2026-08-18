@@ -13,9 +13,9 @@ def pytest_addoption(parser):
     parser.addoption(
         "--regression-backend",
         action="store",
-        default="claude",
+        default="codex",
         choices=("claude", "codex"),
         help="LLM backend to drive the capability regression / blind suites against"
-        " (default: claude). Use 'codex' to run the SAME vulnerable targets through the"
-        " OpenAI Codex CLI. Requires that backend's CLI on PATH + authenticated.",
+        " (default: codex). Use 'claude' to run the SAME vulnerable targets through the"
+        " Claude Code CLI. Requires that backend's CLI on PATH + authenticated.",
     )

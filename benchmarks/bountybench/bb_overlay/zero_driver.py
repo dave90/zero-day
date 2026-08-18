@@ -258,7 +258,7 @@ async def run_zero_engagement(
     cwe: str | None = None,
     info: str = "",
     verify_files: dict[str, str] | None = None,
-    backend: str = "claude",
+    backend: str = "codex",
     model: str | None = None,
     execution_mode: str = "c",
     deadline_seconds: int = 1200,

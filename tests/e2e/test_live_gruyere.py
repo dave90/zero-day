@@ -9,9 +9,9 @@ file on disk proves the whole pipeline plumbed end-to-end).
 Gated by markers + binary presence; skips cleanly if anything's missing
 so the default suite stays green on machines without the prerequisites:
 
-  * marker `gruyere`           — opt-in (slow + costs claude tokens)
+  * marker `gruyere`           — opt-in (slow + costs Codex tokens)
   * `docker image inspect zero-sandbox:latest` succeeds
-  * `claude` on PATH
+  * `codex` on PATH
 
 Run it:
 
@@ -63,8 +63,8 @@ pytestmark = [
     pytest.mark.live,          # token-spending live run — excluded from the default suite
     pytest.mark.gruyere,
     pytest.mark.skipif(
-        shutil.which("claude") is None,
-        reason="claude CLI not on PATH",
+        shutil.which("codex") is None,
+        reason="codex CLI not on PATH",
     ),
     pytest.mark.skipif(
         not _image_exists("zero-sandbox:latest"),
@@ -146,7 +146,6 @@ async def test_zero_finds_at_least_one_finding_on_gruyere(tmp_path: Path, monkey
     cfg = OrchestratorConfig(
         cwd=tmp_path,
         goal="Find ONE unauthenticated web bug; submit the first concrete one you confirm.",
-        backend="claude",
         execution_mode="a",   # this test exercises the single-agent path
         use_container=True,
         yolo=True,            # auto-approve safe + active
@@ -192,7 +191,7 @@ async def test_zero_finds_at_least_one_finding_on_gruyere(tmp_path: Path, monkey
     print(f"\n[gruyere e2e] findings produced: {len(all_files)}")
     for f in all_files:
         print(f"  - {f.relative_to(tmp_path)}")
-    print(f"[gruyere e2e] audit event histogram:")
+    print("[gruyere e2e] audit event histogram:")
     from collections import Counter
     for k, n in sorted(Counter(kinds).items(), key=lambda x: -x[1]):
         print(f"  {n:>4}  {k}")

@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from zero.llm.backend import LLMBackend, LLMResponse, Message
+from zero.llm.backend import LLMBackend, LLMResponse
 from zero.orchestrator.approval import Decision
 from zero.orchestrator.audit import read_audit
 from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
@@ -837,7 +837,7 @@ async def test_context_window_resolved_backend_aware(tmp_path: Path, monkeypatch
     An explicit value is always honored."""
     # Claude '[1m]' model → 1M; plain model → 200k.
     o1m = Orchestrator(OrchestratorConfig(
-        cwd=tmp_path, backend="claude", model="claude-opus-4-8[1m]", use_container=False))
+        cwd=tmp_path, backend="claude", model="claude-opus-5[1m]", use_container=False))
     assert o1m.cfg.context_window == 1_000_000
     o200 = Orchestrator(OrchestratorConfig(
         cwd=tmp_path, backend="claude", model="claude-sonnet-4-6", use_container=False))
@@ -929,6 +929,7 @@ def test_thought_display_gating(tmp_path: Path):
 
 def test_default_execution_mode_is_orchestrated():
     cfg = OrchestratorConfig(cwd=Path("."))
+    assert cfg.backend == "codex"
     assert cfg.execution_mode == "c"
     assert cfg.max_concurrent_subagents == 10
     assert cfg.max_turns == 10  # orchestrator turn budget (turn awareness)

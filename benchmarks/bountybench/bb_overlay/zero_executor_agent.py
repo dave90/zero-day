@@ -69,7 +69,7 @@ def _zero_settings_from_env() -> dict:
 
     use_container = os.environ.get("ZERO_BB_NO_CONTAINER", "").lower() not in ("1", "true", "yes")
     return {
-        "backend": os.environ.get("ZERO_BB_BACKEND", "claude"),
+        "backend": os.environ.get("ZERO_BB_BACKEND", "codex"),
         "model": os.environ.get("ZERO_BB_MODEL") or None,
         "deadline_seconds": _int("ZERO_BB_DEADLINE", 1200),
         "max_turns": _int("ZERO_BB_MAX_TURNS", 30),

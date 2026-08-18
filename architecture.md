@@ -326,16 +326,18 @@ class LLMBackend(ABC):
 
 **Implementations today:**
 
+- `CodexCLIBackend` — shells out to `codex exec` in backend Mode A. **Default.**
+  Reuses the user's authenticated Codex CLI and resumes one persistent thread per
+  actor so subsequent turns retain server-side context and prompt caching.
 - `ClaudeCodeBackend` — shells out to `claude -p ... --output-format json`
-  (backend Mode A). **Default.** Reuses the user's Claude subscription; pins the
+  (backend Mode A). Reuses the user's Claude subscription; pins the
   model and locks the CLI down to zero real tools + our identity (§3.5.1).
 - `ClaudeCodeBackendModeB` — registers an in-process MCP bridge and runs the
   `claude` CLI in agent mode (backend Mode B; used by execution mode `b`).
 - `EchoBackend`, `ReplayBackend` — test/replay fixtures (not for production).
 
-> 📋 **Roadmap — `CodexBackend`, `ApiBackend`.** The interface is designed to wrap
-> other coding-agent CLIs (Codex) or talk to a raw API for pay-per-token use.
-> Neither is implemented yet; only the Claude Code backend exists.
+> 📋 **Roadmap — `ApiBackend`.** The interface can also support a raw API backend
+> for pay-per-token use; that adapter is not implemented yet.
 
 #### 3.5.1 Tool execution: two backend modes
 
@@ -373,7 +375,7 @@ executes tools.
    Code: **`--system-prompt`** carries our agent prompt (also dropping the default
    cwd/env/git/memory sections), and **`--setting-sources user`** drops project/
    local settings so the engagement repo's `CLAUDE.md` is never auto-discovered.
-5. The model is **pinned** with `--model` (default `claude-opus-4-8[1m]`).
+5. The model is **pinned** with `--model` (default `claude-opus-5[1m]`).
 6. The orchestrator parses the envelope, runs the tool (in the container), and
    feeds the result back as the next observation.
 

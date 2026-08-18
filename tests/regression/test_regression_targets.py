@@ -9,12 +9,12 @@ change that quietly makes `zero` worse shows up as a drop in the scorecard.
 Each parametrized case (one per `manifest.TARGETS`):
   1. stands the target up in docker (the `regression_target` fixture),
   2. writes a `pentest.md` scoping the run to that target,
-  3. drives a real orchestrated run (`execution_mode="c"`, real `claude` + real
+  3. drives a real orchestrated run (`execution_mode="c"`, real LLM backend + real
      sandbox) auto-approving everything, exactly like the gruyere driver,
   4. asserts a *validator-confirmed* finding matches the target's ground-truth
      vuln (see `assertions.record_matches`).
 
-Gated + opt-in (slow, costs claude tokens). Run it:
+Gated + opt-in (slow, costs LLM tokens). Run it:
 
     docker build -t zero-sandbox:latest -f docker/Dockerfile .
     uv run pytest -q -m regression -s tests/regression/
@@ -55,10 +55,6 @@ def _image_exists(tag: str) -> bool:
 pytestmark = [
     pytest.mark.live,          # token-spending — excluded from the default suite
     pytest.mark.regression,
-    pytest.mark.skipif(
-        shutil.which("claude") is None,
-        reason="claude CLI not on PATH",
-    ),
     pytest.mark.skipif(
         not _image_exists("zero-sandbox:latest"),
         reason="zero-sandbox:latest image not built — `docker build -t zero-sandbox:latest -f docker/Dockerfile .`",

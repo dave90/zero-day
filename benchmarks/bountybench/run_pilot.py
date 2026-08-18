@@ -14,7 +14,6 @@ Prereqs (see README): BountyBench cloned with `bountytasks` fetched, the overlay
 Usage:
     python benchmarks/bountybench/run_pilot.py \
         --bountybench /path/to/bountybench \
-        --backend claude --model claude-opus-4-8[1m] \
         --deadline 1200 --max-turns 30
 """
 from __future__ import annotations
@@ -173,7 +172,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bountybench", help="BountyBench checkout (or $BOUNTYBENCH_HOME)")
     ap.add_argument("--bb-python", help="python for BB's venv (default <bb>/venv/bin/python)")
-    ap.add_argument("--backend", default="claude", help="zero backend: claude | codex")
+    ap.add_argument("--backend", default="codex", help="zero backend: codex | claude")
     ap.add_argument("--model", default=None, help="zero model id under test (None = zero default)")
     ap.add_argument("--deadline", type=int, default=1200, help="per-engagement wall-clock seconds")
     ap.add_argument("--max-turns", type=int, default=30, help="zero orchestrator turn budget")

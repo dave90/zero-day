@@ -1,9 +1,8 @@
 """EchoBackend — scripted responses, test-only.
 
-This is NOT a user-facing backend: `--backend` only exposes `claude`, and
-`zero` defaults to the Claude Code backend inside the Docker sandbox. The
-EchoBackend exists solely as an offline fake so the test suite can drive the
-agent loop / orchestrator / router without an LLM. Tests construct
+This is NOT a user-facing backend: `--backend` only exposes `codex` and `claude`,
+with Codex as the default. EchoBackend exists solely as an offline fake so the
+test suite can drive the agent loop / orchestrator / router without an LLM. Tests construct
 `OrchestratorConfig(backend="echo")` directly, which the orchestrator factory
 still honors.
 

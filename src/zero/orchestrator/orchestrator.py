@@ -135,12 +135,10 @@ def _orchestrator_turn_note(turns_done: int, max_turns: int) -> str:
 class OrchestratorConfig:
     cwd: Path
     goal: str | None = None
-    backend: str = "claude"  # production default; "echo" is a test-only fixture
-    # Persistent `claude` sessions: each actor (orchestrator + every subagent) keeps a
-    # `claude --session-id` conversation and sends only the new turn via `--resume`,
-    # instead of re-shipping the whole transcript every call. Massive token win (claude
-    # holds + caches the history). claude-backend only; `--no-session-resume` reverts to
-    # the stateless re-ship-everything path.
+    backend: str = "codex"  # production default; "echo" is a test-only fixture
+    # Persistent backend sessions: Claude keeps a `--session-id` conversation and Codex
+    # keeps a thread id; both send only the new turn on resume instead of re-shipping the
+    # full transcript. `--no-session-resume` reverts to the stateless path.
     session_resume: bool = True
     auto_approve: set[str] = field(default_factory=set)
     yolo: bool = False
@@ -161,7 +159,7 @@ class OrchestratorConfig:
     # tool_use attempt at --max-turns 1 instantly trips error_max_turns; a little
     # headroom lets it fail harmlessly and recover to text (see ClaudeCodeConfig.max_turns).
     validator_claude_max_turns: int = 4    # per-call `claude -p --max-turns`
-    # Per-call `claude -p` wall-clock timeout shared by ALL agent backends — the
+    # Per-call LLM wall-clock timeout shared by ALL agent backends — the
     # orchestrator's own turns AND the pentester/validator subagents — so they
     # are always the same value. Heavy iterative exploitation (and the
     # orchestrator's large-context turns) can exceed the bare 300s default, so we
@@ -173,7 +171,7 @@ class OrchestratorConfig:
     # own, smaller budget; `dispatch_pentester(max_turns=...)` can still override.
     pentester_max_turns: int = 14
     # Hard wall-clock ceiling for ONE subagent's whole run, checked between
-    # turns. The 900s `--subagent-timeout` is only PER `claude -p` call — a
+    # turns. The 900s `--llm-timeout` is only PER backend call — a
     # subagent that keeps finding "one more thing to try" has no total cap
     # without this. Bounds a runaway subagent regardless of turn count.
     subagent_deadline_seconds: int = 1200
@@ -213,10 +211,10 @@ class OrchestratorConfig:
     #   "full"               — stream the whole thought (legacy behavior)
     #   "off"                — show nothing (rely on the ▸ activity lines)
     thought_display: str = "condensed"
-    # Model for every `claude -p` call (orchestrator + subagents + validators). Default
-    # is Opus with the 1M-context variant for max capability; override with --model
-    # (alias like 'sonnet', or a full id). None ⇒ account default.
-    model: str | None = "claude-opus-4-8[1m]"
+    # Model for every backend call (orchestrator + subagents + validators). The shared
+    # CLI default is the newest Claude Opus 1M id; Codex deliberately ignores Claude ids
+    # and uses its configured default. Override with --model; None ⇒ account default.
+    model: str | None = "claude-opus-5[1m]"
     # Model context-window size used ONLY for the UI's "ctx used/window (%)" display
     # (per agent). `None` ⇒ resolve it backend-aware at startup (Codex reports its real
     # window at runtime; Claude infers 1M for a '[1m]' model else 200k) — see

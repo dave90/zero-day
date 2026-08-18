@@ -90,7 +90,7 @@ _DEFAULT_SETTING_SOURCES = "user"
 class ClaudeCodeConfig:
     binary: str = "claude"
     # Pin the model for every `claude -p` call (alias like 'opus'/'sonnet' or a full
-    # id like 'claude-opus-4-8[1m]' for the 1M-context variant). None ⇒ use the
+    # id like 'claude-opus-5[1m]' for the 1M-context variant). None ⇒ use the
     # account default. Set by the orchestrator from --model.
     model: str | None = None
     # Which Claude Code setting sources to load. "user" drops project/local so the
@@ -678,7 +678,7 @@ class ModeBConfig:
     binary: str = "claude"
     timeout_seconds: int = 3600
     disallowed_builtin_tools: tuple[str, ...] = ("WebSearch", "WebFetch")
-    model: str | None = None  # pin the model (e.g. 'claude-opus-4-8[1m]'); None ⇒ default
+    model: str | None = None  # pin the model (e.g. 'claude-opus-5[1m]'); None ⇒ default
 
 
 def build_mcp_config(

@@ -56,12 +56,12 @@ pythonpath = ["."]
 # `-m live` (a command-line `-m` overrides this). See README / CLAUDE.md.
 addopts = "-m 'not live'"
 markers = [
-    "live: real token-spending run against a live LLM (claude). Opt-in: `pytest -m live`.",
+    "live: real token-spending run against a live LLM. Opt-in: `pytest -m live`.",
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
     "live_codex: tests that shell out to the real `codex` CLI (slow, costs tokens, needs auth)",
-    "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + claude)",
-    "regression: capability regression vs vulnerable docker targets (slow, costs claude tokens, needs docker + claude). Opt-in: `pytest -m regression`.",
+    "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + codex)",
+    "regression: capability regression vs vulnerable docker targets (slow, costs LLM tokens, needs docker + selected backend). Opt-in: `pytest -m regression`.",
     "regression_blind: blind capability benchmark vs vulnerable docker targets — never fails, prints coverage %. Opt-in: `pytest -m regression_blind`.",
 ]
 

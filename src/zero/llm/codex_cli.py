@@ -146,9 +146,9 @@ def codex_model(model: str | None) -> str:
     """The model id to pass to `codex -m`, or "" to use Codex's own default.
 
     The orchestrator shares ONE `--model` across backends and its default is a Claude
-    id (`claude-opus-4-8[1m]`) — which Codex rejects ("model is not supported when using
+    id (`claude-opus-5[1m]`) — which Codex rejects ("model is not supported when using
     Codex with a ChatGPT account"). So we drop any `claude*` id here: that makes
-    `zero run --backend codex` work out of the box (Codex default model) without forcing
+    `zero run` work out of the box (Codex default model) without forcing
     the user to pass `--model ''`. A non-Claude id is passed through verbatim so a user
     CAN pin a specific Codex model."""
     if not model or model.lower().startswith("claude"):

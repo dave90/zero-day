@@ -6,9 +6,9 @@ This repository tracks the implementation of `zero` as described in
 [`architecture.md`](architecture.md). The build is milestoned in
 [`plan.md`](plan.md); this checkout ships **all of Phase 1** (M1 → M8) plus
 post-M8 hardening: **per-agent working memory + plan**, **parallel multi-tool
-turns**, **model pinning** (Opus-1M by default), a hardened `claude` CLI **tool
-lock-down**, **per-agent context-window display**, and **subagent error
-recovery**.
+turns**, **Codex as the default backend**, optional **model pinning**, hardened
+backend tool lock-down, **per-agent context-window display**, and **subagent
+error recovery**.
 
 ## What works today
 
@@ -33,7 +33,7 @@ recovery**.
     away — `--pentester-max-turns` (default **14**, *not* inherited from the
     orchestrator's `--max-turns`), `--subagent-deadline` (default **1200s** total
     wall-clock per subagent, checked between turns), and `--llm-timeout`
-    (default **900s** per `claude -p` call — the **same** timeout the orchestrator
+    (default **900s** per backend call — the **same** timeout the orchestrator
     uses for its own turns).
   - **Interject while subagents run:** typing a message while the orchestrator is
     blocked in `await_subagents` returns control early (the running subagents keep
@@ -54,15 +54,15 @@ recovery**.
   independent tool calls run in ONE turn), `ask_user`, or `final` — with one-shot
   retry on malformed output. The parser tolerates trailing data after the first
   JSON object (a stray second object no longer kills a subagent).
-- **LLM backend** (`--backend`, default `claude`): a `ClaudeCodeBackend` that shells
+- **Claude Code backend** (`--backend claude`): a `ClaudeCodeBackend` that shells
   out to the authenticated `claude` CLI. It **pins the model** (`--model`, default
-  `claude-opus-4-8[1m]`) and **locks the CLI down to zero real tools**
+  `claude-opus-5[1m]`) and **locks the CLI down to zero real tools**
   (`--allowedTools ""` + `--strict-mcp-config` + `--disable-slash-commands` + a
   denylist) and replaces Claude Code's own identity (`--system-prompt`,
   `--setting-sources user`) so the subagent acts purely as our envelope-driven
   pentester and never drifts into calling a native CLI tool. (An internal scripted
   fake backend exists for the offline test suite only; it is not user-selectable.)
-- **OpenAI Codex backend** (`--backend codex`): a `CodexCLIBackend` that drives the
+- **OpenAI Codex backend** (`--backend`, default `codex`): a `CodexCLIBackend` that drives the
   authenticated `codex` CLI (`codex exec`) the same way — prompt on **stdin**, one
   envelope per turn. It uses a persistent Codex **thread** (`codex exec resume`) so
   the per-actor conversation is server-side **prompt-cached** across turns, just like
@@ -72,8 +72,8 @@ recovery**.
   lock-down is **soft** (`sandbox_mode=read-only` + `approval_policy=never` + the
   envelope instruction — Codex's shell tool can't be hard-removed like `--allowedTools ""`).
   The shared `--model` default is a Claude id, which Codex rejects, so the Codex backend
-  **ignores any `claude*` model** and uses Codex's own default — `--backend codex` works
-  with no extra flags. Pass a real Codex `--model` to pin one. The UI's ctx-window
+  **ignores any `claude*` model** and uses Codex's own default — `zero run` works
+  with no backend flag. Pass a real Codex `--model` to pin one. The UI's ctx-window
   denominator is resolved per backend at startup — for Codex it's read from Codex's own
   model cache at runtime (~272k), not the Claude 1M/200k default.
 - **ApprovalGate** — every tool call is gated (including the orchestrator's own).
@@ -142,9 +142,8 @@ recovery**.
 
 - Python ≥ 3.11
 - [uv](https://docs.astral.sh/uv/) for environment / build management
-- The Claude Code CLI (`claude` on `PATH`, authenticated) — required, since
-  `zero` runs the Claude Code backend by default. (Or, for `--backend codex`, the
-  OpenAI Codex CLI — `codex` on `PATH`, authenticated.)
+- The OpenAI Codex CLI (`codex` on `PATH`, authenticated), used by default. The
+  Claude Code CLI (`claude`) is only required when opting into `--backend claude`.
 - Docker, for the default sandboxed execution (build the `zero-sandbox` image
   below). Use `--no-container` to run on the host instead.
 
@@ -173,21 +172,20 @@ This writes a starter `pentest.md` and a `.pentest/` tree. Edit
 `pentest.md` to describe your scope, credentials, and goals — the agent
 reads the file verbatim every run.
 
-Start an interactive session. By default `zero` runs the **Claude Code
+Start an interactive session. By default `zero` runs the **OpenAI Codex
 backend inside the Docker sandbox** (orchestrated mode), so you need the
-`claude` CLI on `PATH` (authenticated) and the `zero-sandbox` image built
+`codex` CLI on `PATH` (authenticated) and the `zero-sandbox` image built
 (see [Building the sandbox image](#building-the-sandbox-image)):
 
 ```bash
 uv run zero run --goal "Find broken access control on http://localhost:3000"
 ```
 
-To drive the run with the **OpenAI Codex CLI** instead, add `--backend codex` (needs
-`codex` on `PATH`, authenticated). No other flags are required — the Codex backend
-ignores the Claude default model and uses Codex's own:
+To drive the run with **Claude Code** instead, add `--backend claude` (needs
+`claude` on `PATH`, authenticated):
 
 ```bash
-uv run zero run --backend codex \
+uv run zero run --backend claude \
   --goal "Find broken access control on http://localhost:3000"
 ```
 
@@ -207,8 +205,8 @@ orchestrator and every subagent (`thinking.log`).
 | Flag | Meaning |
 |---|---|
 | `--goal <text>` | One-shot goal seeded as the first user message. |
-| `--backend {claude,codex}` | LLM backend. Default `claude` (Claude Code CLI); `codex` shells out to the OpenAI Codex CLI (`codex exec`, with thread-based prompt caching). |
-| `--model <id>` | Model for **every** LLM call (orchestrator + subagents + validators). For `claude`: alias (`opus`/`sonnet`) or full id; default **`claude-opus-4-8[1m]`** (Opus, 1M context). Pass `''` for your account default. With `--backend codex` the Claude default is ignored (Codex uses its own default); pass a real **Codex** model id to pin one. |
+| `--backend {claude,codex}` | LLM backend. Default `codex` (OpenAI Codex CLI with thread-based prompt caching); pass `claude` to use Claude Code. |
+| `--model <id>` | Model for **every** LLM call (orchestrator + subagents + validators). For `claude`: alias (`opus`/`sonnet`) or full id; default **`claude-opus-5[1m]`** (Opus 5, 1M context; pass `claude-opus-4-8[1m]` to stay on the previous generation). Pass `''` for your account default. With `--backend codex` the Claude default is ignored (Codex uses its own default); pass a real **Codex** model id to pin one. |
 | `--execution-mode {a,b,c}` | `c` orchestrated (**default**), `a` single agent, `b` MCP delegated. |
 | `--auto-approve {safe,active,exploit}` | Auto-approve tools at this risk class. Repeatable. |
 | `--yolo` | Auto-approve `safe` + `active`. Does **not** cover `exploit` (use `--auto-approve exploit --i-understand`) or `destructive` (always prompts). |
@@ -220,9 +218,9 @@ orchestrator and every subagent (`thinking.log`).
 | `--validator-max-turns <n>` | Validator investigation steps, separate from `--max-turns` (default **40**). |
 | `--validator-claude-max-turns <n>` | claude's INTERNAL per-call `--max-turns` for the Validator (default **1** — NOT its investigation budget, which is `--validator-max-turns`; we drive the loop, so a high value only lets the model drift into a native tool call). |
 | `--context-window <n>` | Model context-window size for the UI's per-agent `ctx used/window (%)` display. Default resolved per backend at startup: Codex reads its real model window at runtime (~272k); Claude infers 1M for a `[1m]` model, else 200k. |
-| `--llm-timeout <secs>` | Per-call `claude -p` wall-clock timeout (default **900**), shared by the orchestrator **and** the pentester/validator subagents — one value for all. Raise it for heavy iterative exploitation / large-context turns. |
+| `--llm-timeout <secs>` | Per-call LLM backend wall-clock timeout (default **900**), shared by the orchestrator **and** the pentester/validator subagents — one value for all. Raise it for heavy iterative exploitation / large-context turns. |
 | `--pentester-max-turns <n>` | Per-pentester turn budget (default **14**). Pentesters no longer inherit `--max-turns`, so one attack idea can't run 40+ turns. |
-| `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--llm-timeout` only bounds a single `claude -p` call. |
+| `--subagent-deadline <secs>` | Total wall-clock ceiling for one subagent's whole run (default **1200**), checked between turns. `--llm-timeout` only bounds a single backend call. |
 | `--container` / `--no-container` | Run tool calls inside the Docker sandbox. **On by default**; falls back to host execution if Docker is unavailable. |
 | `--container-image <tag>` | Sandbox image tag (default `zero-sandbox:latest`). |
 | `--host-network` | Use the host network — needed for Burp listening on 127.0.0.1. |
@@ -299,7 +297,7 @@ plain `pytest` never runs it.
 - Docker running, with enough disk for the images (the Kali sandbox alone is
   ~6 GB; if Docker Desktop evicts images mid-run, raise its disk-image size in
   Settings → Resources).
-- `claude` authenticated and on `PATH` (it spends subscription tokens — watch
+- `codex` authenticated and on `PATH` (it spends subscription tokens — watch
   `/usage`).
 - The sandbox image built once:
   `docker build -t zero-sandbox:latest -f docker/Dockerfile .`
@@ -312,13 +310,13 @@ uv run pytest -m regression -s               # same, but stream live agent outpu
 uv run pytest -m regression -k juice-shop    # just one target
 uv run pytest -m regression -k "easy or medium"   # only the easy+medium tiers
 uv run pytest -m regression -k hard          # only the hard HTB targets (long; 1h budget each)
-uv run pytest -m regression --regression-backend codex   # run the SAME targets on the Codex CLI
+uv run pytest -m regression --regression-backend claude  # opt into Claude Code instead
 ```
 
-By default the regression suite drives the `claude` backend. Pass
-`--regression-backend codex` to run the identical set of targets through the OpenAI
-Codex CLI instead (needs `codex` authenticated on `PATH`); the per-target scorecard
-line is tagged with the backend so the two runs are comparable.
+By default the regression suite drives the `codex` backend. Pass
+`--regression-backend claude` to run the identical set of targets through Claude Code
+instead; the per-target scorecard line is tagged with the backend so the two runs are
+comparable.
 
 `-m regression` selects every regression target across the repo (it overrides the
 default `-m 'not live'` filter), so a single command runs the whole stable — no
@@ -341,7 +339,7 @@ builds for `linux/amd64` under emulation, so its first run is slow).
 `keywords`) — verify the image is pullable first. The matching/scoring logic is
 unit-tested offline in `tests/unit/test_regression_assertions.py` (runs in the
 free default suite). This suite is a manual, opt-in run — not part of CI, since it
-needs an authenticated `claude` subscription and spends tokens.
+needs an authenticated selected-backend subscription and spends tokens.
 
 #### Blind coverage benchmark (`-m regression_blind`)
 

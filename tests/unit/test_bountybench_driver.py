@@ -15,11 +15,19 @@ from benchmarks.bountybench.bb_overlay.zero_driver import (
     _sum_usage,
     build_bountybench_goal,
     collect_engagement_result,
+    run_zero_engagement,
     synthesize_exploit_from_finding,
 )
 from zero.findings.dedup import dedup_hash
 from zero.findings.schema import Finding, FindingRecord, Validation
 from zero.findings.store import FindingsStore
+
+
+def test_zero_driver_defaults_to_codex():
+    import inspect
+
+    backend = inspect.signature(run_zero_engagement).parameters["backend"]
+    assert backend.default == "codex"
 
 
 def _make_record(title: str, cwe: str, *, verdict: str = "confirmed") -> FindingRecord:

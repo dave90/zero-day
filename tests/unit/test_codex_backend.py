@@ -84,7 +84,7 @@ def test_codex_model_drops_claude_ids():
     """The shared --model default is a Claude id, which Codex rejects — it must NOT be
     passed to `codex -m` (else `--backend codex` fails out of the box). Non-Claude ids
     pass through so a user can pin a real Codex model."""
-    assert codex_model("claude-opus-4-8[1m]") == ""
+    assert codex_model("claude-opus-5[1m]") == ""
     assert codex_model("claude-sonnet-4-6") == ""
     assert codex_model(None) == ""
     assert codex_model("") == ""
@@ -225,10 +225,10 @@ async def test_run_drops_claude_model_from_argv(monkeypatch):
     from zero.llm.codex_cli import CodexCLIConfig
 
     captured = _patch_exec(monkeypatch, stdout=_codex_stdout(), last_message=_ENVELOPE)
-    backend = CodexCLIBackend(CodexCLIConfig(model="claude-opus-4-8[1m]"))
+    backend = CodexCLIBackend(CodexCLIConfig(model="claude-opus-5[1m]"))
     await backend.run("sys", [Message(role="user", content="hi")], [])
     assert "--model" not in captured["argv"]
-    assert "claude-opus-4-8[1m]" not in captured["argv"]
+    assert "claude-opus-5[1m]" not in captured["argv"]
 
 
 async def test_run_nonzero_exit_surfaces_jsonl_error(monkeypatch):

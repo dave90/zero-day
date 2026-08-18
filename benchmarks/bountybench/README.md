@@ -63,14 +63,16 @@ layout you don't need to set anything:
 
 ```bash
 cd /path/to/zero-day
-./benchmarks/bountybench/run.sh                               # lunary#0 exploit (proven default)
+./benchmarks/bountybench/run.sh                               # lunary#0 exploit with Codex
 # (set BOUNTYBENCH_HOME or pass --bountybench if it's not auto-detected)
 ./benchmarks/bountybench/run.sh --system lunary --task detect # a different task type
 ./benchmarks/bountybench/run.sh --system lunary --task detect --use-cwe # CWE-assisted Detect
-./benchmarks/bountybench/run.sh --model claude-sonnet-4-6     # a different model under test
+./benchmarks/bountybench/run.sh --backend claude --model claude-sonnet-4-6
 ./benchmarks/bountybench/run.sh --pilot                       # every available bounty in pilot.py
 ./benchmarks/bountybench/run.sh --help                        # all flags
 ```
+
+The default backend is Codex. Pass `--backend claude` only when you want a Claude run.
 
 ### Or drive the steps yourself
 
@@ -79,7 +81,6 @@ cd /path/to/zero-day
 export PATH="$BOUNTYBENCH_HOME/venv/bin:$PATH"   # so verify.sh's python3 can import psycopg2
 python benchmarks/bountybench/run_pilot.py \
     --bountybench "$BOUNTYBENCH_HOME" \
-    --backend claude --model 'claude-opus-4-8[1m]' \
     --deadline 1800 --max-turns 40
 ```
 
@@ -87,19 +88,20 @@ This runs each available bounty in `pilot.py` through BountyBench (`--use_mock_m
 `zero` owns the real model calls), captures the authoritative verdict + reward + tokens from
 BountyBench's saved run log, and writes `benchmarks/bountybench/results/pilot_<ts>.jsonl`.
 
-Compare two models by re-running with a different `--model` (or `--backend codex`).
+Compare backends by re-running with `--backend claude` (and an optional Claude `--model`).
 
 ### A single bounty by hand
 
 ```bash
 cd "$BOUNTYBENCH_HOME" && source venv/bin/activate
-ZERO_BB_BACKEND=claude ZERO_BB_MODEL='claude-opus-4-8[1m]' ZERO_BB_DEADLINE=1200 \
+ZERO_BB_DEADLINE=1200 \
 python -m workflows.runner --workflow-type zero_exploit_workflow \
     --task_dir bountytasks/lunary --bounty_number 0 \
     --use_mock_model --phase_iterations 2
 ```
 
-`ZERO_BB_*` env vars the overlay agent reads: `ZERO_BB_BACKEND` (claude|codex),
+`ZERO_BB_*` env vars the overlay agent reads: `ZERO_BB_BACKEND` (codex by default;
+`claude` to opt in),
 `ZERO_BB_MODEL`, `ZERO_BB_DEADLINE`, `ZERO_BB_MAX_TURNS`, `ZERO_BB_NETWORK`
 (default `shared_net`), `ZERO_BB_NO_CONTAINER`.
 

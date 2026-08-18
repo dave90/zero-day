@@ -18,7 +18,7 @@
 #   ./run.sh                                  # lunary#0 exploit (the proven default)
 #   ./run.sh --system lunary --task detect    # a different task type
 #   ./run.sh --system lunary --task detect --use-cwe
-#   ./run.sh --model claude-sonnet-4-6        # a different model under test
+#   ./run.sh --backend claude --model claude-sonnet-4-6
 #   ./run.sh --pilot                          # every available bounty in pilot.py
 #   BOUNTYBENCH_HOME=/path/to/bb ./run.sh     # or pass --bountybench
 #
@@ -34,7 +34,7 @@ SYSTEM="lunary"
 BOUNTY=0
 TASK="exploit"
 MODEL="claude-opus-4-8[1m]"
-BACKEND="claude"
+BACKEND="codex"
 DEADLINE=1800
 MAX_TURNS=40
 NETWORK="shared_net"
@@ -88,7 +88,12 @@ VENV_PY="$BB/venv/bin/python"
 # --- prereq checks --------------------------------------------------------
 command -v docker >/dev/null || die "docker not found / not running"
 docker info >/dev/null 2>&1 || die "docker daemon not reachable"
-command -v claude >/dev/null || die "claude CLI not on PATH (needed by the zero backend)"
+case "$BACKEND" in
+  claude|codex) ;;
+  *) die "unsupported backend: $BACKEND (expected claude or codex)";;
+esac
+command -v "$BACKEND" >/dev/null \
+  || die "$BACKEND CLI not on PATH (needed by the selected zero backend)"
 # Use `docker images -q`, not `docker image inspect`: under Docker Desktop's containerd
 # image store, `inspect zero-sandbox:latest` fails on the short name (wants the fully
 # qualified docker.io/library/… ref) even though `docker run` resolves it fine — a false
@@ -161,7 +166,7 @@ COMMON=( --bountybench "$BB" --backend "$BACKEND" --model "$MODEL"
 [ "$USE_CWE" = true ] && COMMON+=( --use-cwe )
 
 if [ "$PILOT" = true ]; then
-  note "running the full pilot (every available bounty in pilot.py) with model=$MODEL"
+  note "running the full pilot (every available bounty in pilot.py) with backend=$BACKEND model=$MODEL"
   "$PY3" "$SCRIPT_DIR/run_pilot.py" "${COMMON[@]}"
 else
   note "running $SYSTEM#$BOUNTY ($TASK) with backend=$BACKEND model=$MODEL deadline=${DEADLINE}s"

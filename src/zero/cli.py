@@ -41,7 +41,7 @@ def main() -> None:
 @click.option(
     "--backend",
     type=click.Choice(["claude", "codex"]),
-    default="claude",
+    default="codex",
     show_default=True,
     help="LLM backend. Shells out to the authenticated Claude Code CLI ('claude') or"
     " the OpenAI Codex CLI ('codex'). With 'codex', pass a Codex --model or omit it.",
@@ -110,7 +110,7 @@ def main() -> None:
     type=int,
     default=900,
     show_default=True,
-    help="Per-call `claude -p` wall-clock timeout (seconds), shared by the"
+    help="Per-call LLM backend wall-clock timeout (seconds), shared by the"
     " orchestrator AND the pentester/validator subagents (one value for all)."
     " Raise it for heavy iterative exploitation / large-context turns.",
 )
@@ -128,7 +128,7 @@ def main() -> None:
     default=1200,
     show_default=True,
     help="Hard wall-clock ceiling (seconds) for ONE subagent's whole run, checked"
-    " between turns. --llm-timeout only bounds a single `claude -p` call.",
+    " between turns. --llm-timeout only bounds a single backend call.",
 )
 @click.option(
     "--max-subagents",
@@ -228,11 +228,13 @@ def main() -> None:
 )
 @click.option(
     "--model",
-    default="claude-opus-4-8[1m]",
+    default="claude-opus-5[1m]",
     show_default=True,
-    help="Model for every claude call (orchestrator + subagents + validators). An"
-    " alias ('opus', 'sonnet') or full id; 'claude-opus-4-8[1m]' is Opus with the"
-    " 1M-context window. Pass '' to use your account default.",
+    help="Model for every LLM call (orchestrator + subagents + validators). For"
+    " Claude, use an alias ('opus', 'sonnet') or full id; 'claude-opus-5[1m]' is"
+    " Opus 5 with the 1M-context window. Codex ignores this Claude default and uses"
+    " its configured default model unless you pass a Codex model id. Pass '' to use"
+    " the selected backend's account default.",
 )
 @click.option(
     "--context-window",

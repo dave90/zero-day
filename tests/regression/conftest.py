@@ -78,9 +78,12 @@ def _record_skip(spec: TargetSpec, reason: str) -> None:
 @pytest.fixture
 def regression_backend(request) -> str:
     """The LLM backend the run should use, from `--regression-backend` (default
-    'claude'). Both the strict and blind suites read this so a whole regression run
-    can be pointed at Codex with `pytest -m regression --regression-backend codex`."""
-    return request.config.getoption("--regression-backend")
+    'codex'). Both the strict and blind suites read this so a whole regression run
+    can be pointed at Claude with `pytest -m regression --regression-backend claude`."""
+    backend = request.config.getoption("--regression-backend")
+    if not _have(backend):
+        pytest.skip(f"{backend} CLI not on PATH")
+    return backend
 
 
 @pytest.fixture(scope="session")
@@ -96,7 +99,7 @@ def regression_blind_scorecard() -> list[CoverageResult]:
 
 
 @pytest.fixture
-def regression_target(request):
+def regression_target(request, regression_backend):
     """Build/pull a target image, run it detached, health-poll it, and yield the
     URL the SANDBOX should use to reach it. Skips (never fails) on any prereq or
     target-startup problem — only a healthy target that the agent fails to crack

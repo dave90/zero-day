@@ -300,7 +300,7 @@ def welcome_banner(cfg: "OrchestratorConfig", *, width: int = 80) -> FormattedTe
     line("banner.ink", "  autonomous web-app pentest agent")
 
     sandbox = "sandbox on" if getattr(cfg, "use_container", True) else "host exec"
-    backend = getattr(cfg, "backend", "claude")
+    backend = getattr(cfg, "backend", "codex")
     model = getattr(cfg, "model", None) or "account-default"
     if backend == "codex":
         # The shared --model default is a Claude id the Codex backend ignores (Codex

@@ -53,10 +53,6 @@ pytestmark = [
     pytest.mark.live,            # token-spending — excluded from the default suite
     pytest.mark.regression_blind,
     pytest.mark.skipif(
-        shutil.which("claude") is None,
-        reason="claude CLI not on PATH",
-    ),
-    pytest.mark.skipif(
         not _image_exists("zero-sandbox:latest"),
         reason="zero-sandbox:latest image not built — `docker build -t zero-sandbox:latest -f docker/Dockerfile .`",
     ),
