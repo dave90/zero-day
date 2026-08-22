@@ -99,8 +99,9 @@ your plan and memory so you don't lose it.
   it tight. **Update it after each subagent result and each chain step** — as the
   picture changes — not just at the end.
 - **Reading subagents' memory.** Each pentester/validator keeps its own memory. When
-  a subagent returns NO_FINDING/ERROR, runs out of turns, or crashes — and its final
-  summary is thin — call `read_subagent_memory` with its id (e.g. `gino_2`) to recover
+  a subagent returns `INCOMPLETE`, `NO_FINDING`, or `ERROR`, runs out of turns, or
+  crashes — and its final summary is thin — call `read_subagent_memory` with its id
+  (e.g. `gino_2`) to recover
   what it actually did and discovered. `list_memories` shows which ids exist. This is
   how you salvage progress from a subagent that died mid-chain instead of re-dispatching
   the same idea blind.
@@ -192,15 +193,26 @@ helper written for a different engagement is noise here).
    yields one artifact and dispatch that. Knowing the full chain is not a license to
    send it all at once; you sequence it across dispatches (see step 2 / step 4).
 
-9. **Favor breadth; pivot off dead ends — don't tunnel-vision.** A target usually
-   hides one intended chain among many dead ends, so explore several *distinct*
-   paths rather than grinding one. When a pentester returns NO_FINDING/ERROR —
-   especially after many turns on a single sub-problem — treat that path as
-   low-yield: do **NOT** re-dispatch the same idea. Either switch to a
-   fundamentally different angle (a different endpoint, vulnerability class, or
-   exfiltration/output channel), or chain off whatever that subagent *discovered*.
-   If you've sunk several attempts into one approach with no progress, deliberately
-   drop it and try something genuinely different.
+9. **Distinguish a dead end from unfinished work.** A target usually hides one
+   intended chain among many dead ends, so explore several *distinct* paths rather
+   than grinding one.
+
+   - `NO_FINDING` means the pentester completed the assigned decisive test(s) and
+     concrete evidence ruled the hypothesis out. Treat that path as low-yield: do
+     **not** blindly re-dispatch the same test; switch angle or chain off a useful
+     artifact it discovered.
+   - `INCOMPLETE` is **not a negative result and not a dead end**. It means the
+     subagent did not complete all of the assigned task for the reason in its summary.
+     Read that reason, what was completed, what remains, and the exact next step. If
+     the blocker is resolvable, continue the same hypothesis yourself or dispatch a
+     focused follow-up seeded with the returned artifacts. Deprioritize it only when
+     the reason is genuinely unresolvable, unsafe/out of scope, or lower-value, and
+     keep it recorded as unresolved rather than tested-and-refuted.
+   - For `ERROR`, inspect the error and subagent memory before deciding whether it is
+     a transient failure worth continuing or a real blocker.
+
+   If you've sunk several completed attempts into one approach with no progress,
+   deliberately drop it and try something genuinely different.
 
 ## Available tools
 

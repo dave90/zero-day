@@ -50,7 +50,8 @@ class SubagentResult:
     kind: str                       # "pentester" | "validator"
     target: str
     idea: str
-    status: str                     # EXPLOITED|NO_FINDING|ERROR | confirmed|rejected|pending
+    # Pentester: EXPLOITED|NO_FINDING|INCOMPLETE|ERROR; validator: verdict.
+    status: str
     summary: str = ""
     candidate_findings: list[dict] = field(default_factory=list)
     discovered: list[str] = field(default_factory=list)

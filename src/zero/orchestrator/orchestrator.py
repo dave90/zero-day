@@ -1948,7 +1948,7 @@ class Orchestrator:
             "`discovered` and the orchestrator will dispatch the next step seeded with it. "
             "Do not submit findings yourself; "
             "when done, reply with a `final` whose `answer` is a JSON object: "
-            '{"status": "EXPLOITED" | "NO_FINDING", "summary": "...", '
+            '{"status": "EXPLOITED" | "NO_FINDING" | "INCOMPLETE", "summary": "...", '
             '"candidate_findings": [{"title":..., "summary":..., "endpoint":..., "method":..., '
             '"cwe":..., "severity_hint":..., "evidence":..., "payload_shape":...}], '
             '"discovered": ["creds/tokens/notes to chain"]}.\n'
@@ -1957,7 +1957,13 @@ class Orchestrator:
             "- If you EXPLOITED something, summarize the bug and how you proved it.\n"
             "- If status is NO_FINDING, do NOT just say 'nothing found'. Explain WHAT YOU TESTED "
             "(the concrete payloads / endpoints / parameters you tried) and WHY each did not work "
-            "(the response/observation that ruled it out). If ANY payload looked PROMISING or got "
+            "(the response/observation that ruled it out). Use NO_FINDING ONLY if you completed the "
+            "decisive test(s) for the assigned hypothesis and the evidence ruled it out.\n"
+            "- If you did not complete every step needed to decide the assigned hypothesis, status "
+            "MUST be INCOMPLETE, not NO_FINDING. In the summary state `Reason incomplete`, "
+            "`Completed`, `Remaining`, and `Exact next step` so the orchestrator can inspect the "
+            "reason and continue the work.\n"
+            "If ANY payload looked PROMISING or got "
             "close — a partial success, an interesting error, a reflection that was almost "
             "exploitable, an auth check that nearly passed — include the EXACT payload (or the full "
             "request / exploit script) VERBATIM in the summary so the orchestrator can refine and "
@@ -1968,7 +1974,8 @@ class Orchestrator:
             "script verbatim rather than truncating them.\n"
             "Don't tunnel-vision: if an approach isn't working after a few attempts, switch "
             "technique rather than repeating variations of the same failing step; if nothing pans "
-            "out, conclude NO_FINDING with what you tried and the most promising lead."
+            "out after decisive testing, conclude NO_FINDING. If the task remains unfinished, "
+            "conclude INCOMPLETE with the reason and exact continuation step."
         )
         loop.add_user_message(brief)
         # If this actor saved memory earlier this run, seed it so it resumes

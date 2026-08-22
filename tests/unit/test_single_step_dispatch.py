@@ -48,3 +48,6 @@ async def test_pentester_brief_says_single_link_not_whole_chain(tmp_path, monkey
     assert "ONE link of a larger chain" in brief
     assert "do NOT try to carry the attack end-to-end" in brief
     assert "the orchestrator will dispatch the next step seeded with it" in brief
+    assert '"EXPLOITED" | "NO_FINDING" | "INCOMPLETE"' in brief
+    assert "status MUST be INCOMPLETE, not NO_FINDING" in brief
+    assert "Reason incomplete" in brief and "Exact next step" in brief

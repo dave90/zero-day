@@ -203,7 +203,7 @@ creds/tokens to chain in `context`). The subagent replies with a structured
 
 ```json
 {
-  "status": "EXPLOITED | NO_FINDING",
+  "status": "EXPLOITED | NO_FINDING | INCOMPLETE",
   "summary": "...",
   "candidate_findings": [{"title": "...", "summary": "...", "endpoint": "...",
                           "method": "...", "cwe": "...", "severity_hint": "...",

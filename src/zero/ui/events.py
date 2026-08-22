@@ -260,7 +260,7 @@ class SubagentFinished:
     subagent_id: str = ""
     subkind: str = "pentester"
     target: str = ""
-    status: str = ""               # EXPLOITED|NO_FINDING|ERROR or a verdict
+    status: str = ""               # EXPLOITED|NO_FINDING|INCOMPLETE|ERROR or a verdict
     finding_ids: list[str] = field(default_factory=list)
     duration: float = 0.0
 
