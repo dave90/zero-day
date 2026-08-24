@@ -2,7 +2,7 @@
 
 Mode A shells out per turn:
 
-    claude -p "$PROMPT" --output-format json --max-turns 1
+    claude -p "$PROMPT" --output-format stream-json --verbose --max-turns 1
 
 The prompt is the system prompt + serialized history + tool catalog.
 
@@ -28,7 +28,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from zero.llm.backend import LLMBackend, LLMResponse, Message, Session
+from zero.llm.backend import (
+    LLMBackend,
+    LLMResponse,
+    Message,
+    Session,
+    context_tokens_from_usage,
+)
 from zero.llm.llm_trace import trace_call
 
 
@@ -240,7 +246,11 @@ def build_mode_a_argv(
     argv = [
         binary,
         "--print",  # non-interactive; the prompt body arrives on STDIN, not argv
-        "--output-format", "json",
+        # Complete assistant messages carry per-request usage, and the JSONL stream
+        # also exposes `system/compact_boundary`. The one-shot JSON result only has
+        # cumulative usage for the whole invocation, which is wrong after compaction.
+        "--output-format", "stream-json",
+        "--verbose",
         "--max-turns", str(max_turns),
     ]
     if model:
@@ -373,7 +383,7 @@ class ClaudeCodeBackend(LLMBackend):
                 binary, prompt, max_turns, sys_for_call, session=session, resume=resuming
             )
             if returncode == 0:
-                resp = parse_claude_json(out_text)
+                resp = parse_claude_stream_json(out_text)
                 if self.cfg.lock_down_tools and _is_native_tool_drift(resp):
                     return None, True, "native tool_use under lock-down"
                 return resp, False, None
@@ -468,7 +478,7 @@ class ClaudeCodeBackend(LLMBackend):
 
 
 def _extract_claude_error(stdout: str) -> str:
-    """Reduce a claude error JSON to a short human-readable string.
+    """Reduce a claude error JSON/JSONL stream to a short human-readable string.
 
     Example input:
       {"type":"result","subtype":"error_max_turns","duration_ms":8544,
@@ -476,17 +486,15 @@ def _extract_claude_error(stdout: str) -> str:
 
     Returns: "error_max_turns (stop=tool_use, num_turns=2)"
 
-    If `stdout` isn't a recognized error JSON, returns "" so the caller
+    If `stdout` contains no recognized error object, returns "" so the caller
     falls back to stderr.
     """
     if not stdout:
         return ""
-    try:
-        obj = json.loads(stdout)
-    except json.JSONDecodeError:
+    errors = [obj for obj in _iter_claude_json(stdout) if obj.get("is_error")]
+    if not errors:
         return ""
-    if not isinstance(obj, dict) or not obj.get("is_error"):
-        return ""
+    obj = errors[-1]
     subtype = obj.get("subtype", "error")
     stop = obj.get("stop_reason", "")
     turns = obj.get("num_turns", "")
@@ -496,6 +504,20 @@ def _extract_claude_error(stdout: str) -> str:
     if turns:
         bits.append(f"num_turns={turns}")
     return f"{bits[0]} (" + ", ".join(bits[1:]) + ")" if len(bits) > 1 else bits[0]
+
+
+def _iter_claude_json(stdout: str):
+    """Yield object lines from Claude's compact JSON or stream-JSON output."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
 
 
 # Claude Code's own message when the model emits a native `tool_use` for a tool that
@@ -552,6 +574,150 @@ _DRIFT_ERROR_MSG = (
     "NOT make native tool calls: reply with EXACTLY ONE JSON envelope naming one of the "
     "provided tools (or a final), and the runtime will run it."
 )
+
+
+def _numeric_usage(value: Any) -> dict[str, int]:
+    """Keep the numeric token counters from a Claude usage object."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): int(amount)
+        for key, amount in value.items()
+        if isinstance(amount, (int, float))
+    }
+
+
+def _claude_message_text(message: dict[str, Any]) -> str:
+    """Extract text blocks from one complete stream-json assistant message."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            value = block.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts)
+
+
+def _claude_context_window(result: dict[str, Any], model: str) -> int | None:
+    """Read the selected model's window from a Claude result when present."""
+    model_usage = result.get("modelUsage") or result.get("model_usage")
+    if not isinstance(model_usage, dict):
+        return None
+    entries: list[Any] = []
+    if model and model in model_usage:
+        entries.append(model_usage[model])
+    entries.extend(value for key, value in model_usage.items() if key != model)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("contextWindow") or entry.get("context_window")
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    return None
+
+
+def parse_claude_stream_json(stdout: str) -> LLMResponse:
+    """Parse CLI `stream-json` and select the current, not cumulative, usage.
+
+    Claude's final result usage is cumulative across all internal model steps. A
+    complete `assistant` event instead carries the usage for that API request, whose
+    input/cache tiers are the live context snapshot. A `compact_boundary` discards any
+    earlier candidate so only a following assistant request can repopulate the value.
+    """
+    objects = list(_iter_claude_json(stdout))
+    if not objects:
+        raise RuntimeError(f"claude returned non-JSON stream: {stdout!r}")
+
+    result: dict[str, Any] = {}
+    assistant_text = ""
+    assistant_usage: dict[str, int] = {}
+    assistant_model = ""
+    assistant_stop_reason = ""
+    compacted = False
+
+    for obj in objects:
+        if obj.get("is_error"):
+            detail = _extract_claude_error(stdout) or "unknown error"
+            raise RuntimeError(f"claude error: {detail}")
+        msg_type = obj.get("type")
+        if msg_type == "system" and obj.get("subtype") == "compact_boundary":
+            compacted = True
+            # Usage observed before the newest boundary describes the old, large
+            # context (or the summarization request), never the replacement context.
+            assistant_usage = {}
+            assistant_model = ""
+            assistant_stop_reason = ""
+            continue
+        if msg_type == "assistant" and obj.get("parent_tool_use_id") in (None, ""):
+            message = obj.get("message")
+            if not isinstance(message, dict):
+                continue
+            usage = _numeric_usage(message.get("usage"))
+            if usage:
+                assistant_usage = usage
+            model = message.get("model")
+            if isinstance(model, str):
+                assistant_model = model
+            stop_reason = message.get("stop_reason")
+            if isinstance(stop_reason, str):
+                assistant_stop_reason = stop_reason
+            text = _claude_message_text(message)
+            if text:
+                assistant_text = text
+            continue
+        if msg_type == "result" or any(
+            isinstance(obj.get(key), str) for key in ("result", "completion")
+        ):
+            result = obj
+
+    # The result's clean text remains authoritative; assistant blocks are a fallback.
+    text = ""
+    for key in ("result", "text", "content", "completion"):
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            text = value
+            break
+    text = text or assistant_text
+    if not text:
+        raise RuntimeError(f"could not find response text in claude stream: {stdout[:500]!r}")
+
+    result_usage = _numeric_usage(result.get("usage"))
+    if assistant_usage:
+        context_tokens = context_tokens_from_usage(assistant_usage)
+        usage_source = "assistant"
+    elif compacted:
+        # Do not fall back to cumulative result usage after a boundary: until another
+        # API request tokenizes the replacement context, its exact size is unknown.
+        context_tokens = 0
+        usage_source = "awaiting_post_compaction"
+    else:
+        # Compatibility for older/fake CLI output that only emits one result object.
+        context_tokens = context_tokens_from_usage(result_usage)
+        usage_source = "result_fallback"
+
+    # Keep billing/audit usage separate from context occupancy. The result is
+    # cumulative for this CLI invocation; use it when present, while the explicit
+    # `context_tokens` above drives the UI from the latest assistant request.
+    usage = result_usage or assistant_usage
+
+    raw = dict(result or objects[-1])
+    raw["context_compacted"] = compacted
+    raw["context_usage_source"] = usage_source
+    if assistant_stop_reason and not raw.get("stop_reason"):
+        raw["stop_reason"] = assistant_stop_reason
+    context_window = _claude_context_window(result, assistant_model)
+    return LLMResponse(
+        text=text,
+        usage=usage,
+        raw=raw,
+        context_tokens=context_tokens,
+        context_window=context_window,
+    )
 
 
 def parse_claude_json(stdout: str) -> LLMResponse:

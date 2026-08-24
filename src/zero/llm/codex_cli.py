@@ -35,9 +35,10 @@ import os
 import shutil
 import tempfile
 import tomllib
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from zero.llm.backend import LLMBackend, LLMResponse, Message, Session
 
@@ -91,6 +92,26 @@ class CodexCLIConfig:
     # Engagements run from a scratch dir that usually isn't a git repo; Codex refuses
     # to start outside one unless told it's fine.
     skip_git_repo_check: bool = True
+
+
+@dataclass(frozen=True)
+class CodexRolloutContext:
+    """Live context metadata extracted from Codex CLI's own rollout JSONL."""
+
+    usage: dict[str, int] | None
+    context_window: int | None
+    compacted: bool = False
+    awaiting_measurement: bool = False
+
+
+@dataclass
+class _RolloutCursor:
+    path: Path
+    offset: int = 0
+
+
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex"))
 
 
 def build_codex_argv(
@@ -165,9 +186,8 @@ def codex_configured_model() -> str:
     ``~/.codex/config.toml``). Reading the same value lets startup diagnostics report
     the model that will actually run instead of the discarded Claude placeholder.
     """
-    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
     try:
-        with (Path(home) / "config.toml").open("rb") as fh:
+        with (_codex_home() / "config.toml").open("rb") as fh:
             config = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError):
         return ""
@@ -182,18 +202,15 @@ def codex_effective_model(model: str | None) -> str:
 
 
 def codex_context_window(model: str | None = None) -> int | None:
-    """The active Codex model's context window (tokens), read at runtime from Codex's
-    own model-metadata cache (`$CODEX_HOME/models_cache.json`, default `~/.codex`).
+    """The active Codex model's effective context window, read from its model cache.
 
-    Codex's live event stream doesn't carry the window, but Codex caches per-model
-    metadata on disk (refreshed by the CLI) — that's the authoritative source. Returns
-    the window for `model` when it matches a cached slug, else the largest cached window
-    (current Codex models share one), or None when the cache is unreadable so the caller
-    falls back. This is why zero shows a correct ctx% for Codex (≈272k) instead of the
-    Claude-derived 1M/200k default."""
-    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    `$CODEX_HOME/models_cache.json` stores the nominal window plus either an explicit
+    auto-compact limit or an effective-window percentage. Apply those runtime limits
+    before returning the UI denominator (for example 272,000 × 95% = 258,400). Returns
+    the matching model's limit, the largest cached limit when no model resolves, or
+    None when the cache is unreadable so the caller can fall back."""
     try:
-        data = json.loads((Path(home) / "models_cache.json").read_text(encoding="utf-8"))
+        data = json.loads((_codex_home() / "models_cache.json").read_text(encoding="utf-8"))
         models = data.get("models") or []
     except (OSError, json.JSONDecodeError, ValueError):
         return None
@@ -204,6 +221,12 @@ def codex_context_window(model: str | None = None) -> int | None:
         slug = m.get("slug") or m.get("id") or m.get("model")
         cw = m.get("context_window") or m.get("max_context_window")
         if slug and isinstance(cw, int) and cw > 0:
+            auto_limit = m.get("auto_compact_token_limit")
+            effective_pct = m.get("effective_context_window_percent")
+            if isinstance(auto_limit, int) and auto_limit > 0:
+                cw = auto_limit
+            elif isinstance(effective_pct, (int, float)) and 0 < effective_pct <= 100:
+                cw = int(cw * effective_pct / 100)
             windows[str(slug)] = cw
     if not windows:
         return None
@@ -213,6 +236,100 @@ def codex_context_window(model: str | None = None) -> int | None:
             if effective_model == slug or effective_model.startswith(slug):
                 return cw
     return max(windows.values())
+
+
+def parse_codex_rollout_context(lines: Iterable[str]) -> CodexRolloutContext | None:
+    """Parse only context metadata from a Codex rollout JSONL fragment.
+
+    The public `exec --json` stream exposes turn-level usage, but the CLI's persisted
+    rollout also records `token_count` snapshots and `context_compacted` boundaries.
+    Reset the candidate at a boundary so a pre-compaction or summarization request can
+    never masquerade as the new active context.
+    """
+    usage: dict[str, int] | None = None
+    context_window: int | None = None
+    compacted = False
+    awaiting_measurement = False
+    saw_context_event = False
+
+    for line in lines:
+        # Rollouts also contain full prompts, tool results, and compacted replacement
+        # histories. Avoid JSON-decoding those potentially huge records when only two
+        # event-message variants matter here.
+        if '"event_msg"' not in line or not (
+            '"token_count"' in line or '"context_compacted"' in line
+        ):
+            continue
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "event_msg":
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type")
+        if event_type == "context_compacted":
+            saw_context_event = True
+            compacted = True
+            awaiting_measurement = True
+            usage = None
+            continue
+        if event_type != "token_count":
+            continue
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            continue
+        saw_context_event = True
+        window = info.get("model_context_window")
+        if isinstance(window, (int, float)) and window > 0:
+            context_window = int(window)
+        last = info.get("last_token_usage")
+        if not isinstance(last, dict):
+            continue
+        input_tokens = last.get("input_tokens")
+        if not isinstance(input_tokens, (int, float)) or input_tokens <= 0:
+            # Codex emits input=0 while producing the replacement summary. Wait for
+            # the first real model request that consumes the compacted history.
+            continue
+        usage = {
+            str(key): int(value)
+            for key, value in last.items()
+            if isinstance(value, (int, float))
+        }
+        awaiting_measurement = False
+
+    if not saw_context_event:
+        return None
+    return CodexRolloutContext(
+        usage=usage,
+        context_window=context_window,
+        compacted=compacted,
+        awaiting_measurement=awaiting_measurement,
+    )
+
+
+def _find_codex_rollout(thread_id: str) -> Path | None:
+    """Find the rollout owned by one validated Codex thread id."""
+    try:
+        safe_id = str(uuid.UUID(thread_id))
+    except (ValueError, AttributeError):
+        return None
+    sessions = _codex_home() / "sessions"
+    try:
+        matches = list(sessions.rglob(f"rollout-*-{safe_id}.jsonl"))
+    except OSError:
+        return None
+    if not matches:
+        return None
+    try:
+        return max(matches, key=lambda path: path.stat().st_mtime_ns)
+    except OSError:
+        return matches[-1]
 
 
 def _extract_codex_error(stdout: str) -> str:
@@ -314,6 +431,33 @@ def parse_codex_output(last_message_text: str, stdout: str) -> LLMResponse:
 class CodexCLIBackend(LLMBackend):
     def __init__(self, cfg: CodexCLIConfig | None = None) -> None:
         self.cfg = cfg or CodexCLIConfig()
+        # One append-only cursor per persistent Codex thread. This avoids rescanning
+        # a potentially huge rollout transcript after every `exec resume` call.
+        self._rollout_cursors: dict[str, _RolloutCursor] = {}
+
+    def _read_rollout_context(self, thread_id: str) -> CodexRolloutContext | None:
+        cursor = self._rollout_cursors.get(thread_id)
+        if cursor is None or not cursor.path.is_file():
+            path = _find_codex_rollout(thread_id)
+            if path is None:
+                return None
+            cursor = _RolloutCursor(path=path)
+            self._rollout_cursors[thread_id] = cursor
+        try:
+            # A replaced/truncated rollout invalidates the append cursor.
+            if cursor.path.stat().st_size < cursor.offset:
+                cursor.offset = 0
+            with cursor.path.open("rb") as fh:
+                fh.seek(cursor.offset)
+                # Parse incrementally instead of materializing an old, potentially
+                # very large rollout when a long-lived thread is first resumed.
+                snapshot = parse_codex_rollout_context(
+                    line.decode("utf-8", errors="replace") for line in fh
+                )
+                cursor.offset = fh.tell()
+            return snapshot
+        except OSError:
+            return None
 
     async def run(
         self,
@@ -361,6 +505,33 @@ class CodexCLIBackend(LLMBackend):
             if tid:
                 session.id = str(tid)
             session.started = True
+        thread_id = str((resp.raw or {}).get("thread_id") or (session.id if session else ""))
+        snapshot = self._read_rollout_context(thread_id) if thread_id else None
+        if snapshot is not None:
+            raw = dict(resp.raw or {})
+            raw.update(
+                {
+                    "context_usage_source": "codex_rollout",
+                    "context_compacted": snapshot.compacted,
+                    "context_awaiting_measurement": snapshot.awaiting_measurement,
+                    "model_context_window": snapshot.context_window,
+                }
+            )
+            resp.raw = raw
+            if snapshot.usage is not None:
+                # Codex input_tokens already includes its cached subset. Keep the
+                # turn.completed usage untouched for audit/billing and expose the
+                # live prompt separately for AgentLoop/UI context tracking.
+                resp.context_tokens = int(snapshot.usage.get("input_tokens", 0))
+            elif snapshot.awaiting_measurement:
+                resp.context_tokens = 0
+            resp.context_window = snapshot.context_window
+        else:
+            # Public stdout has no separately documented live-context field. Preserve
+            # the existing turn usage as an explicitly labelled estimate/fallback.
+            raw = dict(resp.raw or {})
+            raw["context_usage_source"] = "turn_completed_fallback"
+            resp.raw = raw
         return resp
 
     async def _run_once(

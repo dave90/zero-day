@@ -39,6 +39,13 @@ class LLMResponse:
     text: str
     usage: dict[str, int] = field(default_factory=dict)
     raw: dict[str, Any] | None = None
+    # Exact active-context occupancy when a provider exposes it separately from
+    # cumulative/billing usage. None preserves the legacy derivation from `usage`.
+    context_tokens: int | None = None
+    # Provider-reported effective context window for this session/turn. Most
+    # backends leave this unset and the UI uses its configured fallback; CLI
+    # backends fill it when their own runtime exposes a more accurate value.
+    context_window: int | None = None
 
 
 def context_tokens_from_usage(usage: dict[str, int] | None) -> int:

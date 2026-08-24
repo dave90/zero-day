@@ -73,6 +73,11 @@ class AgentLoop:
         # (orchestrator status bar + the per-subagent running view) to show
         # used/window. 0 until the first call (and with the echo test fixture).
         self.context_tokens = 0
+        # A backend may learn a more accurate per-session window at runtime (for
+        # example Codex's rollout token_count event reports the effective window,
+        # after its safety percentage has been applied). 0 means use the UI's
+        # configured backend fallback.
+        self.context_window = 0
 
     @property
     def turn(self) -> int:
@@ -121,6 +126,18 @@ class AgentLoop:
     def add_ask_user_answer(self, answer: str) -> None:
         self.history.append(Message(role="user", content=f"(ask_user answer) {answer}"))
 
+    def _record_context(self, resp) -> None:
+        """Replace this loop's live context snapshot from one backend response."""
+        tokens = getattr(resp, "context_tokens", None)
+        self.context_tokens = (
+            max(0, tokens)
+            if isinstance(tokens, int)
+            else context_tokens_from_usage(resp.usage)
+        )
+        window = getattr(resp, "context_window", None)
+        if isinstance(window, int) and window > 0:
+            self.context_window = window
+
     async def step(self) -> StepResult:
         """Ask the LLM for one envelope. Cancellable via asyncio.CancelledError."""
         if self._turn >= self.max_turns:
@@ -132,7 +149,7 @@ class AgentLoop:
                 self._wrapped_up = True
                 self.history.append(Message(role="user", content=self.wrapup_prompt))
                 resp = await self._invoke()
-                self.context_tokens = context_tokens_from_usage(resp.usage)
+                self._record_context(resp)
                 self.history.append(Message(role="assistant", content=resp.text))
                 self._mark_synced()
                 try:
@@ -162,7 +179,7 @@ class AgentLoop:
         ):
             self.history.append(Message(role="user", content=self.reminder_text))
         resp = await self._invoke()
-        self.context_tokens = context_tokens_from_usage(resp.usage)
+        self._record_context(resp)
         try:
             env = parse_envelope(resp.text)
         except EnvelopeError as e:
@@ -172,7 +189,7 @@ class AgentLoop:
                 Message(role="user", content=f"{RETRY_REMINDER}\n\nReason: {e}")
             )
             resp2 = await self._invoke()
-            self.context_tokens = context_tokens_from_usage(resp2.usage)
+            self._record_context(resp2)
             env = parse_envelope(resp2.text)
             self.history.append(Message(role="assistant", content=resp2.text))
             self._mark_synced()

@@ -16,6 +16,7 @@ from zero.llm.claude_code import (
     build_user_prompt,
     looks_like_native_tool_drift,
     parse_claude_json,
+    parse_claude_stream_json,
     scrub_claude_code_env,
 )
 
@@ -38,6 +39,8 @@ def test_mode_a_argv_keeps_big_strings_off_the_command_line():
     assert "--system-prompt" not in argv     # the inline (huge-argv) variant is gone
     assert _argval(argv, "--system-prompt-file") == "/tmp/sys.md"
     assert _argval(argv, "--setting-sources") == "user"
+    assert _argval(argv, "--output-format") == "stream-json"
+    assert "--verbose" in argv
     # Nothing on the command line should be a large string (the body/system prompt).
     assert all(len(a) < 200 for a in argv), argv
 
@@ -200,6 +203,99 @@ def test_parse_text_fallback():
     out = json.dumps({"text": "hello"})
     resp = parse_claude_json(out)
     assert resp.text == "hello"
+
+
+def _claude_stream(*objects):
+    return "\n".join(json.dumps(obj) for obj in objects)
+
+
+def _assistant_event(*, text, usage, model="claude-opus-5", parent=None):
+    return {
+        "type": "assistant",
+        "parent_tool_use_id": parent,
+        "message": {
+            "id": "msg-1",
+            "model": model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": usage,
+        },
+    }
+
+
+def test_parse_stream_uses_latest_assistant_for_context_but_result_for_audit():
+    assistant_usage = {
+        "input_tokens": 1200,
+        "cache_creation_input_tokens": 3000,
+        "cache_read_input_tokens": 9000,
+        "output_tokens": 80,
+    }
+    cumulative_usage = {
+        "input_tokens": 5000,
+        "cache_creation_input_tokens": 20_000,
+        "cache_read_input_tokens": 100_000,
+        "output_tokens": 500,
+    }
+    stdout = _claude_stream(
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        _assistant_event(text="answer", usage=assistant_usage),
+        {
+            "type": "result",
+            "result": '{"type":"final","answer":"done"}',
+            "usage": cumulative_usage,
+            "modelUsage": {"claude-opus-5": {"contextWindow": 1_000_000}},
+        },
+    )
+
+    resp = parse_claude_stream_json(stdout)
+    assert resp.context_tokens == 13_200
+    assert resp.context_window == 1_000_000
+    assert resp.usage == cumulative_usage
+    assert (resp.raw or {})["context_usage_source"] == "assistant"
+
+
+def test_parse_stream_resets_candidate_at_compact_boundary():
+    stdout = _claude_stream(
+        _assistant_event(
+            text="old",
+            usage={"input_tokens": 7000, "cache_read_input_tokens": 760_000},
+        ),
+        {"type": "system", "subtype": "compact_boundary", "compact_metadata": {}},
+        _assistant_event(
+            text="new",
+            usage={
+                "input_tokens": 1268,
+                "cache_creation_input_tokens": 2000,
+                "cache_read_input_tokens": 10_000,
+            },
+        ),
+        {
+            "type": "result",
+            "result": '{"type":"final","answer":"done"}',
+            "usage": {"input_tokens": 900_000},
+        },
+    )
+
+    resp = parse_claude_stream_json(stdout)
+    assert resp.context_tokens == 13_268
+    assert resp.usage["input_tokens"] == 900_000  # cumulative audit usage is preserved
+    assert (resp.raw or {})["context_compacted"] is True
+
+
+def test_parse_stream_does_not_use_precompact_or_subagent_usage():
+    stdout = _claude_stream(
+        _assistant_event(text="old", usage={"input_tokens": 190_000}),
+        {"type": "system", "subtype": "compact_boundary"},
+        _assistant_event(
+            text="child", usage={"input_tokens": 180_000}, parent="tool-use-1"
+        ),
+        {"type": "result", "result": '{"type":"final","answer":"done"}',
+         "usage": {"input_tokens": 370_000}},
+    )
+
+    resp = parse_claude_stream_json(stdout)
+    assert resp.context_tokens == 0
+    assert (resp.raw or {})["context_usage_source"] == "awaiting_post_compaction"
 
 
 def test_parse_rejects_non_json():

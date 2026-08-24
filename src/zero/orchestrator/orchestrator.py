@@ -257,9 +257,11 @@ class OrchestratorConfig:
 class Orchestrator:
     def __init__(self, cfg: OrchestratorConfig) -> None:
         self.cfg = cfg
+        self._context_window_explicit = self.cfg.context_window is not None
         # Resolve the UI context-window denominator now (once) when left on auto, so the
-        # ctx% reflects the ACTUAL backend's window — Codex (~272k) is far below Claude's
-        # 1M, and a stale denominator would mislead. An explicit value is left untouched.
+        # ctx% reflects the ACTUAL backend's window — Codex's effective runtime limit
+        # is far below Claude's 1M, and a stale denominator would mislead. An explicit
+        # value is left untouched.
         if self.cfg.context_window is None:
             self.cfg.context_window = self._resolve_context_window()
         # Resolve the read-only-fs jail root to an absolute host path (relative to
@@ -377,10 +379,10 @@ class Orchestrator:
     def _resolve_context_window(self) -> int:
         """The UI ctx denominator for the configured backend, resolved at startup.
 
-        Codex exposes its real per-model window in its on-disk model cache (read at
-        runtime) — typically ~272k, far below Claude's 1M; we fall back to 272k if the
-        cache is unreadable. Claude can't report its window, so we infer it from the
-        model id (1M for a '[1m]' variant, else the standard 200k)."""
+        Codex exposes its effective per-model window in its on-disk model cache (read
+        at runtime), and each rollout can replace that startup value with the window
+        used by the actual turn. Claude's result can likewise replace the model-id
+        inference (1M for a '[1m]' variant, else the standard 200k)."""
         if self.cfg.backend == "codex":
             from zero.llm.codex_cli import codex_context_window
 
@@ -2540,7 +2542,12 @@ class Orchestrator:
                 running_validators=rv,
                 # The top-level agent's (orchestrator / mode-a) context-window usage.
                 context_tokens=getattr(self._active_loop, "context_tokens", 0),
-                context_window=self.cfg.context_window,
+                context_window=(
+                    self.cfg.context_window
+                    if self._context_window_explicit
+                    else getattr(self._active_loop, "context_window", 0)
+                    or self.cfg.context_window
+                ),
             )
         )
 

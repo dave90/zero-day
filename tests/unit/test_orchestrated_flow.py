@@ -831,6 +831,27 @@ async def test_status_carries_context_window(tmp_path: Path, monkeypatch):
     assert all(s.context_window == 1_000_000 for s in statuses)  # wired from cfg
 
 
+async def test_status_prefers_runtime_context_window_when_auto(tmp_path: Path):
+    """An auto-resolved startup estimate yields to the window reported by the
+    active CLI session; an explicit --context-window remains covered above."""
+    orch = Orchestrator(OrchestratorConfig(
+        cwd=tmp_path, backend="echo", context_window=None, use_container=False,
+    ))
+    orch._active_loop = type(
+        "RuntimeLoop",
+        (),
+        {"context_tokens": 95_893, "context_window": 258_400},
+    )()
+
+    await orch._emit_status(turn=3, mode="c")
+    status = await orch.ui_queue.get()
+    orch.audit.close()
+
+    assert isinstance(status, Status)
+    assert status.context_tokens == 95_893
+    assert status.context_window == 258_400
+
+
 async def test_context_window_resolved_backend_aware(tmp_path: Path, monkeypatch):
     """When left on auto (None), the ctx denominator is resolved per backend at startup:
     Claude infers it from the model id; Codex reads its real window from the model cache.
@@ -846,11 +867,15 @@ async def test_context_window_resolved_backend_aware(tmp_path: Path, monkeypatch
     # Codex → read from a temp model cache (no dependency on the real ~/.codex).
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     (tmp_path / "models_cache.json").write_text(
-        json.dumps({"models": [{"slug": "gpt-5.5", "context_window": 272000}]}),
+        json.dumps({"models": [{
+            "slug": "gpt-5.5",
+            "context_window": 272000,
+            "effective_context_window_percent": 95,
+        }]}),
         encoding="utf-8",
     )
     ocx = Orchestrator(OrchestratorConfig(cwd=tmp_path, backend="codex", use_container=False))
-    assert ocx.cfg.context_window == 272000
+    assert ocx.cfg.context_window == 258400
 
     # Explicit value is left untouched.
     oexp = Orchestrator(OrchestratorConfig(

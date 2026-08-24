@@ -140,6 +140,12 @@ def test_spinner_frame_is_one_braille_glyph():
     assert theme.spinner_frame() in theme.SPINNER_FRAMES
 
 
+def test_thinking_dots_cycles_on_toolbar_refresh(monkeypatch):
+    for now, expected in ((0.0, "."), (0.5, ".."), (1.0, "..."), (1.5, ".")):
+        monkeypatch.setattr(theme.time, "monotonic", lambda now=now: now)
+        assert theme.thinking_dots() == expected
+
+
 # ----------------------------------------------------- markdown rendering
 
 def test_has_markdown_detects_constructs_and_ignores_plain():

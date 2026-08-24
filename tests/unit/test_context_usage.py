@@ -49,3 +49,21 @@ async def test_agent_loop_tracks_context_tokens():
     assert loop.context_tokens == 0   # before any call
     await loop.step()
     assert loop.context_tokens == 15000  # 3000 + 12000
+
+
+class _SnapshotBackend(LLMBackend):
+    async def run(self, system_prompt, messages, tools):
+        env = json.dumps({"type": "final", "answer": "done"})
+        return LLMResponse(
+            text=env,
+            usage={"input_tokens": 900_000},  # cumulative turn/billing usage
+            context_tokens=13_268,
+            context_window=258_400,
+        )
+
+
+async def test_agent_loop_prefers_explicit_provider_context_snapshot():
+    loop = AgentLoop(_SnapshotBackend(), system_prompt="sys", tools=[])
+    await loop.step()
+    assert loop.context_tokens == 13_268
+    assert loop.context_window == 258_400

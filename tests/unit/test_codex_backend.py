@@ -18,6 +18,7 @@ from zero.llm.codex_cli import (
     codex_context_window,
     codex_effective_model,
     codex_model,
+    parse_codex_rollout_context,
     parse_codex_output,
 )
 
@@ -122,6 +123,27 @@ def test_codex_context_window_reads_cache(tmp_path, monkeypatch):
     assert codex_context_window() == 272000               # no model → largest cached
 
 
+def test_codex_context_window_applies_effective_percentage_and_compact_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_models_cache(tmp_path, [
+        {
+            "slug": "gpt-5.6-sol",
+            "context_window": 272000,
+            "effective_context_window_percent": 95,
+        },
+        {
+            "slug": "gpt-custom",
+            "context_window": 500000,
+            "effective_context_window_percent": 90,
+            "auto_compact_token_limit": 333000,
+        },
+    ])
+    assert codex_context_window("gpt-5.6-sol") == 258400
+    assert codex_context_window("gpt-custom") == 333000
+
+
 def test_codex_context_window_uses_configured_model(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     (tmp_path / "config.toml").write_text('model = "gpt-5.6-luna"\n', encoding="utf-8")
@@ -188,6 +210,65 @@ def test_usage_maps_cached_to_cache_read_without_double_counting():
     assert (resp.raw or {})["usage"]["cached_input_tokens"] == 9600
 
 
+def _rollout_event(payload):
+    return json.dumps({"type": "event_msg", "payload": payload})
+
+
+def test_parse_rollout_uses_first_real_snapshot_after_compaction():
+    lines = [
+        _rollout_event({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 236570, "cached_input_tokens": 220000},
+                "model_context_window": 258400,
+            },
+        }),
+        # Summary generation: output exists, but input=0 is not the replacement prompt.
+        _rollout_event({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 0, "output_tokens": 79303},
+                "model_context_window": 258400,
+            },
+        }),
+        _rollout_event({"type": "context_compacted"}),
+        _rollout_event({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 78962,
+                    "cached_input_tokens": 74000,
+                    "output_tokens": 160,
+                },
+                "model_context_window": 258400,
+            },
+        }),
+    ]
+
+    snapshot = parse_codex_rollout_context(lines)
+    assert snapshot is not None
+    assert snapshot.compacted is True
+    assert snapshot.awaiting_measurement is False
+    assert snapshot.context_window == 258400
+    assert snapshot.usage and snapshot.usage["input_tokens"] == 78962
+
+
+def test_parse_rollout_marks_compaction_pending_without_followup_request():
+    snapshot = parse_codex_rollout_context([
+        _rollout_event({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 220000},
+                "model_context_window": 258400,
+            },
+        }),
+        _rollout_event({"type": "context_compacted"}),
+    ])
+    assert snapshot is not None
+    assert snapshot.usage is None
+    assert snapshot.awaiting_measurement is True
+
+
 # ------------------------------------------------------- subprocess-level (run)
 
 class _FakeProc:
@@ -214,6 +295,9 @@ def _patch_exec(monkeypatch, *, stdout, last_message, returncode=0):
     from zero.llm import codex_cli as cx
 
     monkeypatch.setattr(cx.shutil, "which", lambda b: "/usr/bin/codex")
+    # Keep captured real thread IDs from accidentally resolving a developer's actual
+    # ~/.codex rollout during these offline subprocess tests.
+    monkeypatch.setenv("CODEX_HOME", "/__zero_test_missing_codex_home__")
     captured: dict = {}
 
     async def fake_exec(*argv, **kwargs):
@@ -225,6 +309,14 @@ def _patch_exec(monkeypatch, *, stdout, last_message, returncode=0):
 
     monkeypatch.setattr(cx.asyncio, "create_subprocess_exec", fake_exec)
     return captured
+
+
+def _write_rollout(tmp_path, thread_id, lines):
+    directory = tmp_path / "sessions" / "2026" / "08" / "20"
+    directory.mkdir(parents=True)
+    path = directory / f"rollout-2026-08-20T12-00-00-{thread_id}.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 async def test_run_keeps_command_line_tiny_with_huge_prompt(monkeypatch):
@@ -254,6 +346,46 @@ async def test_run_drops_claude_model_from_argv(monkeypatch):
     await backend.run("sys", [Message(role="user", content="hi")], [])
     assert "--model" not in captured["argv"]
     assert "claude-opus-5[1m]" not in captured["argv"]
+
+
+async def test_run_uses_rollout_context_without_replacing_turn_audit_usage(
+    tmp_path, monkeypatch
+):
+    turn_usage = {
+        "input_tokens": 900000,
+        "cached_input_tokens": 800000,
+        "output_tokens": 5000,
+    }
+    _patch_exec(
+        monkeypatch,
+        stdout=_codex_stdout(usage=turn_usage),
+        last_message=_ENVELOPE,
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _THREAD_ID, [
+        _rollout_event({"type": "context_compacted"}),
+        _rollout_event({
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 95893,
+                    "cached_input_tokens": 90000,
+                    "output_tokens": 200,
+                },
+                "model_context_window": 258400,
+            },
+        }),
+    ])
+
+    resp = await CodexCLIBackend().run(
+        "sys", [Message(role="user", content="hi")], []
+    )
+    assert resp.context_tokens == 95893
+    assert resp.context_window == 258400
+    # turn.completed remains the billing/audit usage; context is a separate snapshot.
+    assert resp.usage["input_tokens"] + resp.usage["cache_read_input_tokens"] == 900000
+    assert (resp.raw or {})["context_usage_source"] == "codex_rollout"
+    assert (resp.raw or {})["context_compacted"] is True
 
 
 async def test_run_nonzero_exit_surfaces_jsonl_error(monkeypatch):

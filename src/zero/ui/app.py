@@ -34,6 +34,7 @@ from zero.ui import theme
 from zero.ui.commands import build_default_registry
 from zero.ui.events import (
     ActivityLine,
+    AgentTextDelta,
     ApprovalPrompt,
     AskUser,
     RalphIteration,
@@ -48,6 +49,8 @@ from zero.ui.events import (
     ToolObservation,
     ToolProposal,
     ToolRunning,
+    TurnCancelled,
+    TurnStart,
 )
 from zero.ui.render import fmt_context, ralph_status_label, render_event, short_reason
 
@@ -56,6 +59,11 @@ if TYPE_CHECKING:
 
 
 _DOUBLE_CTRLC_WINDOW_SEC = 2.0
+_THINKING_LABELS = {
+    "orchestrator": "zero",
+    "analyzer": "ralph · analyzer",
+    "analyzer_validator": "ralph · validator",
+}
 
 
 class ZeroUI:
@@ -78,6 +86,11 @@ class ZeroUI:
         # indicator in the toolbar (ticks via the 0.5s refresh) so a long tool call
         # doesn't look like a hang. Populated on ToolRunning, cleared on ToolObservation.
         self._running_tools: dict[str, dict] = {}
+        # The orchestrator and Ralph planning roles emit TurnStart immediately before
+        # each blocking LLM call. Keep that wait in the live toolbar so `thinking.`,
+        # `thinking..`, `thinking...` can animate instead of leaving a static line.
+        self._thinking_agent: str | None = None
+        self._thinking_turn: int | None = None
         # Live subagent list navigation (↑/↓ select, Enter expand/collapse).
         self._sel_idx = 0
         self._sel_expanded = False
@@ -160,12 +173,20 @@ class ZeroUI:
         # The bar below the input line (its twin above is in _prompt_message).
         row(theme.rule(self._term_width()))
 
+        if self._thinking_agent is not None and self._thinking_turn is not None:
+            row(
+                ("class:accent", f" {_THINKING_LABELS[self._thinking_agent]}"),
+                ("class:dim", f" · turn {self._thinking_turn} · thinking"),
+                ("class:accent", theme.thinking_dots()),
+            )
+
         snap = self._running_snapshot()
         if snap:
             if self._sel_idx >= len(snap):
                 self._sel_idx = len(snap) - 1
             width = self._term_width()
-            window = getattr(getattr(self.orch, "cfg", None), "context_window", 0)
+            configured_window = getattr(getattr(self.orch, "cfg", None), "context_window", 0)
+            window_is_explicit = getattr(self.orch, "_context_window_explicit", False)
             spin = theme.spinner_frame()
             for i, s in enumerate(snap[:8]):
                 selected = i == self._sel_idx
@@ -173,6 +194,11 @@ class ZeroUI:
                 # Long gruyere-style targets would eat the row — keep the tail.
                 tgt = self._short(s["target"], 28)
                 idea = self._short(s["idea"], 44)
+                window = (
+                    configured_window
+                    if window_is_explicit
+                    else s.get("context_window", 0) or configured_window
+                )
                 ctx = fmt_context(s.get("context_tokens", 0), window)
                 ctx_seg = f" · {ctx}" if ctx else ""
                 marker_cls = "class:toolbar.sel" if selected else "class:dim"
@@ -500,6 +526,8 @@ class ZeroUI:
         while True:
             ev = await self.orch.ui_queue.get()
             if isinstance(ev, SessionEnd):
+                self._thinking_agent = None
+                self._thinking_turn = None
                 self._flush_stream(stream_buf)
                 self._flush_buffer()
                 self._print(list(render_event(ev)))
@@ -508,6 +536,30 @@ class ZeroUI:
                 if app.is_running:
                     app.exit()
                 return
+
+            # An inline scrollback line cannot animate in place, while the toolbar
+            # is redrawn every 0.5 s. Keep supported top-level/Ralph roles there until
+            # the matching turn status (or an error/cancel response) arrives.
+            if isinstance(ev, TurnStart) and ev.agent in _THINKING_LABELS:
+                self._thinking_agent = ev.agent
+                self._thinking_turn = ev.turn
+                self._invalidate()
+                continue
+
+            if self._thinking_agent is not None and self._thinking_turn is not None:
+                turn_resolved = (
+                    isinstance(ev, Status)
+                    and ev.turn >= self._thinking_turn
+                ) or (
+                    isinstance(ev, ReasoningSummary)
+                    and ev.agent == self._thinking_agent
+                    and ev.turn >= self._thinking_turn
+                )
+                turn_interrupted = isinstance(ev, (AgentTextDelta, TurnCancelled))
+                if turn_resolved or turn_interrupted:
+                    self._thinking_agent = None
+                    self._thinking_turn = None
+                    self._invalidate()
 
             # Coalesce streamed agent text (the orchestrator's thinking).
             if ev.kind == "agent_text_delta":

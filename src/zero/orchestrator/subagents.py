@@ -269,6 +269,7 @@ class SubagentManager:
                     # Context-window tokens used by this subagent's last LLM call
                     # (the live AgentLoop tracks it). The UI shows used/window.
                     "context_tokens": getattr(r.loop, "context_tokens", 0),
+                    "context_window": getattr(r.loop, "context_window", 0),
                 }
             )
         return out

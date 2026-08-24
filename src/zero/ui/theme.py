@@ -98,6 +98,7 @@ RUN = "⟳"
 HOURGLASS = "⏳"
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+THINKING_FRAMES = (".", "..", "...")
 BAR_FILL = "▰"
 BAR_EMPTY = "▱"
 
@@ -241,6 +242,11 @@ def spinner_frame() -> str:
     """A Braille spinner frame chosen from the wall clock, so successive toolbar
     refreshes (every 0.5 s) visibly rotate it while agents are working."""
     return SPINNER_FRAMES[int(time.monotonic() * 8) % len(SPINNER_FRAMES)]
+
+
+def thinking_dots() -> str:
+    """Cycle through `.`, `..`, `...` on each 0.5-second toolbar refresh."""
+    return THINKING_FRAMES[int(time.monotonic() * 2) % len(THINKING_FRAMES)]
 
 
 def ctx_bar(used: int, window: int, *, width: int = 8) -> FormattedText:
