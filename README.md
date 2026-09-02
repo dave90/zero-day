@@ -1,5 +1,14 @@
 # zero
 
+```text
+ ███████╗███████╗██████╗  ██████╗
+ ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗
+   ███╔╝ █████╗  ██████╔╝██║   ██║
+  ███╔╝  ██╔══╝  ██╔══██╗██║   ██║
+ ███████╗███████╗██║  ██║╚██████╔╝
+ ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝
+```
+
 > Autonomous agent system for web-app pentesting and bug-bounty work — structurally similar to Claude Code, but for offensive security.
 
 This repository tracks the implementation of `zero` as described in
