@@ -20,6 +20,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# The minimal Kali base does not currently include a CA bundle. Its default HTTP
+# mirror redirector can select an HTTPS mirror, making the very first apt install
+# fail certificate verification before `ca-certificates` can be installed.
+# Bootstrap the signed CA package from Kali's official archive over HTTP, then use
+# that same official archive over HTTPS for every remaining package download.
+RUN sed -i 's|http://http.kali.org/kali/|http://archive.kali.org/kali/|' \
+        /etc/apt/sources.list.d/kali.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && sed -i 's|http://archive.kali.org/kali/|https://archive.kali.org/kali/|' \
+        /etc/apt/sources.list.d/kali.sources \
+    && rm -rf /var/lib/apt/lists/*
+
 # Mandatory layer: the runtime we actually need for the RPC server +
 # Mode A's claude CLI.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -55,7 +68,13 @@ RUN apt-get update && for pkg in wordlists dirb dirbuster seclists; do \
 
 # jwt_tool (ticarpi) is NOT an apt package — install it from source and expose a
 # `jwt_tool` launcher on PATH (the JwtTool wrapper invokes `jwt_tool <token> <mode>`).
+# jwt_tool 2.3.0's config writer relies on ConfigParser accepting `:` inside a
+# comment-like key. Python 3.14 rejects that unless `=` is the only delimiter.
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool \
+    && sed -i "s/configparser.ConfigParser(allow_no_value=True)/configparser.ConfigParser(allow_no_value=True, delimiters=('=',))/" \
+        /opt/jwt_tool/jwt_tool.py \
+    && grep -Fq "ConfigParser(allow_no_value=True, delimiters=('=',))" \
+        /opt/jwt_tool/jwt_tool.py \
     && python3 -m pip install --break-system-packages --no-cache-dir \
         -r /opt/jwt_tool/requirements.txt \
     && printf '#!/bin/sh\nexec python3 /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool \
@@ -63,8 +82,11 @@ RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool \
     # First run only creates ~/.jwt_tool/jwtconf.ini and exits without analyzing
     # the token. Bake that config into the image now so the agent's FIRST real
     # jwt_tool call decodes immediately instead of wasting a turn on config setup.
-    && jwt_tool "eyJhbGciOiJIUzI1NiJ9.e30.x" >/dev/null 2>&1 || true \
-    && test -f /root/.jwt_tool/jwtconf.ini \
+    && (jwt_tool "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJsb2dpbiI6InRpY2FycGkifQ.bsSwqj2c2uI9n7-ajmi3ixVGhPUiY7jO9SUn9dm15Po" \
+        >/dev/null 2>&1 || true) \
+    && grep -q '^\[argvals\]' /root/.jwt_tool/jwtconf.ini \
+    && jwt_tool "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJsb2dpbiI6InRpY2FycGkifQ.bsSwqj2c2uI9n7-ajmi3ixVGhPUiY7jO9SUn9dm15Po" \
+        2>/dev/null | grep -q 'login' \
     && echo "OK: jwt_tool installed + config seeded" \
     || echo "WARN: jwt_tool not installed/seeded — jwt_tool calls may misbehave"
 
