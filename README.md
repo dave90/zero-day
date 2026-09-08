@@ -44,6 +44,9 @@ writes the evidence to a local report—all from an interactive terminal.
 - [`uv`](https://docs.astral.sh/uv/)
 - An authenticated OpenAI Codex CLI (`codex` on `PATH`), or Claude Code when using
   `--backend claude`
+- Select the model you want in Codex or Claude Code before starting `zero`. The default Codex
+  backend uses the model configured in Codex. To use the model selected in Claude Code, run with
+  `--backend claude --model ''`; otherwise the Claude backend pins its documented default model.
 - Docker for the recommended sandboxed setup (allow roughly 6 GB for the Kali image)
 
 ### Install
