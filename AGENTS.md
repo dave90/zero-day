@@ -1,11 +1,11 @@
-# CLAUDE.md
+# AGENTS.md
 
 Guidance for working on the **`zero`** codebase. (This is developer guidance for
 the repo — *not* `pentest.md`, which is the per-engagement scope/creds file the
 agents read at runtime. Don't conflate the two.)
 
 `zero` is an autonomous web-app pentest / bug-bounty agent system — structurally
-like Claude Code, but for offensive security. Deep detail lives in
+like Codex, but for offensive security. Deep detail lives in
 [`architecture.md`](architecture.md) (as-built reference) and
 [`README.md`](README.md) (user-facing). Read those before large changes.
 
@@ -17,13 +17,13 @@ importable otherwise; bare `python -m pytest` fails with `No module named 'zero'
 ```bash
 uv sync                                   # create .venv + install deps
 uv run pytest -q                          # DEFAULT: unit + docker sandbox tests (free, no tokens)
-uv run pytest -m live                      # opt-in: token-spending live LLM runs (claude + gruyere)
+uv run pytest -m live                      # opt-in: token-spending live LLM runs
 uv run pytest tests/unit -q                # only the offline unit tests (no Docker)
 uv run pytest tests/unit/test_x.py -q     # one file
 uv run ruff check .                       # lint (line-length 100, target py311)
 uv build                                  # wheel + sdist into dist/
 
-# Run the app (needs `claude` CLI authenticated + the sandbox image):
+# Run the app (needs authenticated `codex` or `claude` + the sandbox image):
 uv run zero init                          # scaffold pentest.md + .pentest/
 uv run zero run --goal "..."              # interactive session (mode c default)
 uv run zero replay <audit.jsonl>          # re-drive a recorded run
@@ -32,27 +32,29 @@ docker build -t zero-sandbox:latest -f docker/Dockerfile .   # build sandbox (co
 
 **Test split (two buckets):**
 - **`tests/unit/`** — offline & free: pure logic + the orchestrator/subagent flow
-  tests driven by `ScriptedBackend`/`EchoBackend` (no network, no `claude`),
+  tests driven by `ScriptedBackend`/`EchoBackend` (no network or model CLI),
   asserting on the JSONL audit log.
-- **`tests/e2e/`** — *real* tests: Docker sandbox tests (each tool actually runs
-  in the `zero-sandbox` container — free, need the built image) and **live** runs
-  that shell out to `claude` and **cost tokens**.
+- **`tests/e2e/`** — Docker sandbox integration checks (free, need the built
+  image) and **live** runs that shell out to the selected model CLI and
+  **cost tokens**.
 
 **Default `uv run pytest` = unit + docker, and never spends tokens:**
 `addopts = -m 'not live'` excludes the live runs; opt in with **`-m live`** (a
 command-line `-m` overrides the default filter). Docker tests skip with a
 build-hint reason when the image isn't present. **Tests are async**
-(`asyncio_mode = "auto"` — no `@pytest.mark.asyncio`). Every registered tool has a
-sandbox test in `tests/e2e/test_tools_in_sandbox.py`; a registry-driven guard
-(`test_every_registered_tool_has_sandbox_coverage`) fails if a new tool lacks one.
+(`asyncio_mode = "auto"` — no `@pytest.mark.asyncio`). A registry-driven guard in
+`tests/e2e/test_tools_in_sandbox.py`
+(`test_every_registered_tool_has_sandbox_coverage`) requires each tool to have an
+execution, binary/dependency presence check, or explicit host-only/intercepted
+exception.
 
 **Capability regression** (`tests/regression/`, marker `regression`, also `live`)
 stands known-vulnerable docker targets up (manifest in
 `tests/regression/manifest.py`) and asserts `zero` *confirms* the known vuln —
 guards finding ability, not just plumbing. Opt-in `uv run pytest -m regression`
 (runs ALL targets in one go — overrides the default `-m 'not live'`; add `-k
-<name>` to narrow to one), needs `claude` + the sandbox image; the offline matcher
-is unit-tested in `tests/unit/test_regression_assertions.py`. Add a target →
+<name>` to narrow to one), needs the selected model CLI + the sandbox image. The
+offline matcher is unit-tested in `tests/unit/test_regression_assertions.py`. Add a target →
 append a `TargetSpec` (verify the image is pullable first).
 
 ## Architecture in one screen
@@ -64,22 +66,36 @@ append a `TargetSpec` (verify the image is pullable first).
 - **Execution modes** (`--execution-mode`, default **`c`**):
   - `c` orchestrated — a senior-pentester **Orchestrator** recons directly and
     dispatches concurrent **pentester** + **validator** subagents.
-  - `a` single Pentest agent; `b` MCP-delegated (`claude` runs its own loop).
+  - `a` single Pentest agent with background validators; `b` MCP-delegated
+    (Claude Code runs its own loop, regardless of `--backend`).
+- **Backends:** `--backend codex` is the default; `--backend claude` is also
+  supported for modes `a`/`c`. Both support persistent per-actor CLI sessions.
 - **Agent loop** (`agents/base.py`): one step per turn. The LLM returns a flat,
-  `type`-tagged JSON **envelope** — `{"type":"action"|"ask_user"|"final", ...}`
+  `type`-tagged JSON **envelope** — `{"type":"action"|"actions"|"ask_user"|"final", ...}`
   (`llm/envelope.py`). The caller runs the tool/answers, appends an observation,
   loops.
 - **Subagents** (`orchestrator/subagents.py`, `tools/dispatch.py`): dispatched via
   `dispatch_pentester` / `dispatch_validator` / `await_subagents` / `finalize`
   (orchestrator-only tools, never in `default_registry`). Bounded by
-  `--pentester-max-turns` (14), `--subagent-deadline` (1200s total wall-clock),
-  `--llm-timeout` (900s per `claude -p` call — shared with the orchestrator's own
-  backend, one value for all), `--max-subagents` (10).
+  `--pentester-max-turns` (14), `--subagent-deadline` (1200s, checked between turns),
+  `--llm-timeout` (900s per model CLI call — shared with the orchestrator's own
+  backend), `--max-subagents` (10 concurrent), and `--max-total-subagents`
+  (0 = unlimited total for a subagent manager).
 - **Validation handoff** (`orchestrator/router.py`): only a Validator subagent
   confirms/rejects a finding; the orchestrator can't self-confirm.
 - **Findings** (`findings/`): `.pentest/findings/{confirmed,rejected,pending}/<10-hex-id>.md`
   + `index.json`; verdicts are exactly `confirmed|rejected|pending`; deduped on
-  `(normalized_endpoint, cwe, payload_shape, method)`.
+  `(normalized_endpoint, cwe, payload_shape, method)`. Reports include confirmed,
+  rejected, and pending findings, plus unsuccessful attempts in orchestrated mode.
+- **Ralph** (`ralph/`): optional outer workflow with analyzer/reviewer planning,
+  an operator plan checkpoint, bounded orchestrated passes, completion review,
+  durable progress, and resume support. The plan checkpoint is on by default.
+  State lives in `.ralph/`, snapshots and
+  the cumulative report in `.ralph_logs/`; findings carry across passes.
+- **Custom tools:** engagement-local scripts live under
+  `<files-root>/custom_tools/`. Management is orchestrator-only; listing and
+  execution are registry tools shared by the agents. See `tools/custom_tools.py`
+  and `tools/_customtools.py` for the catalog/storage split.
 
 ## Code map
 
@@ -89,8 +105,9 @@ append a `TargetSpec` (verify the image is pullable first).
 | `src/zero/orchestrator/orchestrator.py` | The core loop (all 3 modes), subagent runners, validation, UI event emit. Big file — start here. |
 | `src/zero/orchestrator/subagents.py` | `SubagentManager` (concurrency, await, results). `SUMMARY_MAX_CHARS`. |
 | `src/zero/orchestrator/{approval,ask_user_governor,rate_limit,router,context,audit,thinking}.py` | Gate, ask-user policy, per-host rate limit, validator handoff, `pentest.md` loader, logs. |
-| `src/zero/agents/` | `base.py` (AgentLoop), `pentest.py` / `validator.py` / `orchestrator_agent.py` builders + `prompts/*.md`. |
-| `src/zero/llm/` | `ClaudeCodeBackend` (Mode A), `ClaudeCodeBackendModeB` (MCP), `echo`/`replay` fixtures, `mcp_*`. |
+| `src/zero/agents/` | `base.py` (AgentLoop), pentest/validator/orchestrator and Ralph analyzer/reviewer builders + `prompts/*.md`. |
+| `src/zero/llm/` | `CodexCLIBackend` (default), `ClaudeCodeBackend` (both Mode A), `ClaudeCodeBackendModeB` (MCP), `echo`/`replay` fixtures, `mcp_*`. |
+| `src/zero/ralph/` | Outer planning/iteration driver, PRD task model, progress journal, evidence dossiers, snapshots/resume. |
 | `src/zero/tools/` | One file per tool + `registry.py` (`default_registry`), `base.py` (`Tool`, `RiskLevel`), `remote.py` (RPC proxy), `dispatch.py`. |
 | `src/zero/container/` | `manager.py` (docker run/stop), `rpc.py` (host RPC client). Server is baked into the image (`docker/`). |
 | `src/zero/traffic/` | Burp XML parser + `TrafficStore` (file export only). |
@@ -120,21 +137,22 @@ append a `TargetSpec` (verify the image is pullable first).
   pentester/validator subagent) gets its own **persistent** interpreter keyed by a
   `session_id` the orchestrator injects in `_invoke_tool` (the LLM never sets it) —
   globals/imports persist across that actor's calls; concurrent subagents are
-  isolated. No per-call timeout (bounded by `--subagent-deadline`). Workers live in
+  isolated. Calls yield after a soft wait while work continues; polling and
+  cancellation are supported. The wait is not a hard execution timeout, and the
+  subagent deadline is checked between turns. Workers live in
   the sandbox (die with it) or on the host (reaped by `_close_tool_sessions` on
   exit). Changing the tool means rebuilding the image (it's baked in). To add a
   library, agents use the **`pip_install`** tool (non-interactive, hard-timeout,
-  spec-sanitized) — NOT `pip` inside `python_exec` (that would hang the no-timeout
-  session). Common libs (pdfminer.six, pypdf, bs4, cryptography) are pre-baked.
+  spec-sanitized). Common libs (pdfminer.six, pypdf, bs4, cryptography) are pre-baked.
 - **Anything that serves/listens goes through `python_bg`, not `python_exec`.**
-  `python_exec` has no per-call timeout, so a `serve_forever()` / blocking
-  `accept()` there hangs the turn forever. `python_bg` runs detached
+  Long-lived work occupies the persistent `python_exec` worker even after a call
+  yields. `python_bg` runs detached
   `python -u -c <code>` in the background (`start`→`job_id`, `logs`, `stop`,
   `list`), drains stdout/stderr into a bounded ring buffer, and **auto-closes after
   `ttl_seconds`** — the general out-of-band primitive (the agent writes whatever
   listener it needs; no hardcoded OOB API). Jobs run wherever the tool runs (sandbox
   by default, host under `--no-container`) and are killed by `aclose()` on teardown.
-  A bound port is reachable by a remote target only with `--host-network`.
+  Network reachability depends on the container/network configuration.
 - **Read-only filesystem exploration uses `list_dir` / `grep` / `read_file`, not
   `python_exec`.** They're `safe` + `requires_approval=False` (never prompt) and are
   **hard-jailed** to the files root — `--files-root` (default `./zero_files`,
@@ -148,24 +166,29 @@ append a `TargetSpec` (verify the image is pullable first).
   (orchestrator + each subagent) maintains a bounded, self-overwritten scratchpad via
   the `memory_read` / `memory_write` tools (in `default_registry`). The file is chosen
   purely from the `session_id` the orchestrator injects in `_invoke_tool` (same trick
-  as `python_exec`; the LLM never names it), so a subagent can only touch **its own**
-  memory — `.pentest/memory/<session_id>.md` (`tools/_memroot.py`, `ZERO_MEMORY_ROOT`).
+  as `python_exec`; the LLM never names it), so those tools only address the actor's
+  **own** memory — `.pentest/memory/<session_id>.md`
+  (`tools/_memroot.py`, `ZERO_MEMORY_ROOT`).
   These two tools are **excluded from sandbox remoting** (they must write on the host,
-  where the store lives — never mounted into the container), so they don't need sandbox
-  coverage (`HOST_ONLY` in the e2e guard). The orchestrator reads ANY subagent's memory
-  via the orchestrator-only, intercepted `read_subagent_memory` / `list_memories`
+  where the store lives), so they have host-only test coverage (`HOST_ONLY` in the
+  e2e guard). The enclosing engagement directory is still mounted at `/work`;
+  tool-level ownership is not general filesystem isolation. The orchestrator reads
+  any subagent's memory via the orchestrator-only, intercepted
+  `read_subagent_memory` / `list_memories`
   (`tools/dispatch.py`, like the dispatch tools — never `run()`/remoted). Agents are
   seeded with their own memory at the start of a run; usage is steered by the `## Memory`
   prompt sections, not enforced.
-- **`--yolo` is NOT "approve everything."** It auto-approves only `safe`+`active`;
-  `exploit` still needs `--auto-approve exploit --i-understand`, `destructive`
-  always prompts, host-exec needs `--allow-host-exec`.
+- **`--yolo` is NOT "approve everything."** Risk-class auto-approval covers only
+  `safe`+`active`; `exploit` needs explicit risk approval and acknowledgement.
+  Destructive and host-execution actions normally prompt. Session-wide per-tool
+  approvals are a separate policy; see architecture.md §3.9 for its limits.
 - **Scope is advisory, not a hard gate.** There is no `violates_scope → BLOCK`;
   `--scope-host` only blocklists hosts for `web_fetch`. (Roadmap in architecture.md §9.)
-- **Backend is claude-only** (`--backend` is `Choice(["claude"])`); `echo`/`replay`
-  are internal test fixtures, not user-selectable.
-- **Container is ON by default** and falls back to host execution if Docker is
-  missing (then host-exec tools prompt every call). `--no-container` forces host.
+- **Production backends are `codex` (default) and `claude`.** `echo`/`replay`
+  are internal fixtures, not choices for `zero run --backend`. Mode `b` uses the
+  Claude MCP adapter regardless of that setting.
+- **Container is ON by default** and falls back to host execution if startup
+  fails. Host-exec approval policy then applies. `--no-container` forces host.
 - **The UI is inline** (no alternate screen, no overlays); approvals/asks render in
   the stream. Single-line input (`Enter` submits).
 - Don't hand-edit `uv.lock` — regenerate via `uv lock` / `uv sync`. It IS committed

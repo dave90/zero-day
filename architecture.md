@@ -37,16 +37,20 @@ The default runtime is a **hierarchical, multi-agent design** (execution mode
 Two simpler execution modes also ship (see §3.2): a single Pentest agent
 (mode `a`) and a fully delegated MCP loop (mode `b`).
 
+The optional **Ralph** workflow wraps bounded orchestrated passes with reviewed
+task planning, completion checks, and durable progress (§3.15). Engagement-local
+**custom tools** extend the shared tool catalog (§3.6.2).
+
 ### 1.1 Key design choices
 
 | Decision | Rationale |
 |---|---|
 | Containerized **tool execution** (Docker), ON by default | Isolates offensive tooling from the host. Note: only *tool calls* run in the container — the agent loops run on the host (see §2, §4). |
 | Burp Suite as the traffic source (not MCP browser) | Burp handles auth, websockets, TLS interception, and complex SPAs that browser MCPs choke on. |
-| LLM backed by the Claude Code CLI (`claude -p --output-format json`) | No API key needed; reuses the user's existing Claude subscription. |
-| Pluggable `LLMBackend` interface | The same interface can wrap other coding-agent CLIs. 📋 Only the Claude backend is implemented today. |
-| Human-in-the-loop by default | Every tool call requires approval unless `--auto-approve` / `--yolo` is set. |
-| Project context file (`pentest.md`) | Mirrors `CLAUDE.md` — scope, credentials, rules of engagement. |
+| Authenticated CLI backends | `CodexCLIBackend` is the default; `ClaudeCodeBackend` is also supported. Each reuses the selected CLI's authentication. |
+| Pluggable `LLMBackend` interface | Modes `a`/`c` share a turn-based interface for Codex and Claude. Mode `b` uses the Claude MCP adapter specifically. |
+| Human-in-the-loop by default | Registry tool execution follows the approval policy, with declared no-approval tools and session approvals (§3.9). |
+| Project context file (`pentest.md`) | Per-engagement scope, credentials, and rules of engagement; separate from repository guidance in `AGENTS.md`. |
 | Hierarchical orchestration (mode `c`) | A senior agent fans out cheap, independent attack ideas in parallel, then chains and validates the results. |
 
 ### 1.2 Non-goals (current)
@@ -84,12 +88,12 @@ is a **tool sandbox**: tool calls are proxied into it over an HTTP RPC channel
 │  - AuditLog (.pentest/audit.jsonl) + ThinkingLog (thinking.log)  │
 │                                                                  │
 │   build_orchestrator_loop / build_pentest_loop / build_validator │
-│        │  every tool call ──────────────┐                        │
+│        │  registry calls ───────────────┐                        │
 └────────┼───────────────────────────────┼────────────────────────┘
-         │ LLM: claude -p (subprocess)    │ tool RPC (HTTP)
+         │ LLM CLI (subprocess)          │ tool RPC (HTTP)
          ▼                                ▼
   ┌──────────────┐         ┌──────────────────────────────────────┐
-  │ Claude Code  │         │        Docker container (sandbox)     │
+  │ Codex/Claude │         │        Docker container (sandbox)     │
   │   CLI (host) │         │  Tool Layer (proxied via remote wrap):│
   └──────────────┘         │  burp_traffic http_replay sqlmap nmap │
                            │  ffuf nuclei httpx curl_raw jwt_tool  │
@@ -102,9 +106,10 @@ is a **tool sandbox**: tool calls are proxied into it over an HTTP RPC channel
                               └───────────────┘
 ```
 
-If Docker is unavailable, the system **falls back to host execution** and
-tools that run code/binaries on the host require approval on every call (unless
-`--allow-host-exec`). Pass `--no-container` to force host execution.
+If sandbox startup fails, the system **falls back to host execution** and
+applies the host-execution approval policy (§3.9). Pass `--no-container` to force
+host execution. Memory/todo calls and orchestrator-only control operations remain
+host-side even when the sandbox is running.
 
 ---
 
@@ -122,8 +127,8 @@ only component the user interacts with directly.
 - Start the Docker sandbox and swap the tool registry for RPC-proxied versions
   (`_start_container_and_swap_tools`).
 - Drive the agent loop for the selected execution mode (§3.2).
-- Enforce the **approval gate** (§3.11) on every tool call from every agent.
-- Route **`ask_user`** questions to the user and feed answers back (§3.12).
+- Apply the registry tool **approval policy** (§3.9).
+- Route **`ask_user`** questions to the user and feed answers back (§3.10).
 - Run the **SubagentManager** (mode `c`) and the **AgentRouter** (Pentest →
   Validator handoff + findings persistence).
 - Persist the **audit log** (`.pentest/audit.jsonl`), the human-readable
@@ -149,7 +154,7 @@ Orchestrator
 ### 3.2 Execution modes (`--execution-mode a | b | c`, default `c`)
 
 The system supports three runtime shapes behind one switch. (This is distinct
-from the Mode A / Mode B *tool-execution* axis of the LLM backend in §3.6 —
+from the Mode A / Mode B *tool-execution* axis of the LLM backend in §3.5.1 —
 modes `a` and `c` are both built on backend Mode A.)
 
 - **`c` — orchestrated (DEFAULT).** The senior-pentester Orchestrator does recon
@@ -157,22 +162,28 @@ modes `a` and `c` are both built on backend Mode A.)
   dispatch tools (§3.3). This is the production default.
 - **`a` — single agent.** One Pentest agent loop (`build_pentest_loop`) talks to
   the tool catalog directly and submits findings via `finding_submit`, which the
-  orchestrator intercepts and routes to a background Validator. No subagents.
+  orchestrator intercepts and routes to a background Validator. There is no
+  mode-c pentester dispatch manager.
 - **`b` — delegated / MCP.** Control is handed to the `claude` CLI for the whole
   session via an in-process MCP bridge (`ClaudeCodeBackendModeB` +
   `zero/llm/mcp_bridge.py`); the CLI runs its own loop and calls our tools as MCP
-  tools. The approval gate is enforced inside the MCP tool boundary.
+  tools. The registry approval policy applies inside the MCP tool boundary.
+  This path instantiates `ClaudeCodeBackendModeB` regardless of `--backend`;
+  it is not a Codex MCP mode.
 
-All three modes are **interactive and stay open**: after a `final` / `finalize`
-the session goes idle and waits for the next user prompt (Claude-Code style); it
-only exits on `/exit` or a double Ctrl+C.
+Modes `a`/`c` return to an idle input loop after a final response (or `finalize`
+in mode `c`). Mode `b` runs one delegated CLI session and emits `SessionEnd`
+when it finishes, which closes the UI. `--ralph` selects the outer workflow in
+§3.15 instead of these top-level loops. The operator can also exit the UI with
+`/exit` or a double Ctrl+C.
 
 ### 3.3 Orchestrator loop & subagents (mode `c`)
 
 The Orchestrator runs its own `AgentLoop` (`build_orchestrator_loop`) whose
 catalog is the **recon tools** (safe + active registry tools, minus
-`finding_submit`) plus a set of **orchestrator-only dispatch tools**
-(`zero/tools/dispatch.py`). The dispatch tools are *not* in the default
+`finding_submit`) plus **orchestrator-only dispatch, memory inspection, and
+custom-tool management tools** (`zero/tools/dispatch.py`,
+`zero/tools/custom_tools.py`). The dispatch tools are *not* in the default
 registry, so modes `a`/`b` never see them. They are intercepted by the
 orchestrator and never `run()` directly:
 
@@ -236,7 +247,7 @@ active-only finding. The "distrust" property lives in (a) the system prompt,
 (b) the cross-agent isolation (only structured `Finding`/`Validation` objects
 cross the boundary), and (c) the instruction to set up its own test conditions.
 
-Validator tool calls flow through the same approval gate (§3.11).
+Validator registry tool calls follow the same approval policy (§3.9).
 
 **Memory model.** In mode `a`, the orchestrator runs validations as background
 tasks so the pentest loop never blocks; in mode `c`, each validation is its own
@@ -247,7 +258,8 @@ history.
 > The original design called for the Validator to keep one conversation across
 > findings and for the orchestrator to auto-compact older turns near a token
 > budget. Today each validation runs with a fresh history and there is no
-> automatic history summarization/compaction of agent context. (Each actor *does*
+> harness-managed history summarization/compaction of agent context. Backend CLI
+> session behavior is separate from this harness limitation. (Each actor *does*
 > keep a self-managed per-run **memory** file — §3.14 — but that's a scratchpad,
 > not automatic context compaction. The UI also compacts tool-observation
 > *rendering*, which is unrelated.)
@@ -282,10 +294,10 @@ cross-session memory.
 │   ├── confirmed/
 │   │   └── c5deb5e5de.md        # human-readable + frontmatter
 │   ├── rejected/
-│   │   └── 5d28bb3817.md        # kept for dedup, NOT shown to user
+│   │   └── 5d28bb3817.md        # retained and included in reports
 │   ├── pending/
 │   │   └── 7a3fc2e10b.md        # validator couldn't fully confirm
-│   └── index.json               # dedup hashes (rebuilt from disk on startup)
+│   └── index.json               # dedup index; rebuilt if absent/unreadable
 ├── audit.jsonl
 ├── thinking.log
 └── report.md                    # written by finalize / at the turn budget
@@ -295,18 +307,23 @@ cross-session memory.
 - **Verdict values** are exactly `confirmed | rejected | pending` (the design's
   `needs_more_evidence` is implemented as `pending`).
 
-**Rule 1 — rejected findings are never shown to the user.** They go to
-`findings/rejected/` and feed dedup + debugging only. `pending` findings are
-hidden too until a re-validation flips them to `confirmed`.
+**Visibility.** `write_report` (`zero/findings/report.py`) includes confirmed,
+rejected, and pending findings. Confirmed findings include the validator's
+reproducer; rejected findings include the rationale, and pending findings include
+notes. Mode `c` also supplies unsuccessful attempt summaries. The session-summary
+event carries all three verdict categories, and the inline UI points to the
+report; `/findings` lists confirmed files
+and `/show-rejected` lists rejected files. Visibility does not imply confirmation.
 
-**Rule 2 — deduplication is file-based.** Before a finding reaches a Validator,
+**Deduplication is file-based.** Before a finding reaches a Validator,
 the orchestrator computes a `dedup_hash` over a normalized tuple
 (`zero/findings/dedup.py`) of `(normalized_endpoint, cwe, payload_shape,
 http_method)`, where `normalized_endpoint` strips IDs/query values
 (`/orders/1041` → `/orders/{id}`). A hash matching an on-disk finding — or one
 currently in-flight this session — is dropped with a "duplicate" observation so
-the agent stops rediscovering the same bug. `index.json` is rebuilt from the
-directory on startup, so the system self-heals if the index drifts.
+the agent stops rediscovering the same bug. The store rebuilds `index.json` when
+it is absent or unreadable; it does not automatically reconcile a valid but stale
+index at every startup. The normalized tuple is a heuristic, not semantic dedup.
 
 **Cross-session memory.** Findings persist between runs, so a second session
 against the same target inherits the dedup state. Wipe it with `zero reset`
@@ -329,9 +346,9 @@ class LLMBackend(ABC):
 - `CodexCLIBackend` — shells out to `codex exec` in backend Mode A. **Default.**
   Reuses the user's authenticated Codex CLI and resumes one persistent thread per
   actor so subsequent turns retain server-side context and prompt caching.
-- `ClaudeCodeBackend` — shells out to `claude -p ... --output-format json`
+- `ClaudeCodeBackend` — shells out to `claude -p ... --output-format stream-json`
   (backend Mode A). Reuses the user's Claude subscription; pins the
-  model and locks the CLI down to zero real tools + our identity (§3.5.1).
+  model by default and disables its native tools (§3.5.1).
 - `ClaudeCodeBackendModeB` — registers an in-process MCP bridge and runs the
   `claude` CLI in agent mode (backend Mode B; used by execution mode `b`).
 - `EchoBackend`, `ReplayBackend` — test/replay fixtures (not for production).
@@ -343,9 +360,13 @@ class LLMBackend(ABC):
 
 There are two ways to plug the tool catalog into a coding-agent CLI. Both exist:
 
-**Backend Mode A — LLM as pure reasoner** (used by execution modes `a` and `c`).
-The CLI is a stateless `prompt → JSON` function. Our loop is the only thing that
-executes tools.
+**Backend Mode A — envelope-driven reasoning** (used by execution modes `a` and `c`).
+The host requests a JSON response per turn and executes the requested registry
+actions. With session resume enabled (the default), each actor has its own
+persistent Codex thread or Claude session, and subsequent calls send only new
+messages. The stateless path sends full history; `EchoBackend`/`ReplayBackend`
+remain fixtures. `AgentLoop` retains local history for recovery if a CLI session
+fails.
 
 1. The tool catalog (names, descriptions, JSON schemas) is passed to the LLM **as
    data inside the prompt**, not as callable tools.
@@ -358,11 +379,12 @@ executes tools.
    {"type": "final",    "answer": "..."}
    ```
    `actions` is the **batch** form: several INDEPENDENT tool calls run in ONE turn
-   (one LLM round-trip). The executor runs them concurrently, except calls that
-   share a stateful interpreter (`python_exec`/`pip_install`) which are serialized;
-   one observation per call is appended. `action` (singular) still works unchanged.
-3. The CLI must have **zero real tools** so the model can only answer with text
-   (our envelope). The backend strips everything:
+   (one LLM round-trip). The orchestrator/pentester batch executor can run them
+   concurrently while serializing stateful interpreter/package-install work.
+   The generic validator driver handles batches sequentially. Each call appends
+   an observation; `action` (singular) still works unchanged.
+3. **Claude-specific tool restrictions:** `ClaudeCodeBackend` disables native
+   tools so the model answers with text (our envelope):
    - **`--allowedTools ""`** — an empty *whitelist* grants no tools. (An empty
      `--tools ""` does **not** work — it's a greedy variadic and leaves Claude
      Code's defaults enabled; that bug let subagents still see and call `LSP`.)
@@ -371,30 +393,40 @@ executes tools.
    - **`--disable-slash-commands`** — no skills.
    - **`DEFAULT_DISALLOWED_TOOLS`** denylist as a backstop (Bash/Read/…/`LSP`/
      `ToolSearch`/`Monitor`/…), kept exhaustive vs the installed CLI build.
-4. The CLI's **identity** is replaced so the subagent acts as our agent, not Claude
-   Code: **`--system-prompt`** carries our agent prompt (also dropping the default
-   cwd/env/git/memory sections), and **`--setting-sources user`** drops project/
-   local settings so the engagement repo's `CLAUDE.md` is never auto-discovered.
-5. The model is **pinned** with `--model` (default `claude-opus-5[1m]`).
+4. The Claude CLI's **identity** is replaced so the subagent acts as our agent:
+   **`--system-prompt-file`** carries our agent prompt on session creation
+   (also dropping the default cwd/env/git/memory sections), and
+   **`--setting-sources user`** drops project/
+   local settings to avoid importing engagement-project guidance.
+5. **Model selection** is backend-aware. Codex uses its configured model by
+   default; Claude defaults to `claude-opus-5[1m]`. An explicit `--model`
+   overrides the selection; an empty value lets Claude use its CLI default.
 6. The orchestrator parses the envelope, runs the tool (in the container), and
    feeds the result back as the next observation.
 
-Invocation: `claude -p "$PROMPT" --output-format json --max-turns N --model … --system-prompt … --allowedTools "" --strict-mcp-config --disable-slash-commands --setting-sources user`.
-With zero tools the CLI never enters a real tool loop; `--max-turns` (default **4**,
+The Claude adapter sends conversation input over stdin, reads streamed JSON CLI
+events, and extracts the agent's envelope text. On resume, the CLI retains the
+initial system prompt/settings. Its internal `--max-turns` (default **4**,
 with a small retry bonus on `error_max_turns`) is only internal bookkeeping — small
 on purpose: a few turns of headroom let a rare stray native-tool_use attempt fail
 harmlessly (the tool isn't callable) and the model recover to a text envelope,
 instead of the whole call hard-failing with `error_max_turns (stop=tool_use)`.
 A startup banner prints the effective model / lock-down / context window so a stale
 process (Python doesn't hot-reload) is obvious. Subagent backends use the same shape
-with a higher per-call timeout (§5).
+with the shared per-call timeout (§5).
 
-**Pros:** total control — every action passes the approval gate, rate limiter,
-and audit log; replayable. **Cons:** verbose (full history re-sent each turn).
+**Codex-specific limitation:** the Codex adapter uses a read-only CLI sandbox
+and an envelope instruction; native shell access is not removed with the same
+hard tool whitelist as Claude. The intended text-only role is therefore not an
+equivalent enforcement boundary (`zero/llm/codex_cli.py`).
 
-**Backend Mode B — delegated** (used by execution mode `b`). The CLI runs its own
-loop; our catalog is exposed via an MCP server and the gate is enforced inside
-each MCP tool implementation. **Pros:** native tool-calling, the CLI handles
+Registry actions are auditable and handled by the host's approval and rate-limit
+paths. Persistent sessions reduce repeated prompt input; they do not add
+harness-managed context compaction or guarantee deterministic replay.
+
+**Backend Mode B — delegated** (used by execution mode `b`). Claude runs its own
+loop; our catalog is exposed via an MCP server and the approval policy applies
+inside each MCP tool implementation. **Pros:** native tool-calling, the CLI handles
 history/streaming. **Cons:** less tight control; harder to replay.
 
 ### 3.6 Tool layer
@@ -405,7 +437,7 @@ capability. Tools declare a Pydantic `Args` model, a `RiskLevel`, and flags.
 **RiskLevel** (`zero/tools/base.py`): `safe` (read-only / local disk),
 `active` (touches the target — probes/fuzz/scans), `exploit` (proves an exploit
 — SQLi, IDOR write), `destructive` (writes/deletes target data). Tools also carry
-`runs_on_host` (executes on the host even after the container swap) and
+`runs_on_host` (local code/binary execution; remoted wrappers clear this flag) and
 `requires_approval` (local no-side-effect tools like `burp_traffic`
 bypass the gate).
 
@@ -424,18 +456,20 @@ bypass the gate).
 | `jwt_tool` | `jwt_tool` | active | Inspect / tamper JWTs. |
 | `python_exec` | sandboxed python | active | Run a Python snippet. **Persistent per-actor session** — globals/imports/helpers survive across calls; each agent gets its own isolated interpreter. **No hard kill timeout:** code runs in a worker thread; if a call exceeds `wait_seconds` it KEEPS RUNNING and the tool returns "still running" + output-so-far, so the agent can `action="poll"` (wait more) or `action="cancel"` (stop + reset the session). Stops one slow call (e.g. a recursive `glob` over `/usr/share`) freezing the turn forever. |
 | `pip_install` | pip | active | Install Python packages into the sandbox so `python_exec` can import them. Non-interactive, **hard-timeout** (won't wedge a session), package specs sanitized against option injection. Common libs (pdfminer.six, pypdf, bs4, cryptography, …) are pre-baked. |
-| `python_bg` | sandboxed python | active | **Detachable background jobs** — run python that serves/listens/long-polls (an HTTP redirector, an XXE DTD host, a socket catcher), keep it alive, poll its captured logs for callbacks, stop it, or let it **auto-close after a TTL**. The general out-of-band primitive: the agent writes whatever listener it needs (no fixed OOB API). Distinct from `python_exec`, where a `serve_forever()` would hang the turn forever. A bound port is only reachable by a remote target when zero runs with `--host-network`. |
+| `python_bg` | sandboxed python | active | Detached background jobs with bounded captured logs, explicit lifecycle management, and TTL cleanup. Unlike `python_exec`, these jobs do not occupy an actor's persistent interpreter worker. Network reachability depends on the container/network configuration. |
 | `list_dir` | sandboxed python | safe | Plain listing of a directory's sub-dirs + files (dirs first, trailing `/`; hidden shown; optional recursive). **Read-only, never prompts, hard-jailed to `--files-root`** (`/zero_files` in the sandbox) — can't escape via `..`/absolute/symlink. |
 | `grep` | sandboxed python | safe | Regex-search files under the files root → `path:lineno: line` (recursive, `include` glob, `context`). Skips binary/oversized files. **Read-only, never prompts, hard-jailed to `--files-root`.** |
 | `read_file` | sandboxed python | safe | Read a file's content with `offset`/`max_bytes` paging. **Read-only, never prompts, hard-jailed to `--files-root`.** |
 | `memory_read` / `memory_write` | host file | safe (no prompt) | Each actor's bounded **working memory** (replace-model markdown) under `.pentest/memory/<id>.md`. Keyed by the injected `session_id`; runs **host-side, excluded from remoting** (see §3.14). |
 | `todo_read` / `todo_write` | host file | safe (no prompt) | Each actor's **plan/checklist** (`{step,status}` list) under `.pentest/todo/<id>.json`; rendered live in the UI (§3.14). |
+| `custom_tool_list` / `custom_tool_call` | engagement-local scripts | safe (list, no prompt) / active (call) | Shared listing/execution surface for stored custom tools (§3.6.2). |
 | `web_search` | DuckDuckGo (`ddgs`) | safe | Search the public web. |
 | `web_fetch` | `httpx` | safe | Fetch a public URL (scope-host blocklist applies). |
 | `finding_submit` | internal | safe | Submit a candidate finding (orchestrator-intercepted). |
 
-Plus the **orchestrator-only dispatch tools** (§3.3), added to the orchestrator's
-catalog at runtime, never in `default_registry`.
+Plus the **orchestrator-only dispatch/inspection tools** (§3.3) and custom-tool
+management (§3.6.2), added to the orchestrator's catalog at runtime, never in
+`default_registry`.
 
 Adding a tool is mechanical: drop a class in `tools/`, register it in
 `default_registry`. No skill manifest.
@@ -455,6 +489,20 @@ behavior is identical in both backend modes and every call is audited.
 > for a `WebSearchProvider` abstraction (Brave / Serper / SearXNG / DuckDuckGo)
 > and an on-disk `web_cache`. Today only the DuckDuckGo provider is implemented,
 > there is no provider-selection knob, and results are not cached to disk.
+
+#### 3.6.2 Custom-tool storage and authority
+
+`zero/tools/custom_tools.py` separates orchestrator-only management from the
+registry tools available to all agents. Management calls are intercepted on the
+host; `custom_tool_list` and `custom_tool_call` use the normal registry/remoting
+path. Execution follows the registry approval policy and has a per-call timeout.
+
+`zero/tools/_customtools.py` stores Python scripts under
+`<files-root>/custom_tools/`, validates their syntax before writing, and derives
+descriptions from module docstrings without executing them. Store paths use the
+files-root resolver. This constrains storage paths, not the filesystem/network
+permissions of an executing script. Scripts are shared through the files-root
+mount and persist independently of `.pentest/`, including across Ralph resets.
 
 ### 3.7 Burp ingestion bridge
 
@@ -481,8 +529,8 @@ method.
 
 ### 3.8 Project context file (`pentest.md`)
 
-Modeled on `CLAUDE.md` — a markdown file the user authors and the agents read
-first. `zero init` scaffolds it. The orchestrator
+An engagement-specific markdown brief, separate from repository development
+guidance in `AGENTS.md`. `zero init` scaffolds it. The orchestrator
 (`zero/orchestrator/context.py`) reads it and injects it into every agent's
 system prompt (scope, credentials, prohibitions, notes).
 
@@ -508,15 +556,16 @@ system prompt (scope, credentials, prohibitions, notes).
 
 ### 3.9 Approval gate
 
-Every tool call from every agent flows through `ApprovalGate`
-(`zero/orchestrator/approval.py`) before execution. The decision rules:
+Registry calls use `ApprovalGate` (`zero/orchestrator/approval.py`) unless the
+tool declares `requires_approval=False`. Orchestrator-only control operations
+are intercepted separately. The risk-class auto-approval rules are:
 
 | Risk | Behavior |
 |---|---|
 | `safe` | Prompt, unless `--yolo` or `--auto-approve safe`. Local no-side-effect tools (`burp_traffic`) skip the gate entirely. |
 | `active` | Prompt, unless `--yolo` or `--auto-approve active`. |
 | `exploit` | Prompt, unless `--auto-approve exploit` **and** `--i-understand`. |
-| `destructive` | **Always prompts** — no flag (`--yolo` included) skips it. |
+| `destructive` | No risk-class flag (`--yolo` included) auto-approves it. |
 | host-exec | A tool with `runs_on_host` prompts unless `--allow-host-exec`, even if its risk would otherwise be auto-approved. |
 
 `Decision` is `YES | NO | ALWAYS` (`ALWAYS` adds the tool to the session
@@ -525,8 +574,13 @@ deny (so the agent never deadlocks) or typing a reply + Enter.
 
 **`--yolo` covers only `safe` + `active`.** It does **not** auto-approve
 `exploit` (which still needs `--auto-approve exploit` *and* `--i-understand`) or
-`destructive`, and it never bypasses the host-exec boundary. So "yolo" is *not*
-"approve everything" — the high-risk classes still prompt.
+`destructive`, or host-execution checks by itself.
+
+**Policy limitation:** session-wide per-tool approvals are evaluated separately
+and can take precedence over the risk/host checks in `ApprovalGate`. Accordingly,
+the risk-class table is not a guarantee that destructive or host actions always
+prompt. No-approval tools and intercepted control operations are also outside
+that table; the gate is not a universal sandbox boundary.
 
 The prompt shows the tool, args, risk level, the subagent label (in mode `c`),
 and a one-line "why" derived from the agent's thought:
@@ -581,15 +635,20 @@ bucket. Default `--rate-limit 100/min` (`<int>/sec` or `<int>/min`); `0/sec`
 disables it. The host is extracted from common arg shapes (`url`, `target`) and
 the limiter is acquired before the tool runs.
 
+This meters tool invocations with recognized host arguments, not every network
+request made inside a binary or script. It is not a network-wide request quota.
+
 ### 3.12 Audit, thinking log, replay
 
 - **`audit.jsonl`** — append-only JSONL of every prompt, envelope, tool proposal,
-  approval decision, observation, dispatch, finding, and `ask_user`. Enough to
-  replay a session.
+  approval decision, observation, dispatch, finding, and `ask_user`. Some recorded
+  outputs are truncated; this is an audit trail, not a complete traffic capture.
 - **`thinking.log`** — a human-readable per-turn reasoning trace for the
   orchestrator and every subagent.
-- **`zero replay <audit_path> --goal …`** — re-drives a recorded session via the
-  `ReplayBackend`.
+- **Model traces** — `.pentest/llm/` stores per-actor model input/output, enabled
+  by default. Context and logs may contain credentials; redaction is not built in.
+- **`ReplayBackend`** — returns recorded assistant messages from `agent_step`
+  events in order. Replay is not a deterministic simulation of tool results.
 
 ### 3.13 Terminal UI
 
@@ -616,10 +675,11 @@ crash:
   `{step, status}`, rendered live in the UI.
 
 Both are keyed purely by the per-actor `session_id` the orchestrator injects in
-`_invoke_tool` (the LLM never sets it — the same mechanism as `python_exec`), so a
-subagent can only ever touch **its own** files. They run **host-side and are excluded
-from sandbox remoting** (the store lives on the host under `.pentest/`, never mounted
-into the container). At the start of a run each agent is **seeded** with its own
+`_invoke_tool` (the LLM never sets it — the same mechanism as `python_exec`), so
+these tools address only the actor's own files. They run **host-side and are
+excluded from sandbox remoting**. Their storage under `.pentest/` is still inside
+the engagement directory mounted at `/work`; tool-level ownership is not general
+filesystem isolation. At the start of a run each agent is **seeded** with its own
 memory, and the orchestrator can read any subagent's via `read_subagent_memory` /
 `list_memories` (§3.3).
 
@@ -630,9 +690,36 @@ to its memory on completion — merged below any notes the agent wrote. This is 
 makes `read_subagent_memory` reliably useful even when a subagent produced a thin
 final or died.
 
-> 📋 **Roadmap — token-budget auto-compaction** of live agent *context* is still not
-> implemented (memory is a self-managed scratchpad, not automatic history
-> summarization). See §9.
+> 📋 **Roadmap — harness-managed token-budget auto-compaction** of agent context
+> is still not implemented. Scratchpads and backend CLI session management are
+> separate from automatic history summarization in the harness. See §9.
+
+### 3.15 Ralph planning and iteration
+
+`--ralph` selects `RalphDriver` (`zero/ralph/driver.py`) instead of the top-level
+`a`/`b`/`c` loop. It composes the existing agent and orchestrator primitives:
+
+1. An **analyzer** and **analyzer_validator** review a task plan (PRD), with
+   epic-level grouping enabled by default. The operator plan checkpoint is also
+   enabled by default. Planning review is bounded and is not a guarantee of
+   complete coverage.
+2. Each iteration starts a fresh orchestrator session with the plan and durable
+   progress, performs a bounded pass, and records evidence in task dossiers. The
+   analyzer_validator reviews task completion separately from the finding
+   validators. The driver stops at the iteration limit or when the plan's tasks
+   are marked complete.
+3. The driver snapshots each pass and writes a cumulative findings report.
+
+`zero/ralph/prd.py` defines the plan model; `progress.py` and `dossier.py` retain
+the journal and per-task evidence under `.ralph/`. `state.py` manages
+`.ralph_logs/.pentest_<n>/` snapshots and `.ralph_logs/ralph_report.md`. Between
+passes, findings and the open master audit/thinking logs carry forward; other
+`.pentest/` working state is reset. Custom tools live outside that reset root.
+
+Resume loads a usable saved PRD, retains task status/progress, skips the initial
+planning/checkpoint, and continues snapshot numbering. If no usable plan exists,
+it falls back to fresh planning. Each pass has a fresh subagent manager, so its
+total-subagent cap is per pass rather than a cumulative Ralph budget.
 
 ---
 
@@ -640,7 +727,7 @@ final or died.
 
 The **tool execution environment** is a single Docker container; the agent loops
 stay on the host (§2). Container support is ON by default and falls back to host
-execution if Docker is missing.
+execution if sandbox startup fails (including missing Docker or image).
 
 **Why Docker:** `sqlmap`/`nmap`/etc. make many network calls and leave artifacts;
 pinned tool versions per release; one-command install.
@@ -656,8 +743,9 @@ work out of the box. Changing a baked tool/wordlist requires rebuilding the imag
 
 **Mounts:**
 - `./` (project dir) → `/work` read-write — `pentest.md`, findings, logs.
-- `~/.claude/` → `/root/.claude` read-only — so an in-container `claude` could use
-  host auth (opt-in).
+- `~/.claude/` → `/root/.claude` read-only when that host directory exists;
+  `ContainerSpec` resolves it automatically. This mount does not move the model
+  CLI or agent loops into the container.
 - `--burp-dir` → `/work/burp` read-only.
 - `--files-root` (default `./zero_files`, resolved against cwd, auto-created) →
   `/zero_files` read-write — the **jail root** the read-only fs tools
@@ -672,8 +760,11 @@ work out of the box. Changing a baked tool/wordlist requires rebuilding the imag
 4 GB). Binary tools also carry a per-invocation wall-clock timeout (default
 300 s / 5 min, configurable per tool).
 
-**Tool remoting:** by default **every** tool is proxied into the container
-(`--remote-all-tools`); `--no-remote-all-tools` proxies only `python_exec`.
+**Tool remoting:** by default registry tools are proxied into the container
+(`--remote-all-tools`), except host-side memory/todo tools. Intercepted dispatch,
+inspection, custom-tool management, and finding handoffs run on the host.
+`--no-remote-all-tools` proxies only `python_exec`. The read-only filesystem tool
+jail does not constrain arbitrary execution tools or hide the `/work` mount.
 
 ---
 
@@ -684,20 +775,20 @@ limits compose:
 
 | Knob (CLI flag) | Default | What it bounds |
 |---|---|---|
-| `--llm-timeout` | 900 s | Wall-clock for **one** `claude -p` call — shared by the orchestrator's own turns **and** the pentester/validator subagents (one value for all). |
+| `--llm-timeout` | 900 s | Wall-clock for **one** model CLI call in modes `a`/`c` — shared by the orchestrator and pentester/validator backends. |
 | `--pentester-max-turns` | 14 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
 | `--subagent-deadline` | 1200 s | **Total** wall-clock per subagent, checked between turns (pentesters and validators). |
 | `--validator-max-turns` | 40 | Validator investigation steps (our loop). |
-| `--validator-claude-max-turns` | 1 | claude's INTERNAL per-call `--max-turns` for the validator (NOT its investigation budget — that's `--validator-max-turns`). Kept tiny like the agent backend; a high value only lets the model drift into a native tool call. |
+| `--validator-claude-max-turns` | 4 | Claude's internal per-call turn budget; distinct from validator investigation steps and not used by Codex. |
 | `--max-subagents` | 10 | Max concurrent subagents (semaphore). |
+| `--max-total-subagents` | 0 (unlimited) | Total dispatches for one subagent manager; a fresh manager is created per Ralph pass. This is not a token or monetary budget. |
 | `--max-turns` | 10 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
 
-Because the deadline is checked *between* turns, a subagent's absolute worst-case
-wall-clock is `--subagent-deadline` plus one in-flight call (≤ `--llm-timeout`)
-— roughly 35 min by default. A subagent that blows the deadline returns a clean
-`ERROR`/`pending` result instead of running forever. (This bounds the historical
-case where pentesters inherited the orchestrator's large turn budget and looped
-for 50+ minutes on the same failing idea.)
+The subagent deadline is checked *between* turns; it does not cancel an in-flight
+approval wait or tool call. The model timeout only bounds a model call, and tools
+have their own timeout/yield behavior. These controls therefore do not establish
+a strict end-to-end wall-clock bound. When the loop observes an expired deadline,
+it returns an error or pending outcome rather than starting another turn.
 
 **Operator can interject while subagents run.** `await_subagents` races the
 subagent wait against operator input: if the user types a message while the
@@ -707,9 +798,10 @@ message before resuming. This keeps the chat responsive instead of frozen for th
 whole batch.
 
 **Turn-error recovery (orchestrator AND subagents).** A backend timeout, a
-`claude -p` failure (e.g. `error_max_turns`), or a parse error on a turn no longer
-kills the loop. The orchestrator surfaces a `[turn error]` line, records `turn_error`,
-and goes idle for the next prompt. **Subagents recover the same way:** the pentester
+CLI failure, or a parse error on a turn no longer immediately kills the loop.
+The orchestrator records `turn_error` and retries with corrective feedback; after
+repeated consecutive failures it goes idle for the next prompt. **Subagents also
+recover:** the pentester
 loop and the validator driver catch a `loop.step()` error, feed it back as a
 corrective observation ("emit one JSON envelope as text; don't call tools natively"),
 and **retry the turn** — only giving up after a few consecutive failures, and then
@@ -719,8 +811,11 @@ notes*). Previously a single backend glitch turned the whole subagent into `ERRO
 and discarded its work.
 
 **Shutdown.** The session ends only when the UI exits. On exit the orchestrator
-cancels any in-flight subagents; `finalize` (or hitting the turn budget) instead
-waits for running subagents to **complete** before writing the report.
+cancels in-flight subagents. `finalize` (or hitting the turn budget in mode `c`)
+attempts to drain running work before writing the report. `_emit_report` limits
+the subagent wait to 600 seconds and the background-validation wait to 10 seconds;
+it can write a report after those waits expire, so a report is not proof that all
+work finished.
 
 ---
 
@@ -755,8 +850,8 @@ User goal: *"Find access-control bugs in the orders API."*
 
 - **New tool:** add a class in `tools/`, declare `Args`/`risk_level`/flags,
   register in `default_registry`. Nothing else changes.
-- **New LLM backend:** implement `LLMBackend` and register. The loops are
-  backend-agnostic. (📋 Codex/API backends are the obvious next ones.)
+- **New LLM backend:** implement `LLMBackend` and register. Modes `a`/`c` already
+  support Codex and Claude; a raw API adapter remains roadmap work.
 - **New agent role:** the dispatch model makes adding roles (e.g. a Reporter or
   Triage agent) a matter of a new subagent kind + prompt.
 - **New traffic source:** feed a `TrafficStore` (📋 ZAP / mitmproxy / HAR).
@@ -765,14 +860,17 @@ User goal: *"Find access-control bugs in the orders API."*
 
 ## 8. Security & ethical considerations
 
-- **Approval gate is the primary control.** Every tool call is gated; `exploit`
-  needs `--i-understand`, `destructive` always prompts even under `--yolo`, and
-  host-exec prompts unless `--allow-host-exec`.
+- **Approval policy is the primary operator control.** Registry tools follow
+  risk/host rules, with no-approval declarations and session-wide per-tool
+  decisions. Intercepted operations are separate; see §3.9 for limitations.
 - **Sandboxed tool execution** by default (Docker), with host-exec clearly warned
   about at startup when the sandbox is off/unavailable.
 - **Rate limiting** per target host (§3.11).
-- **Audit log** of every prompt, response, tool call, decision, and output.
-- **Containment of artifacts** to `./.pentest/` and the sandbox.
+- **Audit trail and model traces** of run activity, with some outputs truncated
+  (§3.12).
+- **Artifact locations:** findings/logs in `.pentest/`, Ralph state/snapshots in
+  `.ralph/` and `.ralph_logs/`, and custom tools under the files root. These are
+  storage conventions, not a universal write boundary; `/work` is writable.
 
 > 🚧 **Scope enforcement is currently advisory, not mandatory.** Contrary to the
 > original design, there is **no hard scope-blocking gate**. Scope from
@@ -792,12 +890,12 @@ User goal: *"Find access-control bugs in the orders API."*
 
 | Area | Item |
 |---|---|
-| Backends | `CodexBackend`, `ApiBackend` (pay-per-token). |
+| Backends | `ApiBackend` (pay-per-token); Codex and Claude CLI adapters already ship. |
 | Web tools | Pluggable `web_search` providers (Brave / Serper / SearXNG); on-disk `web_cache`. |
 | Burp | REST API ingestion (Pro); Burp-extension push (Community). |
 | Scope | Mandatory `violates_scope → BLOCK` gate (allowlist semantics), not user-overridable. |
 | Credentials | Reference-by-name (`{{user_low}}`) + execution-time substitution so the LLM never sees secrets. |
-| Memory | Shared cross-finding validator history; token-budget auto-compaction of agent context. (Per-agent scratchpad **memory + plan** already ship — §3.14; this is the remaining cross-finding / auto-compaction work.) |
+| Memory | Shared cross-finding validator history; harness-managed token-budget auto-compaction. (Per-agent memory/plan and Ralph task dossiers already ship — §3.14–3.15.) |
 | Approval UI | Wire up the `EDIT` decision (edit args before approving). |
 | Roles | Triage / Reporter agents (dedup across sessions; HackerOne/Bugcrowd report templates). |
 | Platforms | Network-layer tools (smb/ldap), mobile (Frida), cloud (S3/IAM), basic binary. |
