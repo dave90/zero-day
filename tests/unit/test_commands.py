@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from zero.ui.commands import CommandRegistry, build_default_registry
+from zero.ui.commands import build_default_registry
 
 
 def _reg(findings_dir: Path = Path("/tmp"), **overrides):
@@ -63,3 +63,18 @@ def test_findings_lists_files(tmp_path: Path):
     (confirmed / "f1.md").write_text("x", encoding="utf-8")
     _, out = _reg(findings_dir=tmp_path).dispatch("/findings")
     assert any("f1.md" in line for line in out)
+
+
+def test_swarm_inspection_and_respond_now_commands(tmp_path: Path):
+    calls = []
+    reg = build_default_registry(
+        findings_dir=tmp_path,
+        clear_scrollback=lambda: None,
+        request_exit=lambda: None,
+        swarm_snapshot=lambda view: [f"view={view}"],
+        respond_now=lambda: calls.append("respond") or True,
+    )
+    for command in ("agents", "messages", "groups", "work", "history"):
+        assert reg.dispatch(f"/{command}") == (True, [f"view={command}"])
+    assert "freezing" in reg.dispatch("/respond-now")[1]
+    assert calls == ["respond"]

@@ -7,7 +7,6 @@ unless sandboxed (RemoteTool) or --allow-host-exec is set.
 """
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from zero.orchestrator.orchestrator import Orchestrator, OrchestratorConfig
@@ -114,3 +113,23 @@ async def test_allow_host_exec_lets_python_exec_auto_run(tmp_path: Path, monkeyp
     assert prompted == []  # auto-approved (user accepted host risk)
     assert result.ok is True
     assert "x" in result.output
+
+
+async def test_session_always_never_bypasses_host_or_destructive_boundaries():
+    from zero.orchestrator.approval import ApprovalGate, ApprovalRequest, Decision
+    from zero.tools.base import RiskLevel
+
+    decisions = iter([Decision.ALWAYS, Decision.NO, Decision.NO])
+
+    async def prompt(_req):
+        return next(decisions)
+
+    gate = ApprovalGate(prompt)
+    safe = ApprovalRequest("same", {}, RiskLevel.SAFE, "1")
+    assert await gate.check(safe)
+    assert not await gate.check(ApprovalRequest(
+        "same", {}, RiskLevel.SAFE, "2", host_exec=True
+    ))
+    assert not await gate.check(ApprovalRequest(
+        "same", {}, RiskLevel.DESTRUCTIVE, "3"
+    ))

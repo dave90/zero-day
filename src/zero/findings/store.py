@@ -7,6 +7,9 @@ of truth, per plan §3.3.1).
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -29,39 +32,44 @@ class FindingsStore:
         for d in self.dirs.values():
             d.mkdir(parents=True, exist_ok=True)
         self.index_path = root / "index.json"
+        # Validators from several swarm peers may finish concurrently. Keep the
+        # human-readable projection a single-writer view and replace files atomically.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------- index
 
     def index(self) -> dict[str, dict]:
         """{dedup_hash → {id, verdict, title}}. Rebuilt from disk if missing."""
-        if not self.index_path.exists():
-            return self.rebuild_index()
-        try:
-            return json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return self.rebuild_index()
+        with self._lock:
+            if not self.index_path.exists():
+                return self.rebuild_index()
+            try:
+                return json.loads(self.index_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return self.rebuild_index()
 
     def rebuild_index(self) -> dict[str, dict]:
-        idx: dict[str, dict] = {}
-        for verdict, d in self.dirs.items():
-            for f in d.glob("*.md"):
-                rec = self._read(f)
-                if rec is None:
-                    continue
-                idx[rec.dedup_hash] = {
-                    "id": rec.id,
-                    "verdict": verdict,
-                    "title": rec.finding.title,
-                    "path": str(f.relative_to(self.root)),
-                }
-        self._write_index(idx)
-        return idx
+        with self._lock:
+            idx: dict[str, dict] = {}
+            for verdict, d in self.dirs.items():
+                for f in d.glob("*.md"):
+                    rec = self._read(f)
+                    if rec is None:
+                        continue
+                    idx[rec.dedup_hash] = {
+                        "id": rec.id,
+                        "verdict": verdict,
+                        "title": rec.finding.title,
+                        "path": str(f.relative_to(self.root)),
+                    }
+            self._write_index(idx)
+            return idx
 
     def lookup_by_hash(self, h: str) -> dict | None:
         return self.index().get(h)
 
     def _write_index(self, idx: dict) -> None:
-        self.index_path.write_text(json.dumps(idx, indent=2), encoding="utf-8")
+        self._atomic_write(self.index_path, json.dumps(idx, indent=2))
 
     # ----------------------------------------------------------- write/read
 
@@ -70,33 +78,54 @@ class FindingsStore:
 
     def promote(self, rec: FindingRecord, verdict: Verdict) -> Path:
         """Move a record between buckets and update its verdict in-place."""
-        # Remove any old copy.
-        self._remove_by_id(rec.id)
-        return self._save(rec, verdict)
+        with self._lock:
+            # Remove and materialize while holding the same projection lock so
+            # concurrent validators cannot temporarily resurrect a stale bucket.
+            self._remove_by_id(rec.id)
+            return self._save(rec, verdict)
 
     def all_records(self, verdict: Verdict | None = None) -> list[FindingRecord]:
-        out: list[FindingRecord] = []
-        items = self.dirs.items() if verdict is None else [(verdict, self.dirs[verdict])]
-        for _v, d in items:
-            for f in sorted(d.glob("*.md")):
-                rec = self._read(f)
-                if rec is not None:
-                    out.append(rec)
-        return out
+        with self._lock:
+            out: list[FindingRecord] = []
+            items = self.dirs.items() if verdict is None else [(verdict, self.dirs[verdict])]
+            for _v, d in items:
+                for f in sorted(d.glob("*.md")):
+                    rec = self._read(f)
+                    if rec is not None:
+                        out.append(rec)
+            return out
 
     def _save(self, rec: FindingRecord, verdict: Verdict) -> Path:
-        path = self.dirs[verdict] / f"{rec.id}.md"
-        path.write_text(self._serialize(rec), encoding="utf-8")
-        # Update index.
-        idx = self.index()
-        idx[rec.dedup_hash] = {
-            "id": rec.id,
-            "verdict": verdict,
-            "title": rec.finding.title,
-            "path": str(path.relative_to(self.root)),
-        }
-        self._write_index(idx)
-        return path
+        with self._lock:
+            path = self.dirs[verdict] / f"{rec.id}.md"
+            self._atomic_write(path, self._serialize(rec))
+            # Update index while holding the same lock as the record projection.
+            idx = self.index()
+            idx[rec.dedup_hash] = {
+                "id": rec.id,
+                "verdict": verdict,
+                "title": rec.finding.title,
+                "path": str(path.relative_to(self.root)),
+            }
+            self._write_index(idx)
+            return path
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(raw, path)
+        except BaseException:
+            try:
+                os.unlink(raw)
+            except FileNotFoundError:
+                pass
+            raise
 
     def _remove_by_id(self, fid: str) -> None:
         for d in self.dirs.values():

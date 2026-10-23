@@ -64,8 +64,6 @@ class ApprovalGate:
         self._session_always: set[str] = set()  # tool names accepted for the whole session
 
     def _is_auto_approved(self, req: ApprovalRequest) -> bool:
-        if req.tool in self._session_always:
-            return True
         # Host execution boundary: a tool that runs code/binaries on the host
         # (not sandboxed in the container) is NEVER auto-approved — not by
         # --yolo, not by mode-c's safe+active default — unless the operator
@@ -76,6 +74,11 @@ class ApprovalGate:
         rl = req.risk_level
         if rl == RiskLevel.DESTRUCTIVE:
             return False
+        # Cached per-tool grants are deliberately below the two hard policy
+        # boundaries above. A prior sandboxed/safe call must never silently grant
+        # later destructive or host execution by a same-named tool.
+        if req.tool in self._session_always:
+            return True
         if rl == RiskLevel.EXPLOIT:
             return RiskLevel.EXPLOIT in self._auto and self._i_understand
         if rl == RiskLevel.ACTIVE:

@@ -97,6 +97,7 @@ class SubagentManager:
         runner: Runner,
         emit: Emit,
         max_total: int = 0,
+        id_prefix: str = "",
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.max_concurrent = max_concurrent
@@ -104,6 +105,9 @@ class SubagentManager:
         # Distinct from `max_concurrent` (how many run AT ONCE). `_counter` is the
         # running total, so `at_total_capacity()` gates further dispatches.
         self.max_total = max_total
+        # A swarm supplies its fully-qualified parent actor id so child ids remain
+        # globally unique.  The empty compatibility default preserves legacy ids.
+        self.id_prefix = id_prefix
         self._sem = asyncio.Semaphore(max_concurrent)
         self._runner = runner
         self._emit = emit
@@ -137,7 +141,8 @@ class SubagentManager:
         self._counter += 1
         # Serial counter (1,2,3…) keeps ids unique; prepend a random funny name
         # purely for flavour, e.g. `gino_2`.
-        sid = f"{random.choice(_FUNNY_NAMES)}_{self._counter}"
+        local_id = f"{random.choice(_FUNNY_NAMES)}_{self._counter}"
+        sid = f"{self.id_prefix}__{local_id}" if self.id_prefix else local_id
         rec = SubagentRecord(
             id=sid, kind=kind, target=target, idea=idea,
             context=context, max_turns=max_turns, finding=finding,

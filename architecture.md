@@ -34,6 +34,11 @@ The default runtime is a **hierarchical, multi-agent design** (execution mode
 - **Validator subagents** — independently investigate a candidate finding from
   scratch and return a confirm/reject/pending verdict plus CVSS scoring.
 
+Mode `c` can also run a fixed-size **live peer swarm** with `--swarm-size N`.
+Each top-level peer retains the hierarchy above while coordinating through a
+transactional work/evidence/message store. Size one follows the legacy mode-c
+path unchanged.
+
 Two simpler execution modes also ship (see §3.2): a single Pentest agent
 (mode `a`) and a fully delegated MCP loop (mode `b`).
 
@@ -199,6 +204,35 @@ orchestrator and never `run()` directly:
 These are intercepted host-side (never `run()`/remoted) and added only to the
 orchestrator's catalog. The orchestrator may also batch several `dispatch_pentester`
 calls in one `actions` envelope to fan out concurrently.
+
+#### 3.3.1 Live peer swarm
+
+With `--swarm-size > 1`, one `SwarmRuntime` owns the engagement lifecycle and runs
+the selected number of `SwarmWorker` peers. Every peer has a globally qualified
+actor/session id, independent conversation and child `SubagentManager`, plus an
+initial coverage lane. The container, registry, approval gate, findings projection,
+audit log, and final report remain single engagement-owned services.
+
+`.pentest/swarm/state.sqlite3` is the durable coordination plane. It uses WAL,
+foreign keys, short locked transactions, and an ordered event stream for workers,
+flat groups, immutable recipient-snapshotted messages, leased/deduplicated work,
+content-addressed evidence, response contributions, and centrally reserved finding
+candidates. Collaboration tools are host-intercepted and are available only to
+top-level peers; Pentester and Validator children cannot recursively join the swarm.
+
+A response cycle freezes its expected peers, collects one contribution or explicit
+unavailable result from each, and passes an immutable snapshot to a dedicated
+tool-less summarizer. The coordinator writes one atomic report. Candidate dedup is
+global to the swarm and only an independent Validator result can commit a terminal
+verdict. Modes `a`/`b` and Ralph reject swarm sizes above one.
+
+The initial response cycle is guarded by an ownership bootstrap. A peer must inspect
+the shared ledger, atomically claim at least one work item, announce its boundary,
+wait for coordination, and call `swarm_finish_bootstrap` before the runtime permits
+ordinary target tools or child dispatch. Exact claims serialize in SQLite; semantic
+overlap is resolved by peer messages before testing begins. Later response cycles are
+follow-ups: peers reuse durable state, the summarizer unwraps accidental final-envelope
+JSON, and `SessionSummary`/report generation occurs again only when findings changed.
 
 **SubagentManager** (`zero/orchestrator/subagents.py`) runs each subagent as an
 independent `asyncio` task, capped by a semaphore (`--max-subagents`, default

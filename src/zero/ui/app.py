@@ -102,6 +102,8 @@ class ZeroUI:
             clear_scrollback=self._clear_scrollback,
             request_exit=self._request_exit,
             running_snapshot=self._running_lines,
+            swarm_snapshot=self._swarm_lines,
+            respond_now=self._respond_now,
         )
         # PromptSession construction does NOT touch the TTY (that happens in
         # prompt_async), so this is safe to build in tests too.
@@ -128,7 +130,12 @@ class ZeroUI:
 
     def _running_snapshot(self) -> list:
         subs = getattr(self.orch, "subagents", None)
-        return subs.snapshot() if subs is not None else []
+        if subs is not None:
+            return subs.snapshot()
+        runtime = getattr(self.orch, "_swarm_runtime", None)
+        if runtime is None:
+            return []
+        return [item for worker in runtime.workers for item in worker.subagents.snapshot()]
 
     def _term_width(self) -> int:
         try:
@@ -259,6 +266,26 @@ class ZeroUI:
                     self._ralph_iter, self._ralph_total, self._ralph_phase)),
                 ("class:dim", " · "),
             ]
+        elif st.mode == "swarm":
+            runtime = getattr(self.orch, "_swarm_runtime", None)
+            snap = runtime.ui_snapshot() if runtime is not None else None
+            if snap is None:
+                mode_frags = [("class:dim", " · swarm · ")]
+            else:
+                phase = str(snap["phase"])
+                detail = (
+                    f"bootstrap {snap['bootstrapped']}/{snap['size']}"
+                    if phase == "bootstrap" else
+                    f"{snap['contributions']}/{snap['size']} contributed"
+                )
+                mode_frags = [
+                    ("class:dim", " · "),
+                    ("class:accent.b", f"SWARM {snap['size']}"),
+                    ("class:dim", f" · {phase} · {detail}"),
+                    ("class:dim", f" · active {snap['active']}"),
+                    ("class:dim", f" · work {snap['work_done']}/{snap['work_total']}"),
+                    ("class:dim", f" · msg {snap['messages']} · "),
+                ]
         else:
             mode_frags = [("class:dim", f" · mode {st.mode} · ")]
         out: list = [
@@ -492,8 +519,24 @@ class ZeroUI:
         """Snapshot of running subagents for the /running command (mode c)."""
         subs = getattr(self.orch, "subagents", None)
         if subs is None:
+            runtime = getattr(self.orch, "_swarm_runtime", None)
+            if runtime is not None:
+                lines = runtime.inspection_lines("agents")
+                for worker in runtime.workers:
+                    snapshot = worker.subagents.format_snapshot()
+                    if "(none)" not in snapshot:
+                        lines.extend(snapshot.splitlines())
+                return lines
             return ["(no subagents — /running is for orchestrated mode)"]
         return subs.format_snapshot().splitlines()
+
+    def _swarm_lines(self, view: str) -> list[str]:
+        runtime = getattr(self.orch, "_swarm_runtime", None)
+        return runtime.inspection_lines(view) if runtime is not None else ["(no live swarm)"]
+
+    def _respond_now(self) -> bool:
+        runtime = getattr(self.orch, "_swarm_runtime", None)
+        return runtime.respond_now() if runtime is not None else False
 
     def _request_exit(self) -> None:
         self._exit = True

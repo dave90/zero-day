@@ -98,7 +98,7 @@ async def test_host_exec_still_runs_if_user_approves():
     assert await gate.check(make_req(RiskLevel.ACTIVE, host_exec=True)) is True
 
 
-async def test_host_exec_always_is_remembered():
+async def test_host_exec_always_stays_below_the_hard_policy_boundary():
     calls = {"n": 0}
 
     async def prompter(_req):
@@ -110,4 +110,9 @@ async def test_host_exec_always_is_remembered():
     r2 = make_req(RiskLevel.ACTIVE, tool="python_exec", host_exec=True)
     assert await gate.check(r1) is True
     assert await gate.check(r2) is True
-    assert calls["n"] == 1  # explicit ALWAYS bypasses the host-exec guard thereafter
+    assert calls["n"] == 2  # a cached grant cannot silently cross the host boundary
+
+    gate = ApprovalGate(prompter=prompter, allow_host_exec=True)
+    assert await gate.check(r1) is True
+    assert await gate.check(r2) is True
+    assert calls["n"] == 3  # with explicit host consent, ALWAYS is reusable

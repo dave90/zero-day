@@ -37,8 +37,9 @@ _BUF_CHARS = 64_000        # ...and at most this many chars
 class _BgJob:
     """One detached `python -u -c <code>` process with captured output + TTL."""
 
-    def __init__(self, job_id: str, code: str, ttl: int) -> None:
+    def __init__(self, job_id: str, code: str, ttl: int, owner_id: str) -> None:
         self.id = job_id
+        self.owner_id = owner_id
         self.ttl = ttl
         self.started = time.monotonic()
         self.status = "running"
@@ -121,6 +122,8 @@ class PythonBgArgs(BaseModel):
     ttl_seconds: int = Field(default=_DEFAULT_TTL, ge=1, le=_MAX_TTL,
                              description="auto-close the job after this many seconds (action=start)")
     tail_lines: int | None = Field(default=None, description="only the last N log lines (action=logs)")
+    # Managed automatically by the orchestrator; any model-supplied value is overwritten.
+    session_id: str = Field(default="_default")
 
 
 class PythonBgTool(Tool):
@@ -151,7 +154,7 @@ class PythonBgTool(Tool):
             return self._logs(args)
         if args.action == "stop":
             return await self._stop(args)
-        return self._list()
+        return self._list(args.session_id)
 
     async def _start(self, args: PythonBgArgs) -> ToolResult:
         if not args.code or not args.code.strip():
@@ -163,7 +166,7 @@ class PythonBgTool(Tool):
                 return ToolResult(ok=False, output=f"too many background jobs (max {_MAX_JOBS}); stop some first")
             self._counter += 1
             job_id = f"bg{self._counter}"
-            job = _BgJob(job_id, args.code, args.ttl_seconds)
+            job = _BgJob(job_id, args.code, args.ttl_seconds, args.session_id)
             try:
                 await job.start()
             except OSError as e:
@@ -179,11 +182,12 @@ class PythonBgTool(Tool):
             meta={"job_id": job_id},
         )
 
-    def _get(self, job_id: str | None) -> _BgJob | None:
-        return self._jobs.get(job_id) if job_id else None
+    def _get(self, job_id: str | None, owner_id: str) -> _BgJob | None:
+        job = self._jobs.get(job_id) if job_id else None
+        return job if job is not None and job.owner_id == owner_id else None
 
     def _logs(self, args: PythonBgArgs) -> ToolResult:
-        job = self._get(args.job_id)
+        job = self._get(args.job_id, args.session_id)
         if job is None:
             return ToolResult(ok=False, output=f"no such job: {args.job_id!r}")
         body = job.logs(args.tail_lines)
@@ -191,18 +195,19 @@ class PythonBgTool(Tool):
         return ToolResult(ok=True, output=f"{header}\n{body}" if body else f"{header}\n(no output yet)")
 
     async def _stop(self, args: PythonBgArgs) -> ToolResult:
-        job = self._get(args.job_id)
+        job = self._get(args.job_id, args.session_id)
         if job is None:
             return ToolResult(ok=False, output=f"no such job: {args.job_id!r}")
         await job.stop()
         return ToolResult(ok=True, output=f"job {job.id} stopped ({job.status}).")
 
-    def _list(self) -> ToolResult:
-        if not self._jobs:
+    def _list(self, owner_id: str) -> ToolResult:
+        jobs = [job for job in self._jobs.values() if job.owner_id == owner_id]
+        if not jobs:
             return ToolResult(ok=True, output="(no background jobs)")
         lines = [
             f"{j.id}  {j.status:18}  {j.elapsed:.0f}s  {j._chars}B captured"
-            for j in self._jobs.values()
+            for j in jobs
         ]
         return ToolResult(ok=True, output="\n".join(lines))
 

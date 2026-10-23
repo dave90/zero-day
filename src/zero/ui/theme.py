@@ -316,12 +316,24 @@ def welcome_banner(cfg: "OrchestratorConfig", *, width: int = 80) -> FormattedTe
         model = codex_effective_model(getattr(cfg, "model", None))
     ctxw = fmt_tokens(getattr(cfg, "context_window", 0) or 0)
     froot = getattr(cfg, "files_root", "zero_files")
+    swarm_size = getattr(cfg, "swarm_size", 1)
+    run_mode = (
+        f"swarm {swarm_size}"
+        if getattr(cfg, "execution_mode", "c") == "c" and swarm_size > 1
+        else f"mode {getattr(cfg, 'execution_mode', 'c')}"
+    )
     config = (
-        f"  mode {getattr(cfg, 'execution_mode', 'c')} · {backend} · {sandbox} · "
+        f"  {run_mode} · {backend} · {sandbox} · "
         f"{model} · ctx {ctxw} · files {froot}"
     )
     line("banner.faint", config)
-    line("banner.faint", "  /help · ↑↓ inspect agents · ^C cancel (×2 quit) · type a goal ↵")
+    if swarm_size > 1:
+        line(
+            "banner.faint",
+            "  /agents · /work · /messages · /groups · ^C cancel (×2 quit) · type a goal ↵",
+        )
+    else:
+        line("banner.faint", "  /help · ↑↓ inspect agents · ^C cancel (×2 quit) · type a goal ↵")
     line("")
     return FormattedText(frags)
 

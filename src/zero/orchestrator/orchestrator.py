@@ -205,6 +205,9 @@ class OrchestratorConfig:
     rate_limit: str = "100/min"
     replay_audit_path: Path | None = None
     execution_mode: str = "c"   # c=orchestrated (default), a=single agent, b=MCP
+    # Fixed top-level peer count. Size one deliberately retains the mature legacy
+    # mode-c loop; larger values select the shared live-swarm runtime.
+    swarm_size: int = 1
     # How much of the agent's free-form `thought` reaches the chat. The full
     # thought is always recorded in thinking.log; this only controls the UI.
     #   "condensed" (default) — first sentence, one clean line
@@ -257,6 +260,12 @@ class OrchestratorConfig:
 class Orchestrator:
     def __init__(self, cfg: OrchestratorConfig) -> None:
         self.cfg = cfg
+        if cfg.swarm_size < 1:
+            raise ValueError("swarm_size must be at least 1")
+        if cfg.swarm_size > 1 and cfg.execution_mode != "c":
+            raise ValueError("swarm_size > 1 is supported only in execution mode c")
+        if cfg.swarm_size > 1 and cfg.ralph:
+            raise ValueError("swarm_size > 1 cannot be combined with Ralph")
         self._context_window_explicit = self.cfg.context_window is not None
         # Resolve the UI context-window denominator now (once) when left on auto, so the
         # ctx% reflects the ACTUAL backend's window — Codex's effective runtime limit
@@ -310,6 +319,9 @@ class Orchestrator:
         self.subagent_backend = self._build_subagent_backend()
         self.validator_backend = self._build_validator_backend()
         self.rate_limiter = RateLimiter(default_rate=cfg.rate_limit)
+        # Swarm peers install their own limiter under qualified actor/child ids;
+        # single-session callers continue to use `rate_limiter` as the fallback.
+        self._actor_rate_limiters: dict[str, RateLimiter] = {}
         self.ask_governor = AskUserGovernor(yolo=cfg.yolo)
         self.findings_store = FindingsStore(cfg.cwd / ".pentest" / "findings")
         self.router: AgentRouter | None = None  # built after project context loads
@@ -355,6 +367,11 @@ class Orchestrator:
         # Set by the RPC recovery hook when a lost sandbox is re-created, so the next tool
         # observation warns the agent its in-container session state was reset.
         self._sandbox_reset_pending = False
+        self._swarm_runtime = None
+        # Deterministic scripted factories used by offline swarm tests. Production
+        # builds a fresh selected backend for every peer and the summarizer.
+        self._swarm_backend_factory: Any = None
+        self._swarm_summarizer_backend_factory: Any = None
 
     # ------------------------------------------------------------------ setup
 
@@ -571,9 +588,15 @@ class Orchestrator:
                 self._agent_main_mode_b(project_ctx), name="agent_mode_b"
             )
         elif self.cfg.execution_mode == "c":
-            agent_task = asyncio.create_task(
-                self._orchestrator_main(project_ctx), name="orchestrator"
-            )
+            if self.cfg.swarm_size > 1:
+                from zero.swarm.runtime import SwarmRuntime
+
+                self._swarm_runtime = SwarmRuntime(self, project_ctx)
+                agent_task = asyncio.create_task(self._swarm_runtime.run(), name="swarm")
+            else:
+                agent_task = asyncio.create_task(
+                    self._orchestrator_main(project_ctx), name="orchestrator"
+                )
         else:
             agent_task = asyncio.create_task(self._agent_main(project_ctx), name="agent")
         try:
@@ -584,6 +607,8 @@ class Orchestrator:
                 await agent_task
             except (asyncio.CancelledError, Exception):
                 pass
+            if self._swarm_runtime is not None:
+                await self._swarm_runtime.close()
             await self._close_tool_sessions()
             await self._teardown_container()
             self.audit.write("session_end")
@@ -2444,7 +2469,7 @@ class Orchestrator:
         # (infra, not LLM-set) so each actor — orchestrator, each pentester/
         # validator subagent — gets an isolated session and its OWN memory file.
         if tool.name in (
-            "python_exec", "memory_read", "memory_write", "todo_read", "todo_write",
+            "python_exec", "python_bg", "memory_read", "memory_write", "todo_read", "todo_write",
         ):
             args = {**args, "session_id": session_id}
         try:
@@ -2452,8 +2477,9 @@ class Orchestrator:
         except ValidationError as e:
             return ToolResult(ok=False, output=f"args validation error: {e}")
         host = _extract_target_host(args)
-        if host and not self.rate_limiter.disabled():
-            await self.rate_limiter.acquire(host)
+        limiter = self._actor_rate_limiters.get(session_id, self.rate_limiter)
+        if host and not limiter.disabled():
+            await limiter.acquire(host)
         try:
             result = await tool.run(parsed)
         except asyncio.CancelledError:
@@ -2583,6 +2609,8 @@ class Orchestrator:
 
     def request_cancel_turn(self) -> bool:
         """Cancel the in-flight agent turn. Returns True if there was one."""
+        if self._swarm_runtime is not None:
+            return self._swarm_runtime.cancel_turns()
         t = self._current_turn_task
         if t and not t.done():
             t.cancel()

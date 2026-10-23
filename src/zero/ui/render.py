@@ -19,6 +19,7 @@ from zero.ui.events import (
     SubagentFinished,
     SubagentProgress,
     SubagentStarted,
+    SwarmPhase,
     TodoUpdate,
     ToolObservation,
     ToolProposal,
@@ -113,6 +114,12 @@ def render_event(ev: UIEvent) -> Iterable[str]:
             yield f"╭─ ralph · iteration {ev.iteration}/{ev.total} ({ev.phase}) ─────"
         else:
             yield f"╭─ ralph · {ev.phase} ─────"
+        for line in (ev.text.splitlines() or [""]):
+            yield f"│  {line}"
+        yield "╰────────────"
+    elif isinstance(ev, SwarmPhase):
+        yield ""
+        yield f"╭─ swarm · {ev.size} peers · {ev.phase} ─────"
         for line in (ev.text.splitlines() or [""]):
             yield f"│  {line}"
         yield "╰────────────"

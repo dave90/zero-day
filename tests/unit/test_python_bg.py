@@ -124,3 +124,23 @@ async def test_logs_unknown_job():
     t = PythonBgTool()
     r = await t.run(PythonBgArgs(action="logs", job_id="nope"))
     assert r.ok is False and "no such job" in r.output
+
+
+async def test_jobs_are_private_to_the_injected_actor():
+    t = PythonBgTool()
+    try:
+        start = await t.run(PythonBgArgs(
+            action="start", code="import time; time.sleep(30)", ttl_seconds=30,
+            session_id="actor-a",
+        ))
+        job_id = start.meta["job_id"]
+        own = await t.run(PythonBgArgs(action="list", session_id="actor-a"))
+        other = await t.run(PythonBgArgs(action="list", session_id="actor-b"))
+        denied = await t.run(PythonBgArgs(
+            action="logs", job_id=job_id, session_id="actor-b"
+        ))
+        assert job_id in own.output
+        assert "no background jobs" in other.output
+        assert not denied.ok and "no such job" in denied.output
+    finally:
+        await t.aclose()

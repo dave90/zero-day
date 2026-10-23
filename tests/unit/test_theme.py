@@ -71,6 +71,23 @@ def test_welcome_banner_shows_effective_codex_model(tmp_path, monkeypatch):
     assert "claude-opus" not in banner
 
 
+def test_welcome_banner_makes_swarm_mode_obvious():
+    cfg = SimpleNamespace(
+        backend="echo",
+        model="test-model",
+        execution_mode="c",
+        swarm_size=10,
+        use_container=True,
+        context_window=200_000,
+        files_root="zero_files",
+    )
+
+    banner = fragment_list_to_text(theme.welcome_banner(cfg))
+
+    assert "swarm 10" in banner
+    assert "/agents · /work · /messages · /groups" in banner
+
+
 # ----------------------------------------------------- marker → class map
 
 def test_tool_proposal_colors_tool_risk_and_args():

@@ -278,6 +278,21 @@ class RalphIteration:
 
 
 @dataclass
+class SwarmPhase:
+    """A visible swarm lifecycle boundary in the session scrollback.
+
+    Swarm coordination is otherwise mostly database/audit traffic.  These
+    deliberately sparse banners make it obvious that the CLI is running a
+    peer swarm without dumping every peer message into the operator chat.
+    """
+
+    kind: Literal["swarm_phase"] = "swarm_phase"
+    phase: str = "bootstrap"
+    size: int = 0
+    text: str = ""
+
+
+@dataclass
 class SessionEnd:
     """The orchestrator is shutting down; UI should exit."""
 
@@ -304,5 +319,6 @@ UIEvent = (
     | SubagentProgress
     | SubagentFinished
     | RalphIteration
+    | SwarmPhase
     | SessionEnd
 )
