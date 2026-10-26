@@ -113,7 +113,7 @@ async def _drive(orch: Orchestrator, *, deadline: float) -> None:
 )
 async def test_blind_coverage(
     regression_target, spec, tmp_path: Path, monkeypatch, regression_blind_scorecard,
-    regression_backend,
+    regression_backend, regression_api_options,
 ):
     url = regression_target
     (tmp_path / "pentest.md").write_text(
@@ -126,6 +126,7 @@ async def test_blind_coverage(
         cwd=tmp_path,
         goal="Black-box pentest: find and confirm as many distinct vulnerabilities as possible.",
         backend=regression_backend,
+        **regression_api_options,
         execution_mode="c",
         use_container=True,
         yolo=True,

@@ -52,7 +52,7 @@ task planning, completion checks, and durable progress (§3.15). Engagement-loca
 |---|---|
 | Containerized **tool execution** (Docker), ON by default | Isolates offensive tooling from the host. Note: only *tool calls* run in the container — the agent loops run on the host (see §2, §4). |
 | Burp Suite as the traffic source (not MCP browser) | Burp handles auth, websockets, TLS interception, and complex SPAs that browser MCPs choke on. |
-| Authenticated CLI backends | `CodexCLIBackend` is the default; `ClaudeCodeBackend` is also supported. Each reuses the selected CLI's authentication. |
+| LLM backends | Codex (default) and Claude reuse CLI authentication; `ApiBackend` calls provider APIs through the LiteLLM SDK. |
 | Pluggable `LLMBackend` interface | Modes `a`/`c` share a turn-based interface for Codex and Claude. Mode `b` uses the Claude MCP adapter specifically. |
 | Human-in-the-loop by default | Registry tool execution follows the approval policy, with declared no-approval tools and session approvals (§3.9). |
 | Project context file (`pentest.md`) | Per-engagement scope, credentials, and rules of engagement; separate from repository guidance in `AGENTS.md`. |
@@ -291,9 +291,9 @@ history.
 > 📋 **Roadmap — shared cross-finding history & token-budget summarization.**
 > The original design called for the Validator to keep one conversation across
 > findings and for the orchestrator to auto-compact older turns near a token
-> budget. Today each validation runs with a fresh history and there is no
-> harness-managed history summarization/compaction of agent context. Backend CLI
-> session behavior is separate from this harness limitation. (Each actor *does*
+> budget. Today each validation runs with a fresh history. API actors have bounded
+> context compression (§3.5); CLI actors rely on their backend's session management.
+> Shared cross-finding validator history remains unimplemented. (Each actor *does*
 > keep a self-managed per-run **memory** file — §3.14 — but that's a scratchpad,
 > not automatic context compaction. The UI also compacts tool-observation
 > *rendering*, which is unrelated.)
@@ -386,9 +386,35 @@ class LLMBackend(ABC):
 - `ClaudeCodeBackendModeB` — registers an in-process MCP bridge and runs the
   `claude` CLI in agent mode (backend Mode B; used by execution mode `b`).
 - `EchoBackend`, `ReplayBackend` — test/replay fixtures (not for production).
+- `ApiBackend` — calls `litellm.acompletion` on the host. Requires an explicit
+  provider/model and provider credentials; accepts a custom compatible API base.
+  Supports modes `a`/`c`, Ralph, and swarm independently. Mode `b` rejects API access;
+  the existing Ralph-plus-swarm restriction remains.
 
-> 📋 **Roadmap — `ApiBackend`.** The interface can also support a raw API backend
-> for pay-per-token use; that adapter is not implemented yet.
+**API actor state and lifecycle.** `AgentLoop` calls `backend.fork()` so each API
+actor owns an independent compression view and reasoning continuation metadata,
+including Ralph analyzers/reviewers and background Validators built from a shared
+backend prototype. Existing CLI and fixture adapters return themselves from `fork`.
+API actors have no persistent CLI `Session`: each call receives complete local history.
+The first engagement message and recent complete turns remain verbatim; bounded
+compression summarizes older turns without modifying `AgentLoop.history`. Input
+space reserves the output cap plus a safety margin, using conservative local byte
+estimates and bundled context metadata. Unknown model context sizes require an override.
+
+One engagement-owned `ApiRuntime` shares an async HTTP session, a request semaphore,
+and discovered output-format support across all actor forks. The default concurrent
+request cap is 4 and includes compression and swarm summaries. Transient requests
+retry twice by default, with provider SDK retries disabled; the complete backend
+call deadline covers queueing, compression and backoff. Permanent errors stop an
+actor's outer retries; shared authentication/billing failures prevent further API
+requests with the same engagement credentials. Cancellation drains actors before
+the owned transport closes. Model credentials are not forwarded to the tool sandbox.
+
+API traces use per-actor files and redact credentials before writing either trace
+or audit metadata. Provider text is normalized into the existing envelope protocol;
+reasoning blocks stay separate. Capability-aware JSON mode has a bounded fallback
+for a specific unsupported-format error. The tool-less swarm summarizer explicitly
+uses plain-text output, without the agent catalog/envelope instructions.
 
 #### 3.5.1 Tool execution: two backend modes
 
@@ -724,9 +750,9 @@ to its memory on completion — merged below any notes the agent wrote. This is 
 makes `read_subagent_memory` reliably useful even when a subagent produced a thin
 final or died.
 
-> 📋 **Roadmap — harness-managed token-budget auto-compaction** of agent context
-> is still not implemented. Scratchpads and backend CLI session management are
-> separate from automatic history summarization in the harness. See §9.
+> API actors compress older turns in their local request view (§3.5). CLI actors
+> retain backend-managed sessions; a common harness compaction policy across all
+> backends remains roadmap work. Scratchpads are separate from automatic compaction.
 
 ### 3.15 Ralph planning and iteration
 

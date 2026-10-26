@@ -19,6 +19,7 @@ created lazily and cached. Nothing here touches the root logger or other handler
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -30,6 +31,16 @@ _log_root: Path | None = None
 _root_resolved = False
 _loggers: dict[str, logging.Logger] = {}
 _unsafe = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def trace_api_call(actor: str, record: dict) -> None:
+    """Log a credential-sanitized API record using the same per-actor lifecycle."""
+    logger = _logger_for(actor)
+    if logger is not None:
+        try:
+            logger.info("API %s", json.dumps(record, ensure_ascii=False))
+        except Exception:  # noqa: BLE001 — logging must not break an actor
+            pass
 
 
 def set_llm_log_root(path: Path | str | None) -> None:

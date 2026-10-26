@@ -215,7 +215,10 @@ class SwarmRuntime:
     async def _summarize(self, snapshot: dict[str, Any]) -> str:
         factory = getattr(self.services, "_swarm_summarizer_backend_factory", None)
         try:
-            backend = factory() if factory is not None else self.services._build_backend()
+            backend = factory() if factory is not None else self.services._build_backend(
+                purpose="summary"
+            )
+            backend.set_actor(f"swarm-{self.store.swarm_id}__summarizer-{uuid.uuid4().hex[:6]}")
             summarizer = SwarmSummarizer(
                 backend,
                 session=self.services._make_session(

@@ -14,8 +14,12 @@ def pytest_addoption(parser):
         "--regression-backend",
         action="store",
         default="codex",
-        choices=("claude", "codex"),
+        choices=("claude", "codex", "api"),
         help="LLM backend to drive the capability regression / blind suites against"
         " (default: codex). Use 'claude' to run the SAME vulnerable targets through the"
         " Claude Code CLI. Requires that backend's CLI on PATH + authenticated.",
     )
+    parser.addoption("--regression-model", default=None, help="Explicit API provider/model.")
+    parser.addoption("--regression-api-base-url", default=None)
+    parser.addoption("--regression-api-key-env", default=None)
+    parser.addoption("--regression-context-window", type=int, default=None)

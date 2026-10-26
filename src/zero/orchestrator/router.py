@@ -16,9 +16,9 @@ Cross-agent isolation: nothing leaks except the structured `Finding` and
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 from zero.agents.base import AgentLoop
 from zero.agents.validator import (
@@ -29,7 +29,7 @@ from zero.agents.validator import (
 from zero.findings.dedup import dedup_hash
 from zero.findings.schema import Finding, FindingRecord, Validation, Verdict
 from zero.findings.store import FindingsStore, new_finding_id
-from zero.llm.backend import LLMBackend, Session
+from zero.llm.backend import LLMBackend, Session, terminal_backend_error
 from zero.llm.envelope import ActionEnvelope, ActionsEnvelope, AskUserEnvelope, FinalEnvelope
 
 
@@ -99,6 +99,7 @@ class AgentRouter:
             max_turns=self.validator_max_turns,
             session=self._session_factory(f"validator-{h[:8]}") if self._session_factory else None,
         )
+        loop.backend.set_actor(f"validator-{h[:10]}")
         seed_with_finding(loop, finding)
         if self.goal:
             loop.add_user_message(
@@ -205,8 +206,6 @@ def _format_validator_feedback(rec_id: str, v: Validation) -> str:
 # Callable type: orchestrator-side driver that runs the validator's loop to
 # completion (handling its own tool calls + approvals + ask_user). Returns
 # the parsed Validation or None.
-from typing import Any, Awaitable, Callable
-
 ValidatorDriver = Callable[[AgentLoop], Awaitable[Validation | None]]
 
 
@@ -240,7 +239,7 @@ async def default_validator_driver(
             raise
         except Exception as e:  # noqa: BLE001 — a backend glitch must not kill validation
             consecutive_errors += 1
-            if consecutive_errors >= 3:
+            if terminal_backend_error(e) or consecutive_errors >= 3:
                 # Persistent failure: re-raise so handle_finding_submit captures the
                 # actual error in the finding's notes (parked pending WITH the reason),
                 # instead of a blind "no Validation".

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from zero.agents.swarm_orchestrator import build_swarm_orchestrator_loop
 from zero.findings.dedup import dedup_hash
+from zero.llm.backend import terminal_backend_error
 from zero.llm.envelope import ActionEnvelope, ActionsEnvelope, AskUserEnvelope, FinalEnvelope
 from zero.orchestrator.subagents import SubagentManager
 from zero.orchestrator.rate_limit import RateLimiter
@@ -100,6 +101,7 @@ class SwarmWorker:
             max_turns=self.services.cfg.max_turns,
             session=self.services._make_session(ident.actor_id),
         )
+        self.loop.backend.set_actor(ident.actor_id)
         directory = ", ".join(
             f"{w['worker_id']}={w['name']} ({w['lane']})" for w in self.runtime.store.workers()
         )
@@ -137,7 +139,7 @@ class SwarmWorker:
                         error=f"{type(exc).__name__}: {exc}",
                         consecutive=consecutive_turn_errors,
                     )
-                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    if terminal_backend_error(exc) or consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
                         raise
                     self.loop.add_observation(
                         "(system)", False,

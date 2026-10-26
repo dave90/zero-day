@@ -68,6 +68,13 @@ def context_tokens_from_usage(usage: dict[str, int] | None) -> int:
 
 
 class LLMBackend(ABC):
+    def fork(self) -> LLMBackend:
+        """Own one actor's request state. Stateless/CLI adapters can share themselves."""
+        return self
+
+    def set_actor(self, name: str) -> None:
+        """Optional trace label, independent of persistent provider sessions."""
+
     @abstractmethod
     async def run(
         self,
@@ -96,3 +103,15 @@ class LLMBackend(ABC):
         """Optional: stream tokens. Default falls back to one-shot run."""
         resp = await self.run(system_prompt, messages, tools, session=session)
         yield resp.text
+
+
+class BackendError(RuntimeError):
+    """An already-classified backend failure; permanent errors must not be re-driven."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def terminal_backend_error(error: Exception) -> bool:
+    return isinstance(error, BackendError) and not error.retryable

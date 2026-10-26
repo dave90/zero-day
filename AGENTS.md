@@ -70,6 +70,9 @@ append a `TargetSpec` (verify the image is pullable first).
     (Claude Code runs its own loop, regardless of `--backend`).
 - **Backends:** `--backend codex` is the default; `--backend claude` is also
   supported for modes `a`/`c`. Both support persistent per-actor CLI sessions.
+  `--backend api --model provider/model` uses the host-side LiteLLM SDK with provider
+  credentials; supports modes `a`/`c`, Ralph, and swarm independently, with full local
+  history rather than CLI session deltas. See `llm/api.py`.
 - **Agent loop** (`agents/base.py`): one step per turn. The LLM returns a flat,
   `type`-tagged JSON **envelope** — `{"type":"action"|"actions"|"ask_user"|"final", ...}`
   (`llm/envelope.py`). The caller runs the tool/answers, appends an observation,
@@ -184,9 +187,15 @@ append a `TargetSpec` (verify the image is pullable first).
   approvals are a separate policy; see architecture.md §3.9 for its limits.
 - **Scope is advisory, not a hard gate.** There is no `violates_scope → BLOCK`;
   `--scope-host` only blocklists hosts for `web_fetch`. (Roadmap in architecture.md §9.)
-- **Production backends are `codex` (default) and `claude`.** `echo`/`replay`
+- **Production backends are `codex` (default), `claude`, and `api`.** `echo`/`replay`
   are internal fixtures, not choices for `zero run --backend`. Mode `b` uses the
-  Claude MCP adapter regardless of that setting.
+  Claude MCP adapter; it rejects `--backend api`.
+- **API state belongs to an actor.** `AgentLoop` forks API prototypes so context
+  compression and reasoning metadata never cross actors. All forks share the
+  engagement's `ApiRuntime` request cap and owned HTTP session; do not put history
+  there or apply CLI delta-session handling. The swarm summarizer needs explicit
+  plain-text purpose. API tests are free with the loopback provider; `live_api`
+  tests also carry `live` and require model credentials/credits.
 - **Container is ON by default** and falls back to host execution if startup
   fails. Host-exec approval policy then applies. `--no-container` forces host.
 - **The UI is inline** (no alternate screen, no overlays); approvals/asks render in

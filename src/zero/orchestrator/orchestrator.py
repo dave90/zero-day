@@ -20,7 +20,8 @@ from pydantic import ValidationError
 
 from zero.agents.pentest import build_pentest_loop
 from zero.agents.orchestrator_agent import build_orchestrator_loop, parse_pentester_result
-from zero.llm.backend import LLMBackend, Session
+from zero.llm.backend import LLMBackend, Session, terminal_backend_error
+from zero.llm.api import ApiBackend, ApiConfig, ApiRuntime, resolve_context_window
 from zero.llm.envelope import (
     ActionEnvelope,
     ActionsEnvelope,
@@ -136,6 +137,7 @@ class OrchestratorConfig:
     cwd: Path
     goal: str | None = None
     backend: str = "codex"  # production default; "echo" is a test-only fixture
+    api: ApiConfig | None = None
     # Persistent backend sessions: Claude keeps a `--session-id` conversation and Codex
     # keeps a thread id; both send only the new turn on resume instead of re-shipping the
     # full transcript. `--no-session-resume` reverts to the stateless path.
@@ -218,8 +220,8 @@ class OrchestratorConfig:
     # CLI default is the newest Claude Opus 1M id; Codex deliberately ignores Claude ids
     # and uses its configured default. Override with --model; None ⇒ account default.
     model: str | None = "claude-opus-5[1m]"
-    # Model context-window size used ONLY for the UI's "ctx used/window (%)" display
-    # (per agent). `None` ⇒ resolve it backend-aware at startup (Codex reports its real
+    # Model context window for the per-agent display and API input budgeting.
+    # `None` ⇒ resolve it backend-aware at startup (Codex reports its real
     # window at runtime; Claude infers 1M for a '[1m]' model else 200k) — see
     # Orchestrator._resolve_context_window. An explicit int (e.g. from --context-window)
     # is always honored.
@@ -266,7 +268,23 @@ class Orchestrator:
             raise ValueError("swarm_size > 1 is supported only in execution mode c")
         if cfg.swarm_size > 1 and cfg.ralph:
             raise ValueError("swarm_size > 1 cannot be combined with Ralph")
-        self._context_window_explicit = self.cfg.context_window is not None
+        # Capture whether the operator supplied an override before API metadata
+        # resolution writes the inferred value back into the shared config.
+        self._context_window_explicit = cfg.context_window is not None
+        self._api_runtime: ApiRuntime | None = None
+        if cfg.backend == "api":
+            if cfg.execution_mode == "b":
+                raise ValueError("--backend api is not supported in execution mode b")
+            if not cfg.model or "/" not in cfg.model:
+                raise ValueError("--backend api requires an explicit provider/model in --model")
+            cfg.api = cfg.api or ApiConfig()
+            cfg.context_window = resolve_context_window(cfg.model, cfg.context_window)
+            self._api_runtime = ApiRuntime(
+                cfg.api, cfg.model, cfg.context_window,
+                timeout=cfg.llm_timeout_seconds, trace=cfg.llm_log,
+            )
+        elif cfg.api is not None:
+            raise ValueError("API options require --backend api")
         # Resolve the UI context-window denominator now (once) when left on auto, so the
         # ctx% reflects the ACTUAL backend's window — Codex's effective runtime limit
         # is far below Claude's 1M, and a stale denominator would mislead. An explicit
@@ -288,6 +306,8 @@ class Orchestrator:
         self._memory_root_abs.mkdir(parents=True, exist_ok=True)
         os.environ["ZERO_MEMORY_ROOT"] = str(self._memory_root_abs)
         self.audit = AuditLog(cfg.cwd / ".pentest" / "audit.jsonl")
+        if self._api_runtime is not None:
+            self._api_runtime.audit = self.audit
         # Readable reasoning log for the orchestrator + every subagent.
         self.thinking = ThinkingLog(cfg.cwd / ".pentest" / "thinking.log")
         self.ui_queue: asyncio.Queue[UIEvent] = asyncio.Queue()
@@ -409,6 +429,8 @@ class Orchestrator:
 
     def _effective_model_name(self) -> str:
         """Return the model the selected backend will actually receive."""
+        if self.cfg.backend == "api":
+            return self.cfg.model or ""
         backend_cfg = getattr(self.backend, "cfg", None)
         model = getattr(backend_cfg, "model", None)
         if self.cfg.backend == "codex":
@@ -417,7 +439,10 @@ class Orchestrator:
             return codex_effective_model(model)
         return model or "account-default"
 
-    def _build_backend(self) -> LLMBackend:
+    def _build_backend(self, *, purpose: str = "agent") -> LLMBackend:
+        if self.cfg.backend == "api":
+            assert self._api_runtime is not None
+            return ApiBackend(self._api_runtime, actor="orchestrator", purpose=purpose)
         if self.cfg.backend == "echo":
             from zero.llm.echo import EchoBackend
 
@@ -609,7 +634,17 @@ class Orchestrator:
                 pass
             if self._swarm_runtime is not None:
                 await self._swarm_runtime.close()
+            # Background validators must stop using the shared API transport before
+            # it closes. Mode-a cancellation may have scheduled their cancellation
+            # without awaiting it yet.
+            validators = list(self._validation_tasks)
+            for task in validators:
+                task.cancel()
+            if validators:
+                await asyncio.gather(*validators, return_exceptions=True)
             await self._close_tool_sessions()
+            if self._api_runtime is not None:
+                await self._api_runtime.aclose()
             await self._teardown_container()
             self.audit.write("session_end")
             self.audit.close()
@@ -1010,7 +1045,7 @@ class Orchestrator:
                             "final) — no prose, no markdown fence, no trailing data."
                         ),
                     )
-                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    if terminal_backend_error(e) or consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
                         await self._emit(AgentTextDelta(
                             text=(
                                 f"\n[turn error ×{consecutive_turn_errors}] "
@@ -1074,6 +1109,8 @@ class Orchestrator:
             await self._emit(SessionEnd())
 
     async def _do_turn(self, loop, *, agent: str = "pentest", mode: str = "a") -> Any:
+        if isinstance(loop.backend, ApiBackend) and loop.backend.actor.startswith("orchestrator-"):
+            loop.backend.set_actor(agent)
         # Emit BEFORE the LLM call so the user sees the agent is working
         # during the (potentially multi-second) wait. loop.turn updates
         # inside loop.step(), so we render `current_turn + 1`.
@@ -1281,6 +1318,7 @@ class Orchestrator:
         analyzer_validator. Unattended: an `ask_user` is auto-answered to proceed.
         Bounded by the loop's own turn cap plus a wall-clock deadline; on repeated
         backend errors it returns a short diagnostic string instead of crashing."""
+        loop.backend.set_actor(session_id)
         start = time.monotonic()
         deadline = start + (deadline_seconds or self.cfg.subagent_deadline_seconds)
         consecutive = 0
@@ -1297,7 +1335,7 @@ class Orchestrator:
                     "ralph_agent_turn_error", agent=agent_label,
                     error=f"{type(e).__name__}: {e}", consecutive=consecutive,
                 )
-                if consecutive >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                if terminal_backend_error(e) or consecutive >= _MAX_CONSECUTIVE_TURN_ERRORS:
                     return f"(stopped after {consecutive} backend errors: {type(e).__name__}: {e})"
                 loop.add_observation(
                     "(system)", False,
@@ -1357,6 +1395,7 @@ class Orchestrator:
             max_turns=max_turns,
             session=self._make_session(session_label),
         )
+        loop.backend.set_actor(session_label)
         self._active_loop = loop
         base_system_prompt = loop.system_prompt
         for msg in seed_messages:
@@ -1385,7 +1424,7 @@ class Orchestrator:
                         f"your previous turn failed: {e}. Reply with EXACTLY ONE valid JSON"
                         " envelope (action / actions / final).",
                     )
-                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    if terminal_backend_error(e) or consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
                         final_summary = f"(pass aborted after {consecutive_turn_errors} errors: {e})"
                         break
                     continue
@@ -1531,7 +1570,7 @@ class Orchestrator:
                             "final) — no prose, no markdown fence, no trailing data."
                         ),
                     )
-                    if consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                    if terminal_backend_error(e) or consecutive_turn_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
                         await self._emit(AgentTextDelta(
                             text=(
                                 f"\n[turn error ×{consecutive_turn_errors}] "
@@ -1955,6 +1994,7 @@ class Orchestrator:
             max_turns=rec.max_turns or self.cfg.pentester_max_turns,
             session=self._make_session(f"pentester-{rec.id}"),
         )
+        loop.backend.set_actor(f"pentester-{rec.id}")
         rec.loop = loop
         brief = (
             f"You are a focused pentester subagent. TARGET: {rec.target}\n"
@@ -2054,7 +2094,7 @@ class Orchestrator:
                     "subagent_turn_error", subagent_id=rec.id,
                     error=f"{type(e).__name__}: {e}", consecutive=consecutive_errors,
                 )
-                if consecutive_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
+                if terminal_backend_error(e) or consecutive_errors >= _MAX_CONSECUTIVE_TURN_ERRORS:
                     elapsed = time.monotonic() - start
                     self._autowrite_memory(
                         rec.id,
@@ -2344,6 +2384,7 @@ class Orchestrator:
             # validator loop is built inside the router, so we capture it here).
             if record is not None:
                 record.loop = sub_loop
+                sub_loop.backend.set_actor(f"validator-{session_id}")
             return await default_validator_driver(
                 sub_loop,
                 action_handler=action_handler,

@@ -45,7 +45,7 @@ writes the evidence to a local report—all from an interactive terminal.
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/)
 - An authenticated OpenAI Codex CLI (`codex` on `PATH`), or Claude Code when using
-  `--backend claude`
+  `--backend claude`, or a provider API key when using `--backend api` (no coding CLI needed)
 - Select the model you want in Codex or Claude Code before starting `zero`. The default Codex
   backend uses the model configured in Codex. To use the model selected in Claude Code, run with
   `--backend claude --model ''`; otherwise the Claude backend pins its documented default model.
@@ -162,12 +162,12 @@ Use `--files-root <path>` to provide a different directory.
 
 ## Configuration
 
-Most runs only need `pentest.md`, `--scope-host`, and a goal. No project-specific environment
-variables are required; `zero` uses the selected CLI's existing authentication.
+Most runs only need `pentest.md`, `--scope-host`, and a goal. CLI backends use existing
+authentication; the API backend reads the selected provider's credential environment.
 
 | Option | Default | Use it to |
 | --- | --- | --- |
-| `--backend <name>` | `codex` | Select `codex` or `claude` as the authenticated LLM CLI |
+| `--backend <name>` | `codex` | Select `codex`, `claude`, or direct model API access through `api` |
 | `--model <id>` | Codex CLI default; `claude-opus-5[1m]` for Claude | Pin one model for every agent |
 | `--scope-host <host>` | None | Route an in-scope host away from the safe `web_fetch` tool; repeat per host |
 | `--max-turns <n>` | `10` | Bound orchestrator turns |
@@ -184,6 +184,74 @@ See every option with:
 ```bash
 uv run zero run --help
 ```
+
+### API models through LiteLLM
+
+Set your provider key in the host environment, for example `OPENROUTER_API_KEY`, then run:
+
+```bash
+uv run zero run --backend api --model openrouter/z-ai/glm-5.3 --goal "..."
+uv run zero run --backend api --model openrouter/z-ai/glm-5.3 --ralph --goal "..."
+uv run zero run --backend api --model openrouter/z-ai/glm-5.3 --swarm-size 3 --goal "..."
+```
+
+LiteLLM runs inside Zero and calls the selected provider. No OpenCode installation or
+LiteLLM gateway is needed. Use an explicit LiteLLM `provider/model` identifier; hosted
+open models and commercial models use the same agent/tool workflow. API access supports
+modes `a` and `c`, all Ralph phases/resume, and swarm peers, children, validation, and
+summarization. Ralph and swarm sizes above one remain mutually exclusive. Mode `b`
+requires the Claude Code MCP backend and rejects `--backend api`.
+
+For a hosted or self-hosted OpenAI-compatible chat endpoint:
+
+```bash
+# Set MODEL_API_KEY in the environment first.
+uv run zero run --backend api --model openai/organization/model-name \
+  --api-base-url https://inference.example.com/v1 --api-key-env MODEL_API_KEY \
+  --context-window 131072 --goal "..."
+```
+
+`--api-base-url` follows the provider's LiteLLM convention: OpenAI-compatible endpoints
+usually include `/v1`; Anthropic uses the server root because its adapter adds
+`/v1/messages`. Do not include a completion endpoint or credentials in the URL.
+`--api-key-env` overrides standard credential discovery without putting a key in argv.
+Other providers can use their standard LiteLLM credential environment.
+
+The API output cap defaults to 16384 tokens, including provider-counted reasoning;
+adjust `--api-max-output-tokens` if a reasoning model exhausts its output before emitting
+an envelope. `--api-reasoning-effort` passes an explicit supported effort value.
+`--api-response-format auto|json|text` defaults to capability-aware JSON/text selection.
+Every response is validated by Zero's envelope parser. The swarm summarizer uses plain text.
+
+`--api-max-concurrency` defaults to 4 across the whole engagement, including all swarm
+peers and Ralph roles; it is separate from target-host rate limits. `--api-retries`
+defaults to 2 transient retries; `--llm-timeout` bounds a whole backend call including
+queueing, compression, attempts and backoff. Authentication and configuration errors
+stop the current actor without repeatedly spending its turn budget.
+
+Context limits come from bundled metadata, with a conservative fallback for the initial
+GLM 5.3 integration. Unknown model IDs require `--context-window`. API actors keep local
+history and compress older turns near the limit while retaining recent turns and the
+original audit history. Token estimates are conservative and do not download tokenizers.
+Provider/model compatibility does not imply equal finding quality; new models should
+be checked with the opt-in capability regression suite.
+
+Default unit and local API end-to-end tests use mocks or dummy keys and spend no credits.
+Live provider tests require an explicit model and credentials:
+
+```bash
+ZERO_TEST_API_MODEL=openrouter/z-ai/glm-5.3 \
+  uv run pytest tests/e2e/test_live_api.py -m live_api -q
+uv run pytest -m regression --regression-backend api \
+  --regression-model openrouter/z-ai/glm-5.3 -k dvwa
+```
+
+The live tests also accept `ZERO_TEST_API_BASE_URL`, `ZERO_TEST_API_KEY_ENV`, and
+`ZERO_TEST_API_CONTEXT_WINDOW`. Regression equivalents are `--regression-api-base-url`,
+`--regression-api-key-env`, and `--regression-context-window`. All live API and capability
+regression tests remain excluded from the default test run and spend provider credits
+when explicitly selected. Loopback transport tests cover OpenAI-compatible and Anthropic
+request formats; live compatibility must be verified with your chosen provider/model.
 
 ### Approval controls
 

@@ -118,7 +118,7 @@ async def _drive(orch: Orchestrator, *, deadline: float) -> None:
 )
 async def test_regression_target(
     regression_target, spec, tmp_path: Path, monkeypatch, regression_scorecard,
-    regression_backend,
+    regression_backend, regression_api_options,
 ):
     url = regression_target
     (tmp_path / "pentest.md").write_text(
@@ -133,6 +133,7 @@ async def test_regression_target(
         cwd=tmp_path,
         goal=spec.goal,
         backend=regression_backend,
+        **regression_api_options,
         execution_mode="c",       # orchestrated — the production default
         use_container=True,
         yolo=True,                # auto-approve safe + active

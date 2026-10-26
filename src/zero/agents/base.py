@@ -42,7 +42,9 @@ class AgentLoop:
         reminder_every: int = 0,
         session: Session | None = None,
     ) -> None:
-        self.backend = backend
+        # API adapters keep compression/reasoning state per actor even when builders
+        # receive the same prototype (Ralph and the background validator do this).
+        self.backend = backend.fork()
         self.system_prompt = system_prompt
         self.tools = tools
         self.max_turns = max_turns

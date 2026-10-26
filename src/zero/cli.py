@@ -40,12 +40,23 @@ def main() -> None:
 @click.option("--goal", default=None, help="One-shot goal seeded as the first user message.")
 @click.option(
     "--backend",
-    type=click.Choice(["claude", "codex"]),
+    type=click.Choice(["claude", "codex", "api"]),
     default="codex",
     show_default=True,
-    help="LLM backend. Shells out to the authenticated Claude Code CLI ('claude') or"
-    " the OpenAI Codex CLI ('codex'). With 'codex', pass a Codex --model or omit it.",
+    help="LLM backend: authenticated Codex/Claude CLI, or API-key access through LiteLLM."
+    " API requires --model provider/model.",
 )
+@click.option("--api-base-url", default=None, help="API provider base URL (API backend only).")
+@click.option("--api-key-env", default=None, help="Environment variable containing the API key.")
+@click.option("--api-max-output-tokens", type=click.IntRange(min=1), default=None,
+              help="API output cap including reasoning (default 16384).")
+@click.option("--api-reasoning-effort", default=None, help="Provider-supported reasoning effort.")
+@click.option("--api-response-format", type=click.Choice(["auto", "json", "text"]), default=None,
+              help="API envelope format (default auto).")
+@click.option("--api-max-concurrency", type=click.IntRange(min=1), default=None,
+              help="Engagement-wide concurrent API request cap (default 4).")
+@click.option("--api-retries", type=click.IntRange(min=0), default=None,
+              help="Transient API retries after the first attempt (default 2).")
 @click.option(
     "--execution-mode",
     type=click.Choice(["a", "b", "c"]),
@@ -178,9 +189,8 @@ def main() -> None:
     default=True,
     show_default=True,
     help=(
-        "Keep one persistent `claude` session per actor and send only each new turn"
-        " via --resume (claude holds + caches the history) instead of re-shipping the"
-        " whole transcript every call. Big token saver; claude-backend only."
+        "Keep one persistent Codex/Claude CLI session per actor and send only new"
+        " turns on resume. API actors always use full local history."
     ),
 )
 @click.option(
@@ -235,21 +245,19 @@ def main() -> None:
 )
 @click.option(
     "--model",
-    default="claude-opus-5[1m]",
-    show_default=True,
-    help="Model for every LLM call (orchestrator + subagents + validators). For"
-    " Claude, use an alias ('opus', 'sonnet') or full id; 'claude-opus-5[1m]' is"
-    " Opus 5 with the 1M-context window. Codex ignores this Claude default and uses"
-    " its configured default model unless you pass a Codex model id. Pass '' to use"
-    " the selected backend's account default.",
+    default=None,
+    help="Model for every actor. API: explicit LiteLLM provider/model (required)."
+    " Codex: configured default. Claude: claude-opus-5[1m] by default; pass ''"
+    " for the selected CLI's account default.",
 )
 @click.option(
     "--context-window",
     type=int,
     default=None,
-    help="Context-window size for the UI's per-agent 'ctx used/window (%)' display."
+    help="Context-window size for the per-agent display and API input budgeting."
     " Default: resolved per backend at startup — Codex reads its real model window"
-    " (~272k) at runtime; Claude infers 1M for a '[1m]' model, else 200k.",
+    " (~272k) at runtime; Claude infers 1M for a '[1m]' model, else 200k; API uses"
+    " bundled metadata and requires an override for unknown model limits.",
 )
 @click.option(
     "--llm-log/--no-llm-log",
@@ -317,6 +325,13 @@ def main() -> None:
 def run(
     goal: str | None,
     backend: str,
+    api_base_url: str | None,
+    api_key_env: str | None,
+    api_max_output_tokens: int | None,
+    api_reasoning_effort: str | None,
+    api_response_format: str | None,
+    api_max_concurrency: int | None,
+    api_retries: int | None,
     execution_mode: str,
     swarm_size: int,
     auto_approve: tuple[str, ...],
@@ -343,7 +358,7 @@ def run(
     remote_all_tools: bool,
     rate_limit: str,
     thought_display: str,
-    model: str,
+    model: str | None,
     context_window: int | None,
     llm_log: bool,
     ralph: bool,
@@ -364,7 +379,23 @@ def run(
     # (None) so the orchestrator resolves it backend-aware at startup — Codex reports
     # its real ~272k window at runtime, Claude infers 1M/200k from the model id. An
     # explicit --context-window is passed through and always honored.
-    model_or_none = model or None
+    model_or_none = ("claude-opus-5[1m]" if backend == "claude" and model is None
+                     else model or None)
+    from zero.llm.api import ApiConfig
+
+    api_options = {
+        "base_url": api_base_url, "key_env": api_key_env,
+        "max_output_tokens": api_max_output_tokens, "reasoning_effort": api_reasoning_effort,
+        "response_format": api_response_format, "max_concurrency": api_max_concurrency,
+        "retries": api_retries,
+    }
+    supplied_api_options = {k: v for k, v in api_options.items() if v is not None}
+    if backend != "api" and supplied_api_options:
+        raise click.UsageError("API options require --backend api")
+    try:
+        api_config = ApiConfig(**supplied_api_options) if backend == "api" else None
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from None
 
     # No implicit auto-approve policy: every tool call (orchestrator's own and
     # its subagents') goes through the ApprovalGate and prompts unless the user
@@ -380,6 +411,7 @@ def run(
         cwd=Path.cwd(),
         goal=goal,
         backend=backend,
+        api=api_config,
         session_resume=session_resume,
         auto_approve=approve,
         yolo=yolo,
@@ -417,7 +449,10 @@ def run(
         ralph_epics=ralph_epics,
         analyzer_validator_max_turns=analyzer_validator_max_turns,
     )
-    orch = Orchestrator(cfg)
+    try:
+        orch = Orchestrator(cfg)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from None
     asyncio.run(orch.run_interactive())
 
 

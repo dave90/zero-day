@@ -81,9 +81,32 @@ def regression_backend(request) -> str:
     'codex'). Both the strict and blind suites read this so a whole regression run
     can be pointed at Claude with `pytest -m regression --regression-backend claude`."""
     backend = request.config.getoption("--regression-backend")
+    if backend == "api":
+        if not request.config.getoption("--regression-model"):
+            pytest.skip("API regression requires --regression-model provider/model")
+        return backend
     if not _have(backend):
         pytest.skip(f"{backend} CLI not on PATH")
     return backend
+
+
+@pytest.fixture
+def regression_api_options(request, regression_backend):
+    if regression_backend != "api":
+        return {}
+    from zero.llm.api import ApiConfig, ApiRuntime, resolve_context_window
+
+    model = request.config.getoption("--regression-model")
+    config = ApiConfig(base_url=request.config.getoption("--regression-api-base-url"),
+                       key_env=request.config.getoption("--regression-api-key-env"))
+    window = resolve_context_window(model, request.config.getoption("--regression-context-window"))
+    try:
+        ApiRuntime(config, model, window, trace=False)
+    except ValueError as exc:
+        if "credential" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise
+    return {"model": model, "api": config, "context_window": window}
 
 
 @pytest.fixture(scope="session")
@@ -99,7 +122,7 @@ def regression_blind_scorecard() -> list[CoverageResult]:
 
 
 @pytest.fixture
-def regression_target(request, regression_backend):
+def regression_target(request, regression_backend, regression_api_options):
     """Build/pull a target image, run it detached, health-poll it, and yield the
     URL the SANDBOX should use to reach it. Skips (never fails) on any prereq or
     target-startup problem — only a healthy target that the agent fails to crack

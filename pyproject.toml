@@ -23,6 +23,7 @@ dependencies = [
     "mcp>=1.2",
     "uvicorn>=0.27",
     "starlette>=0.36",
+    "litellm>=1.106.4,<2",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +61,7 @@ markers = [
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
     "live_codex: tests that shell out to the real `codex` CLI (slow, costs tokens, needs auth)",
+    "live_api: real provider API calls (costs credits; requires ZERO_TEST_API_MODEL and credentials)",
     "gruyere: live full-stack run against Google Gruyere (slow, costs tokens, needs docker + codex)",
     "regression: capability regression vs vulnerable docker targets (slow, costs LLM tokens, needs docker + selected backend). Opt-in: `pytest -m regression`.",
     "regression_blind: blind capability benchmark vs vulnerable docker targets — never fails, prints coverage %. Opt-in: `pytest -m regression_blind`.",
