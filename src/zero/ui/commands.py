@@ -58,6 +58,8 @@ def build_default_registry(
     clear_scrollback: Callable[[], None],
     request_exit: Callable[[], None],
     running_snapshot: Callable[[], list[str]] | None = None,
+    swarm_snapshot: Callable[[str], list[str]] | None = None,
+    respond_now: Callable[[], bool] | None = None,
 ) -> CommandRegistry:
     reg = CommandRegistry()
 
@@ -114,6 +116,18 @@ def build_default_registry(
             return ["(no live-subagent view available)"]
         return running_snapshot()
 
+    def swarm_cmd(view: str) -> Callable[[list[str]], list[str]]:
+        def handler(_args: list[str]) -> list[str]:
+            if swarm_snapshot is None:
+                return ["(no live swarm)"]
+            return swarm_snapshot(view)
+        return handler
+
+    def respond_now_cmd(_args: list[str]) -> str:
+        if respond_now is None or not respond_now():
+            return "(no active swarm response cycle)"
+        return "freezing received contributions; active peers are being marked unavailable"
+
     def keys_cmd(_args: list[str]) -> list[str]:
         return [
             "keyboard shortcuts:",
@@ -145,6 +159,12 @@ def build_default_registry(
     reg.register(Command("findings", "list confirmed findings", findings_cmd))
     reg.register(Command("show-rejected", "list rejected findings", show_rejected_cmd))
     reg.register(Command("running", "list running subagents (orchestrated mode)", running_cmd))
+    reg.register(Command("agents", "list top-level swarm peers", swarm_cmd("agents")))
+    reg.register(Command("messages", "show retained swarm messages", swarm_cmd("messages")))
+    reg.register(Command("groups", "show swarm groups", swarm_cmd("groups")))
+    reg.register(Command("work", "show shared swarm work", swarm_cmd("work")))
+    reg.register(Command("history", "show ordered swarm events", swarm_cmd("history")))
+    reg.register(Command("respond-now", "finish with contributions received so far", respond_now_cmd))
     reg.register(Command("replay", "info about replay (use the CLI)", replay_cmd))
     reg.register(Command("mode", "show the execution mode", mode_cmd))
     return reg

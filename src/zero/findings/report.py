@@ -1,6 +1,8 @@
 """Write a single Markdown report: found & approved vs tested & rejected/failed."""
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -98,5 +100,17 @@ def write_report(
         lines.append("")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    fd, raw = tempfile.mkstemp(prefix=f".{out_path.name}.", dir=out_path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(raw, out_path)
+    except BaseException:
+        try:
+            os.unlink(raw)
+        except FileNotFoundError:
+            pass
+        raise
     return out_path

@@ -59,6 +59,13 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--swarm-size",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Top-level collaborating orchestrators (mode c only). Size 1 preserves legacy mode c.",
+)
+@click.option(
     "--auto-approve",
     multiple=True,
     type=click.Choice(["safe", "active", "exploit"]),
@@ -311,6 +318,7 @@ def run(
     goal: str | None,
     backend: str,
     execution_mode: str,
+    swarm_size: int,
     auto_approve: tuple[str, ...],
     yolo: bool,
     i_understand: bool,
@@ -363,6 +371,11 @@ def run(
     # opts out with --auto-approve / --yolo. Use --yolo for unattended runs.
     approve = set(auto_approve)
 
+    if swarm_size > 1 and execution_mode != "c":
+        raise click.UsageError("--swarm-size > 1 is supported only with --execution-mode c")
+    if swarm_size > 1 and ralph:
+        raise click.UsageError("--swarm-size > 1 cannot be combined with --ralph")
+
     cfg = OrchestratorConfig(
         cwd=Path.cwd(),
         goal=goal,
@@ -391,6 +404,7 @@ def run(
         remote_all_tools=remote_all_tools,
         rate_limit=rate_limit,
         execution_mode=execution_mode,
+        swarm_size=swarm_size,
         thought_display=thought_display,
         model=model_or_none,
         context_window=context_window,

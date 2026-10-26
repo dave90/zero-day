@@ -25,6 +25,8 @@ writes the evidence to a local report—all from an interactive terminal.
 
 - **Parallel by default** — an orchestrator dispatches focused pentesters and reacts as they
   finish.
+- **Live collaborative swarm** — `--swarm-size N` runs several peer orchestrators with durable
+  messaging, leased work claims, evidence handoffs, and one independently validated result set.
 - **Independent validation** — a separate validator retests every candidate before it is marked
   confirmed or rejected.
 - **Codex or Claude subscriptions** — run through either authenticated CLI using the subscription
@@ -98,6 +100,29 @@ uv run zero run \
   --goal "Find and independently validate all reproducible vulnerabilities starting from http://testaspnet.vulnweb.com/about.aspx. Follow pentest.md exactly."
 ```
 
+To run several collaborating top-level orchestrators over the same engagement:
+
+```bash
+uv run zero run --execution-mode c --swarm-size 4 \
+  --goal "Find and independently validate all reproducible vulnerabilities"
+```
+
+Peers have separate model sessions, memory, tool state, turn budgets, and focused children. They
+coordinate through `.pentest/swarm/state.sqlite3`, share one sandbox and approval policy, hand off
+content-addressed evidence, and produce one consolidated response and report. `--swarm-size 1`
+keeps the original mode-c runtime. Swarms are intentionally unavailable with modes `a`/`b` and
+Ralph.
+
+The first swarm cycle has a mandatory ownership bootstrap. Each peer inspects the shared ledger,
+publishes and atomically claims lane-specific work, announces its boundaries, waits for peer
+coordination, and completes the bootstrap before target tools or child dispatches are enabled.
+Later read-only questions reuse durable findings and coordination state; they return a clean answer
+without repeating the engagement report when no findings changed.
+
+The terminal marks these runs as `swarm N` in the startup banner. Phase banners show bootstrap and
+consolidation boundaries, while the live footer tracks bootstrap/contribution progress, active
+peers, shared work, and message counts. Use `/agents`, `/work`, `/messages`, or `/groups` for detail.
+
 `zero` automatically loads the `pentest.md` in the current target directory. This is a bounded
 assessment, so “all vulnerabilities” is the investigation goal—not a guarantee of exhaustive
 coverage.
@@ -146,8 +171,9 @@ variables are required; `zero` uses the selected CLI's existing authentication.
 | `--model <id>` | Codex CLI default; `claude-opus-5[1m]` for Claude | Pin one model for every agent |
 | `--scope-host <host>` | None | Route an in-scope host away from the safe `web_fetch` tool; repeat per host |
 | `--max-turns <n>` | `10` | Bound orchestrator turns |
-| `--max-subagents <n>` | `10` | Limit concurrent pentester and validator agents |
-| `--max-total-subagents <n>` | `0` (unlimited) | Cap total subagents and control cost |
+| `--swarm-size <n>` | `1` | Run fixed-size collaborating top-level peers in mode `c` |
+| `--max-subagents <n>` | `10` | Limit concurrent pentester and validator children **per swarm peer** |
+| `--max-total-subagents <n>` | `0` (unlimited) | Cap total children **per swarm peer** (`N × cap` maximum for a swarm of size `N`) |
 | `--rate-limit <spec>` | `100/min` | Limit requests per host, for example `5/sec` |
 | `--files-root <path>` | `./zero_files` | Expose local files to the jailed read-only file tools |
 | `--no-container` | Container enabled | Explicitly run tools on the host |
@@ -189,6 +215,9 @@ During a run:
 | Input | Description |
 | --- | --- |
 | `/running` | Show active pentester and validator agents |
+| `/agents`, `/work` | Inspect swarm peers and the shared work ledger |
+| `/messages`, `/groups`, `/history` | Inspect durable swarm coordination state |
+| `/respond-now` | Freeze current contributions and finish the active swarm response |
 | `/findings` | List confirmed findings |
 | `/show-rejected` | List rejected findings |
 | `/scope` | Display the loaded `pentest.md` |
