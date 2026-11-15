@@ -16,9 +16,9 @@ Cross-agent isolation: nothing leaks except the structured `Finding` and
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 from zero.agents.base import AgentLoop
 from zero.agents.validator import (
@@ -51,7 +51,7 @@ class AgentRouter:
         backend: LLMBackend,
         tools: list[dict],
         project_context: str | None,
-        validator_max_turns: int = 40,
+        validator_max_turns: int = 50,
         goal: str | None = None,
         session_factory: "Callable[[str], Session | None] | None" = None,
     ) -> None:
@@ -205,8 +205,6 @@ def _format_validator_feedback(rec_id: str, v: Validation) -> str:
 # Callable type: orchestrator-side driver that runs the validator's loop to
 # completion (handling its own tool calls + approvals + ask_user). Returns
 # the parsed Validation or None.
-from typing import Any, Awaitable, Callable
-
 ValidatorDriver = Callable[[AgentLoop], Awaitable[Validation | None]]
 
 

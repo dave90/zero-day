@@ -38,6 +38,7 @@ class ApprovalRequest:
     # True when the tool executes code/binaries on the HOST (not sandboxed).
     # The gate never auto-approves these unless --allow-host-exec is set.
     host_exec: bool = False
+    actor_id: str = ""
 
 
 # UI prompter: shown an ApprovalRequest, returns the user's Decision.

@@ -77,7 +77,8 @@ append a `TargetSpec` (verify the image is pullable first).
 - **Subagents** (`orchestrator/subagents.py`, `tools/dispatch.py`): dispatched via
   `dispatch_pentester` / `dispatch_validator` / `await_subagents` / `finalize`
   (orchestrator-only tools, never in `default_registry`). Bounded by
-  `--pentester-max-turns` (14), `--subagent-deadline` (1200s, checked between turns),
+  `--pentester-max-turns` (50), `--validator-max-turns` (50),
+  `--subagent-deadline` (1200s, checked between turns),
   `--llm-timeout` (900s per model CLI call — shared with the orchestrator's own
   backend), `--max-subagents` (10 concurrent), and `--max-total-subagents`
   (0 = unlimited total for a subagent manager).

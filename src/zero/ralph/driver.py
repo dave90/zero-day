@@ -325,11 +325,17 @@ class RalphDriver:
         more analyzer pass, then re-prompt)."""
         orch = self.orch
         while True:
-            await self._emit_text(
-                "\nPRD checkpoint — reply 'go' to start the loop, 'abort' to cancel,"
-                " or type feedback to revise the PRD.\n"
-            )
-            msg = (await orch.user_queue.get()).strip()
+            if orch.plan_checkpoint_handler is None:
+                await self._emit_text(
+                    "\nPRD checkpoint — reply 'go' to start the loop, 'abort' to cancel,"
+                    " or type feedback to revise the PRD.\n"
+                )
+            if orch.plan_checkpoint_handler is not None:
+                # Web consumers receive the actual PRD and revision, never a parsed
+                # approximation of the human-readable checkpoint announcement.
+                msg = (await orch.plan_checkpoint_handler(prd)).strip()
+            else:
+                msg = (await orch.user_queue.get()).strip()
             low = msg.lower()
             if low in ("go", "start", "approve", "yes", "y", "ok"):
                 return True

@@ -31,7 +31,7 @@ def build_orchestrator_loop(
     tools: list[dict],
     *,
     project_context: str | None = None,
-    max_turns: int = 20,
+    max_turns: int = 50,
     session: Session | None = None,
 ) -> AgentLoop:
     return AgentLoop(

@@ -1,0 +1,62 @@
+name: Studio offline checks
+on:
+  pull_request:
+    paths: ['ui/**', 'src/zero/**', 'tests/**', 'pyproject.toml', 'uv.lock', '.github/workflows/ui.yml']
+  push:
+    branches: [main]
+    paths: ['ui/**', 'src/zero/**', 'tests/**', 'pyproject.toml', 'uv.lock', '.github/workflows/ui.yml']
+permissions:
+  contents: read
+jobs:
+  service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked --project ui/server
+      - run: uv run --no-sync --project ui/server pytest ui/server/tests -q
+      - run: uv run --no-sync --project ui/server ruff check ui
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ui/web/package-lock.json
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked --project ui/server
+      - run: npm --prefix ui/web ci
+      - run: npm --prefix ui/web run test
+      - run: npm --prefix ui/web run build
+      - run: npm --prefix ui/web exec -- playwright install --with-deps chromium
+      - run: npm --prefix ui/web run test:e2e
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked --project ui/server
+      - run: docker build -t zero-sandbox:latest -f docker/Dockerfile .
+      - run: uv run --no-sync --project ui/server pytest ui/server/tests/test_docker_workers.py -q
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: '3.12'
+      - run: uv sync --locked
+      - run: uv run --no-sync pytest -q
+# Live model preflight/matrix is deliberately absent from normal CI.

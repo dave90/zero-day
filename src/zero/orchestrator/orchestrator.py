@@ -12,6 +12,7 @@ import json
 import os
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,9 @@ from zero.ui.events import (
     ToolRunning,
     TurnCancelled,
     TurnStart,
+    RuntimeState,
+    RuntimeFailure,
+    InteractionResolved,
     UIEvent,
 )
 
@@ -147,11 +151,11 @@ class OrchestratorConfig:
     # Off by default: host-exec tools always prompt unless sandboxed (--container).
     allow_host_exec: bool = False
     scope_hosts: set[str] = field(default_factory=set)
-    max_turns: int = 10
+    max_turns: int = 50
     # Validator gets its own, generous turn budget — it investigates a
     # finding from scratch (fetch, analyze, re-fetch, conclude) and must
     # not be capped at the pentest agent's per-call limit.
-    validator_max_turns: int = 40          # Validator AgentLoop investigation steps (OUR loop)
+    validator_max_turns: int = 50          # Validator AgentLoop investigation steps (OUR loop)
     # claude's INTERNAL per-call --max-turns for the validator. Was 60 on the mistaken
     # belief the validator's investigation needs many claude turns — but those are OUR
     # loop turns (validator_max_turns). claude needs ~one turn to emit one envelope.
@@ -165,11 +169,9 @@ class OrchestratorConfig:
     # orchestrator's large-context turns) can exceed the bare 300s default, so we
     # use a single generous, CLI-configurable budget (`--llm-timeout`).
     llm_timeout_seconds: int = 900
-    # Per-subagent turn budget for PENTESTERS. Previously pentesters inherited
-    # the orchestrator's (large) max_turns, so a single attack idea could run
-    # 40+ turns and burn an hour looping on the same failure. Cap them on their
-    # own, smaller budget; `dispatch_pentester(max_turns=...)` can still override.
-    pentester_max_turns: int = 14
+    # Pentesters keep their own budget even when the operator changes the main
+    # max_turns. An explicit `dispatch_pentester(max_turns=...)` can override it.
+    pentester_max_turns: int = 50
     # Hard wall-clock ceiling for ONE subagent's whole run, checked between
     # turns. The 900s `--llm-timeout` is only PER backend call — a
     # subagent that keeps finding "one more thing to try" has no total cap
@@ -368,6 +370,12 @@ class Orchestrator:
         # observation warns the agent its in-container session state was reset.
         self._sandbox_reset_pending = False
         self._swarm_runtime = None
+        # Optional typed operator checkpoint; terminal retains its textual input flow.
+        self.plan_checkpoint_handler = None
+        self._terminal_announcements = True
+        self.initial_run_id = ""
+        self._run_context: ContextVar[str] = ContextVar("zero_run_id", default="")
+        self._queued_run_ids: list[tuple[str, str]] = []
         # Deterministic scripted factories used by offline swarm tests. Production
         # builds a fresh selected backend for every peer and the summarizer.
         self._swarm_backend_factory: Any = None
@@ -505,115 +513,174 @@ class Orchestrator:
     # ------------------------------------------------------------- public api
 
     async def run_interactive(self) -> None:
-        """Spawn agent + UI as concurrent tasks; await UI exit."""
+        """Attach the inline terminal to the same lifecycle used by other frontends."""
         from zero.ui.app import run_ui
 
-        # Per-agent LLM I/O tracing (on by default). $ZERO_LLM_LOG_DIR overrides the
-        # location; it's honoured lazily by llm_trace, so only set a root here when the
-        # env var is absent — and only when not explicitly disabled via --no-llm-log.
-        if self.cfg.llm_log and not os.environ.get("ZERO_LLM_LOG_DIR"):
-            from zero.llm.llm_trace import set_llm_log_root
-            set_llm_log_root(self.cfg.cwd / ".pentest" / "llm")
+        await self.run_headless(run_ui, terminal_announcements=True)
 
-        project_ctx = project_context_for(self.cfg.cwd)
-        effective_model = self._effective_model_name()
-        self.audit.write(
-            "session_start",
-            cwd=str(self.cfg.cwd),
-            backend=self.cfg.backend,
-            goal=self.cfg.goal,
-            has_project_context=project_ctx is not None,
-            use_container=self.cfg.use_container,
-            execution_mode=self.cfg.execution_mode,
-            model=effective_model,
-            context_window=self.cfg.context_window,
-        )
+    async def run_headless(self, frontend, *, terminal_announcements: bool = False) -> None:
+        """Run a frontend-neutral session. ``frontend(self)`` owns operator I/O.
 
-        # Startup banner: print the EFFECTIVE backend config the running process
-        # actually loaded. A long-running interactive session started before a code
-        # change keeps the old in-memory code (Python doesn't hot-reload), which is
-        # the #1 cause of "subagents can't use tools" after a fix — this makes it
-        # obvious whether the fix is live (model / tool lock-down / context window).
-        be_cfg = getattr(self.backend, "cfg", None)
-        model = effective_model
-        locked = "locked-down" if getattr(be_cfg, "lock_down_tools", False) else "default"
-        await self._emit(AgentTextDelta(
-            text=(
-                f"zero · mode {self.cfg.execution_mode} · backend {self.cfg.backend}"
-                f" · model {model} · tools {locked} · ctx-window {self.cfg.context_window:,}\n"
-            )
-        ))
-        await self._emit(AgentTextEnd())
+        All runtimes own their directory exclusively, including CLI sessions. The
+        OS releases the lock on process loss; a stale PID is never used to kill work.
+        Separate engagements still need separate processes because tool roots and
+        model tracing are process-local.
+        """
+        from zero.orchestrator.ownership import WorkspaceOwnership
 
-        if self.cfg.use_container:
-            try:
-                await self._start_container_and_swap_tools()
-            except Exception as e:  # noqa: BLE001 — Docker missing / not running / image absent
-                self.audit.write("container_start_failed", error=f"{type(e).__name__}: {e}")
-                for ln in (
-                    "",
-                    f"⚠  could not start the sandbox container ({type(e).__name__}: {e}).",
-                    "   Falling back to HOST execution — code/binary tools will require",
-                    "   approval on every call. Install/start Docker (and build the",
-                    "   zero-sandbox image) for sandboxed execution, or pass --no-container.",
-                ):
-                    await self._emit(AgentTextDelta(text=ln + "\n"))
-                await self._emit(AgentTextEnd())
-                self._container = None
-                self._rpc = None
+        self._terminal_announcements = terminal_announcements
+        self._run_context.set(self.initial_run_id)
+        with WorkspaceOwnership(self.cfg.cwd):
+            await self._run_with_frontend(frontend)
 
-        await self._warn_host_exec()
-        await self._announce_files_root()
-
-        # Router needs the (possibly remote-swapped) registry + project ctx.
-        # The Validator runs on its own backend with a generous turn budget.
-        self.router = AgentRouter(
-            store=self.findings_store,
-            backend=self.validator_backend,
-            tools=self.registry.catalog(),
-            project_context=project_ctx,
-            validator_max_turns=self.cfg.validator_max_turns,
-            goal=self.cfg.goal,
-            session_factory=self._make_session,
-        )
-
-        if self.cfg.ralph:
-            from zero.ralph.driver import RalphDriver
-
-            agent_task = asyncio.create_task(
-                RalphDriver(self, project_ctx).run(), name="ralph"
-            )
-        elif self.cfg.execution_mode == "b":
-            agent_task = asyncio.create_task(
-                self._agent_main_mode_b(project_ctx), name="agent_mode_b"
-            )
-        elif self.cfg.execution_mode == "c":
-            if self.cfg.swarm_size > 1:
-                from zero.swarm.runtime import SwarmRuntime
-
-                self._swarm_runtime = SwarmRuntime(self, project_ctx)
-                agent_task = asyncio.create_task(self._swarm_runtime.run(), name="swarm")
-            else:
-                agent_task = asyncio.create_task(
-                    self._orchestrator_main(project_ctx), name="orchestrator"
-                )
-        else:
-            agent_task = asyncio.create_task(self._agent_main(project_ctx), name="agent")
+    async def _run_with_frontend(self, frontend) -> None:
+        agent_task = None
+        frontend_task = None
         try:
-            await run_ui(self)
+            # Per-agent LLM I/O tracing (on by default). $ZERO_LLM_LOG_DIR overrides the
+            # location; it's honoured lazily by llm_trace, so only set a root here when the
+            # env var is absent — and only when not explicitly disabled via --no-llm-log.
+            if self.cfg.llm_log and not os.environ.get("ZERO_LLM_LOG_DIR"):
+                from zero.llm.llm_trace import set_llm_log_root
+                set_llm_log_root(self.cfg.cwd / ".pentest" / "llm")
+
+            project_ctx = project_context_for(self.cfg.cwd)
+            effective_model = self._effective_model_name()
+            self.audit.write(
+                "session_start",
+                cwd=str(self.cfg.cwd),
+                backend=self.cfg.backend,
+                goal=self.cfg.goal,
+                has_project_context=project_ctx is not None,
+                use_container=self.cfg.use_container,
+                execution_mode=self.cfg.execution_mode,
+                model=effective_model,
+                context_window=self.cfg.context_window,
+            )
+
+            # Startup banner: print the EFFECTIVE backend config the running process
+            # actually loaded. A long-running interactive session started before a code
+            # change keeps the old in-memory code (Python doesn't hot-reload), which is
+            # the #1 cause of "subagents can't use tools" after a fix — this makes it
+            # obvious whether the fix is live (model / tool lock-down / context window).
+            if self._terminal_announcements:
+                be_cfg = getattr(self.backend, "cfg", None)
+                model = effective_model
+                locked = "locked-down" if getattr(be_cfg, "lock_down_tools", False) else "default"
+                await self._emit(AgentTextDelta(
+                    text=(
+                        f"zero · mode {self.cfg.execution_mode} · backend {self.cfg.backend}"
+                        f" · model {model} · tools {locked} · ctx-window {self.cfg.context_window:,}\n"
+                    )
+                ))
+                await self._emit(AgentTextEnd())
+
+            execution_warning = ""
+            if self.cfg.use_container:
+                try:
+                    await self._start_container_and_swap_tools()
+                except Exception as e:  # noqa: BLE001 — Docker missing / not running / image absent
+                    self.audit.write("container_start_failed", error=f"{type(e).__name__}: {e}")
+                    execution_warning = f"{type(e).__name__}: {e}"
+                    if self._terminal_announcements:
+                        for ln in (
+                            "",
+                            f"⚠  could not start the sandbox container ({type(e).__name__}: {e}).",
+                            "   Falling back to HOST execution — code/binary tools will require",
+                            "   approval on every call. Install/start Docker (and build the",
+                            "   zero-sandbox image) for sandboxed execution, or pass --no-container.",
+                        ):
+                            await self._emit(AgentTextDelta(text=ln + "\n"))
+                        await self._emit(AgentTextEnd())
+                    self._container = None
+                    self._rpc = None
+
+            await self._emit(RuntimeState(
+                lifecycle="active", activity="idle", backend=self.cfg.backend,
+                model=effective_model, execution_location=(
+                    "sandbox" if self._container is not None else "host"
+                ), context_window=self.cfg.context_window, warning=execution_warning,
+                llm_log_enabled=bool(self.cfg.llm_log or os.environ.get("ZERO_LLM_LOG_DIR")),
+                model_log_dir=(os.environ.get("ZERO_LLM_LOG_DIR") or
+                               str(self.cfg.cwd / ".pentest" / "llm")),
+            ))
+            if self._terminal_announcements:
+                await self._warn_host_exec()
+                await self._announce_files_root()
+
+            # Router needs the (possibly remote-swapped) registry + project ctx.
+            # The Validator runs on its own backend with a generous turn budget.
+            self.router = AgentRouter(
+                store=self.findings_store,
+                backend=self.validator_backend,
+                tools=self.registry.catalog(),
+                project_context=project_ctx,
+                validator_max_turns=self.cfg.validator_max_turns,
+                goal=self.cfg.goal,
+                session_factory=self._make_session,
+            )
+
+            if self.cfg.ralph:
+                from zero.ralph.driver import RalphDriver
+
+                agent_task = asyncio.create_task(
+                    RalphDriver(self, project_ctx).run(), name="ralph"
+                )
+            elif self.cfg.execution_mode == "b":
+                agent_task = asyncio.create_task(
+                    self._agent_main_mode_b(project_ctx), name="agent_mode_b"
+                )
+            elif self.cfg.execution_mode == "c":
+                if self.cfg.swarm_size > 1:
+                    from zero.swarm.runtime import SwarmRuntime
+
+                    self._swarm_runtime = SwarmRuntime(self, project_ctx)
+                    agent_task = asyncio.create_task(self._swarm_runtime.run(), name="swarm")
+                else:
+                    agent_task = asyncio.create_task(
+                        self._orchestrator_main(project_ctx), name="orchestrator"
+                    )
+            else:
+                agent_task = asyncio.create_task(self._agent_main(project_ctx), name="agent")
+            frontend_task = asyncio.create_task(frontend(self), name="frontend")
+            done, _ = await asyncio.wait(
+                {agent_task, frontend_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            failure = None
+            if agent_task in done:
+                if not agent_task.cancelled():
+                    failure = agent_task.exception()
+                if failure is not None:
+                    await self._emit(RuntimeFailure(error=f"{type(failure).__name__}: {failure}"))
+                await self._emit(SessionEnd())
+            await frontend_task
+            if failure is not None:
+                raise failure
         finally:
-            agent_task.cancel()
+            if frontend_task is not None and not frontend_task.done():
+                frontend_task.cancel()
+                await asyncio.gather(frontend_task, return_exceptions=True)
+            if agent_task is not None:
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             try:
-                await agent_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            if self._swarm_runtime is not None:
-                await self._swarm_runtime.close()
-            await self._close_tool_sessions()
-            await self._teardown_container()
-            self.audit.write("session_end")
-            self.audit.close()
-            self.thinking.close()
+                if self._swarm_runtime is not None:
+                    await self._swarm_runtime.close()
+                if self.subagents is not None:
+                    await self.subagents.cancel_all()
+                for task in list(self._validation_tasks):
+                    task.cancel()
+                if self._validation_tasks:
+                    await asyncio.gather(*self._validation_tasks, return_exceptions=True)
+            finally:
+                await self._close_tool_sessions()
+                await self._teardown_container()
+                self.audit.write("session_end")
+                self.audit.close()
+                self.thinking.close()
 
     async def _close_tool_sessions(self) -> None:
         """Tear down any persistent tool state (python_exec interpreter workers).
@@ -840,6 +907,7 @@ class Orchestrator:
             )
             req = ApprovalRequest(
                 tool=name, args=args, risk_level=tool.risk_level, call_id=call_id,
+                host_exec=getattr(tool, "runs_on_host", False), actor_id="modeb",
             )
             allowed = await self.gate.check(req)
             self.audit.write("approval_decision_modeb", call_id=call_id, allowed=allowed)
@@ -958,10 +1026,13 @@ class Orchestrator:
                 # to act on (no --goal at startup, or the last exchange
                 # produced a final).
                 if needs_user_input:
-                    await self._emit(AgentTextDelta(text="\n"))
-                    await self._emit(AgentTextDelta(text="ready — type a goal / question:"))
-                    await self._emit(AgentTextEnd())
+                    await self._emit(RuntimeState(lifecycle="idle", activity="idle"))
+                    if self._terminal_announcements:
+                        await self._emit(AgentTextDelta(text="\n"))
+                        await self._emit(AgentTextDelta(text="ready — type a goal / question:"))
+                        await self._emit(AgentTextEnd())
                     msg = await self.user_queue.get()
+                    self.adopt_user_run(msg)
                     loop.add_user_message(msg)
                     self.audit.write("user_message", text=msg, source="ui")
                     # Fresh turn budget for the new exchange so a long
@@ -973,6 +1044,7 @@ class Orchestrator:
                 # while we were idle / working, then run one turn.
                 while not self.user_queue.empty():
                     extra = self.user_queue.get_nowait()
+                    self.adopt_user_run(extra)
                     loop.add_user_message(extra)
                     self.audit.write("user_message", text=extra, source="ui")
                 self._user_input_event.clear()
@@ -1032,7 +1104,7 @@ class Orchestrator:
                 consecutive_turn_errors = 0
 
                 if isinstance(env, FinalEnvelope):
-                    await self._emit(AgentTextDelta(text=f"\n[final] {env.answer}\n"))
+                    await self._emit(AgentTextDelta(text=(f"\n[final] {env.answer}\n" if self._terminal_announcements else env.answer)))
                     await self._emit(AgentTextEnd())
                     self.audit.write("final", answer=env.answer)
                     needs_user_input = True
@@ -1077,6 +1149,7 @@ class Orchestrator:
         # Emit BEFORE the LLM call so the user sees the agent is working
         # during the (potentially multi-second) wait. loop.turn updates
         # inside loop.step(), so we render `current_turn + 1`.
+        await self._emit(RuntimeState(lifecycle="active", activity="thinking"))
         await self._emit(TurnStart(agent=agent, turn=loop.turn + 1))
         step = await loop.step()
         env = step.envelope
@@ -1172,20 +1245,20 @@ class Orchestrator:
         call_id = uuid.uuid4().hex[:8]
         if tool_name not in self.registry:
             obs = f"unknown tool: {tool_name!r}"
-            await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label))
-            self.audit.write("tool_unknown", tool=tool_name, call_id=call_id, label=label)
+            await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label, actor_id=session_id))
+            self.audit.write("tool_unknown", tool=tool_name, call_id=call_id, label=label, actor_id=session_id)
             return ToolResult(ok=False, output=obs)
 
         tool = self.registry.get(tool_name)
         await self._emit(
             ToolProposal(
                 tool=tool_name, args=args, risk_level=tool.risk_level.value,
-                call_id=call_id, label=label,
+                call_id=call_id, label=label, actor_id=session_id,
             )
         )
         self.audit.write(
             "tool_proposal", tool=tool_name, args=args,
-            risk_level=tool.risk_level.value, call_id=call_id, label=label,
+            risk_level=tool.risk_level.value, call_id=call_id, label=label, actor_id=session_id,
         )
 
         if not getattr(tool, "requires_approval", True):
@@ -1194,13 +1267,13 @@ class Orchestrator:
         else:
             req = ApprovalRequest(
                 tool=tool_name, args=args, risk_level=tool.risk_level, call_id=call_id,
-                label=label, host_exec=getattr(tool, "runs_on_host", False), reason=reason,
+                label=label, actor_id=session_id, host_exec=getattr(tool, "runs_on_host", False), reason=reason,
             )
             allowed = await self.gate.check(req)
-        self.audit.write("approval_decision", call_id=call_id, allowed=allowed, label=label)
+        self.audit.write("approval_decision", call_id=call_id, allowed=allowed, label=label, actor_id=session_id)
         if not allowed:
             obs = "user denied the tool call"
-            await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label))
+            await self._emit(ToolObservation(tool=tool_name, call_id=call_id, ok=False, output=obs, label=label, actor_id=session_id))
             return ToolResult(ok=False, output=obs)
 
         # Tell the UI the tool is now executing so a long run (e.g. a 300s ffuf in a
@@ -1211,7 +1284,7 @@ class Orchestrator:
             getattr(tool, "timeout_seconds", 0) or 0
         )
         await self._emit(
-            ToolRunning(tool=tool_name, call_id=call_id, label=label, timeout_seconds=timeout)
+            ToolRunning(tool=tool_name, call_id=call_id, label=label, actor_id=session_id, timeout_seconds=timeout)
         )
         result = await self._invoke_tool(tool, args, session_id=session_id)
         # If the sandbox was re-created mid-call (RPC recovery), tell the agent ONCE so it
@@ -1234,16 +1307,16 @@ class Orchestrator:
         await self._emit(
             ToolObservation(
                 tool=tool_name, call_id=call_id,
-                ok=result.ok, output=result.output, truncated=result.truncated, label=label,
+                ok=result.ok, output=result.output, truncated=result.truncated, label=label, actor_id=session_id,
             )
         )
         # Surface a plan update as a checklist (Claude-Code TodoWrite). Labelled
         # (subagent) todos are routed out of the main chat by the UI.
         if tool_name == "todo_write" and result.ok:
-            await self._emit(TodoUpdate(items=list(args.get("items", [])), label=label))
+            await self._emit(TodoUpdate(items=list(args.get("items", [])), label=label, actor_id=session_id))
         self.audit.write(
             "tool_observation", tool=tool_name, call_id=call_id,
-            ok=result.ok, output=result.output[:4000], truncated=result.truncated, label=label,
+            ok=result.ok, output=result.output[:4000], truncated=result.truncated, label=label, actor_id=session_id,
         )
         return result
 
@@ -1475,10 +1548,13 @@ class Orchestrator:
         try:
             while True:
                 if needs_user_input:
-                    await self._emit(AgentTextDelta(text="\n"))
-                    await self._emit(AgentTextDelta(text="ready — describe the engagement / target:"))
-                    await self._emit(AgentTextEnd())
+                    await self._emit(RuntimeState(lifecycle="idle", activity="idle"))
+                    if self._terminal_announcements:
+                        await self._emit(AgentTextDelta(text="\n"))
+                        await self._emit(AgentTextDelta(text="ready — describe the engagement / target:"))
+                        await self._emit(AgentTextEnd())
                     msg = await self.user_queue.get()
+                    self.adopt_user_run(msg)
                     loop.add_user_message(msg)
                     self.audit.write("user_message", text=msg, source="ui")
                     loop._turn = 0
@@ -1486,6 +1562,7 @@ class Orchestrator:
 
                 while not self.user_queue.empty():
                     extra = self.user_queue.get_nowait()
+                    self.adopt_user_run(extra)
                     loop.add_user_message(extra)
                     self.audit.write("user_message", text=extra, source="ui")
                 # All pending operator input is now in the conversation.
@@ -1579,7 +1656,7 @@ class Orchestrator:
                         )
                         needs_user_input = True
                         continue
-                    await self._emit(AgentTextDelta(text=f"\n[final] {env.answer}\n"))
+                    await self._emit(AgentTextDelta(text=(f"\n[final] {env.answer}\n" if self._terminal_announcements else env.answer)))
                     await self._emit(AgentTextEnd())
                     self.audit.write("final", answer=env.answer)
                     needs_user_input = True
@@ -1949,9 +2026,8 @@ class Orchestrator:
         ]
         loop = build_pentest_loop(
             backend, tools, project_context=self._project_ctx,
-            # Pentesters get their OWN (smaller) turn budget — they no longer
-            # inherit the orchestrator's large max_turns, which let a single
-            # idea run 40+ turns. An explicit dispatch max_turns still wins.
+            # Pentesters use their own budget, independently of the main agent.
+            # An explicit dispatch max_turns still wins over the configured default.
             max_turns=rec.max_turns or self.cfg.pentester_max_turns,
             session=self._make_session(f"pentester-{rec.id}"),
         )
@@ -2107,7 +2183,7 @@ class Orchestrator:
                     turns=loop.turn, duration=time.monotonic() - start,
                 )
             if isinstance(env, AskUserEnvelope):
-                answer = await self._do_ask_user(env, agent=f"pentester {rec.id}")
+                answer = await self._do_ask_user(env, agent=f"pentester {rec.id}", actor_id=rec.id)
                 loop.add_ask_user_answer(answer)
                 continue
             if isinstance(env, ActionEnvelope):
@@ -2304,7 +2380,7 @@ class Orchestrator:
             await self._emit(
                 ToolProposal(
                     tool=action_env.tool, args=action_env.args,
-                    risk_level=tool.risk_level.value, call_id=sub_call_id, label=label,
+                    risk_level=tool.risk_level.value, call_id=sub_call_id, label=label, actor_id=session_id,
                 )
             )
             if not getattr(tool, "requires_approval", True):
@@ -2312,7 +2388,7 @@ class Orchestrator:
             else:
                 req = ApprovalRequest(
                     tool=action_env.tool, args=action_env.args,
-                    risk_level=tool.risk_level, call_id=sub_call_id, label=label,
+                    risk_level=tool.risk_level, call_id=sub_call_id, label=label, actor_id=session_id,
                     host_exec=getattr(tool, "runs_on_host", False),
                     reason=action_env.thought,
                 )
@@ -2321,20 +2397,27 @@ class Orchestrator:
                 "validator_approval", call_id=sub_call_id, allowed=allowed,
             )
             if not allowed:
+                await self._emit(ToolObservation(
+                    tool=action_env.tool, call_id=sub_call_id, ok=False,
+                    output="user denied tool call", label=label, actor_id=session_id,
+                ))
                 return "user denied tool call"
+            await self._emit(ToolRunning(
+                tool=action_env.tool, call_id=sub_call_id, label=label, actor_id=session_id,
+            ))
             result = await self._invoke_tool(
                 tool, action_env.args, session_id=session_id
             )
             await self._emit(
                 ToolObservation(
                     tool=action_env.tool, call_id=sub_call_id,
-                    ok=result.ok, output=result.output, truncated=result.truncated, label=label,
+                    ok=result.ok, output=result.output, truncated=result.truncated, label=label, actor_id=session_id,
                 )
             )
             return result.output
 
         async def ask_handler(ask_env: AskUserEnvelope) -> str:
-            return await self._do_ask_user(ask_env, agent="validator")
+            return await self._do_ask_user(ask_env, agent=label, actor_id=session_id)
 
         validator_deadline = time.monotonic() + self.cfg.subagent_deadline_seconds
 
@@ -2505,7 +2588,9 @@ class Orchestrator:
             result.output = neutralize_nul(result.output)
         return result
 
-    async def _do_ask_user(self, env: AskUserEnvelope, *, agent: str = "pentest") -> str:
+    async def _do_ask_user(
+        self, env: AskUserEnvelope, *, agent: str = "pentest", actor_id: str = ""
+    ) -> str:
         decision = self.ask_governor.evaluate(agent, env)
         if decision.refusal is not None:
             self.audit.write("ask_user_refused", agent=agent, reason=decision.refusal)
@@ -2527,6 +2612,8 @@ class Orchestrator:
                 free_form=env.free_form,
                 blocking=env.blocking,
                 ask_id=ask_id,
+                agent=agent,
+                actor_id=actor_id or ("agent" if agent == "pentest" else agent),
             )
         )
         self.audit.write(
@@ -2537,12 +2624,16 @@ class Orchestrator:
             answer = await fut
         finally:
             self._ask_user_replies.pop(ask_id, None)
+            await self._emit(InteractionResolved(request_id=ask_id))
         self.ask_governor.record_answer(agent, env, answer)
         return answer
 
     # ---------------------------------------------------- UI <-> orchestrator
 
     async def _emit(self, event: UIEvent) -> None:
+        # Async children inherit the goal context in which they were dispatched.
+        # A validator finishing after a follow-up keeps its original provenance.
+        event._run_id = self._run_context.get()  # type: ignore[union-attr]
         await self.ui_queue.put(event)
 
     async def _emit_status(self, *, turn: int | None = None, mode: str | None = None) -> None:
@@ -2591,17 +2682,34 @@ class Orchestrator:
                     call_id=call_id,
                     label=req.label,
                     reason=req.reason,
+                    host_exec=req.host_exec,
+                    actor_id=req.actor_id,
+                    execution_location=("host" if req.host_exec or self._container is None
+                                        else "sandbox"),
+                    session_grant_allowed=(req.risk_level.value != "destructive"
+                                           and (not req.host_exec or self.cfg.allow_host_exec)),
                 )
             )
             return await fut
         finally:
             self._approval_replies.pop(call_id, None)
+            await self._emit(InteractionResolved(request_id=call_id))
             self._approvals_pending = max(0, self._approvals_pending - 1)
 
     # Public entry points the UI calls.
 
-    def submit_user_text(self, text: str) -> None:
+    def adopt_user_run(self, text: str) -> None:
+        """Associate a consumed optional transport run ID without changing CLI input types."""
+        for index, (queued, run_id) in enumerate(self._queued_run_ids):
+            if queued == text:
+                self._queued_run_ids.pop(index)
+                self._run_context.set(run_id)
+                break
+
+    def submit_user_text(self, text: str, *, run_id: str = "") -> None:
         if text.strip():
+            if run_id:
+                self._queued_run_ids.append((text, run_id))
             self.user_queue.put_nowait(text)
             # Wake a blocking await_subagents so the orchestrator can pick up
             # this message instead of staying frozen until subagents finish.

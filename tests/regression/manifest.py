@@ -74,7 +74,7 @@ class TargetSpec:
     # --- run budget (difficulty-scaled) -------------------------------------
     max_turns: int = 30                  # orchestrator turn budget
     deadline_seconds: int = 900          # whole-engagement wall-clock (test-enforced)
-    pentester_max_turns: int = 14        # per-pentester turn budget (orchestrator default)
+    pentester_max_turns: int = 14        # fixed per-pentester budget for regression fixtures
     subagent_deadline_seconds: int = 1200  # per-subagent wall-clock ceiling (default 20m)
 
     @property

@@ -224,3 +224,6 @@ targets/*
 # not source. Keep the harness, ignore its results.
 benchmarks/bountybench/results/
 plan.md
+
+# Per-engagement runtime ownership (local process state).
+.zero-runtime.lock

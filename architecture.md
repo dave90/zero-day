@@ -810,13 +810,13 @@ limits compose:
 | Knob (CLI flag) | Default | What it bounds |
 |---|---|---|
 | `--llm-timeout` | 900 s | Wall-clock for **one** model CLI call in modes `a`/`c` — shared by the orchestrator and pentester/validator backends. |
-| `--pentester-max-turns` | 14 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
+| `--pentester-max-turns` | 50 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
 | `--subagent-deadline` | 1200 s | **Total** wall-clock per subagent, checked between turns (pentesters and validators). |
-| `--validator-max-turns` | 40 | Validator investigation steps (our loop). |
+| `--validator-max-turns` | 50 | Validator investigation steps (our loop). |
 | `--validator-claude-max-turns` | 4 | Claude's internal per-call turn budget; distinct from validator investigation steps and not used by Codex. |
 | `--max-subagents` | 10 | Max concurrent subagents (semaphore). |
 | `--max-total-subagents` | 0 (unlimited) | Total dispatches for one subagent manager; a fresh manager is created per Ralph pass. This is not a token or monetary budget. |
-| `--max-turns` | 10 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
+| `--max-turns` | 50 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
 
 The subagent deadline is checked *between* turns; it does not cancel an in-flight
 approval wait or tool call. The model timeout only bounds a model call, and tools

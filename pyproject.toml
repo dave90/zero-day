@@ -56,6 +56,7 @@ pythonpath = ["."]
 # `-m live` (a command-line `-m` overrides this). See README / CLAUDE.md.
 addopts = "-m 'not live'"
 markers = [
+    "ui_live: opt-in live web product matrix (Codex/Gruyere)",
     "live: real token-spending run against a live LLM. Opt-in: `pytest -m live`.",
     "docker: tests that require a running Docker daemon and the built `zero-sandbox` image",
     "live_claude: tests that shell out to the real `claude` CLI (slow, costs tokens, needs auth)",
