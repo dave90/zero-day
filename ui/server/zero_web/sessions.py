@@ -7,10 +7,49 @@ import json
 import os
 import signal
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from zero_web.storage import Store, TERMINAL, identity
+
+
+async def terminate_tree(process):
+    """Escalate only after cooperative shutdown of an owned worker times out."""
+    if process.returncode is not None:
+        return
+    if os.name == "nt":
+        # terminate()/kill() only stop the Python parent on Windows. taskkill's
+        # tree option also stops model/tool children left behind by a stuck worker.
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/PID", str(process.pid), "/T", "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except OSError:
+            pass
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        await process.wait()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), 3)
+    except TimeoutError:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await process.wait()
 
 
 class Worker:
@@ -56,7 +95,8 @@ class Worker:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
-            start_new_session=True,
+            start_new_session=os.name != "nt",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
         )
         self.tasks = [
             asyncio.create_task(self.read()),
@@ -201,7 +241,7 @@ class Worker:
                     log_root, destination / ".pentest/llm", symlinks=True, dirs_exist_ok=True
                 )
         (destination / "pentest.md").write_text(context, encoding="utf-8")
-        return str(destination.relative_to(self.store.root))
+        return destination.relative_to(self.store.root).as_posix()
 
     async def close(self):
         self.closing = True
@@ -212,15 +252,7 @@ class Worker:
                 self.process.stdin.close()
                 await asyncio.wait_for(asyncio.shield(self.tasks[2]), timeout=18)
             except (TimeoutError, ValueError, BrokenPipeError):
-                # Signal the owned process group, only while its process is alive.
-                if self.process.returncode is None:
-                    os.killpg(self.process.pid, signal.SIGTERM)
-                    try:
-                        await asyncio.wait_for(self.process.wait(), 3)
-                    except TimeoutError:
-                        if self.process.returncode is None:
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                        await self.process.wait()
+                await terminate_tree(self.process)
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
 

@@ -16,7 +16,13 @@ npm --prefix ui/web ci
 ```
 
 Open **http://127.0.0.1:4319**. Development proxies `/api` to the service on port 4318.
-For one-origin production serving:
+On **Windows**, use PowerShell and the built UI commands below in place of `./ui/dev.sh`.
+Studio runs natively and reuses the authenticated Codex or Claude CLI for your Windows user.
+Docker Desktop should use Linux containers for the tool sandbox. For frontend development,
+run `uv run --project ui/server zero-web --dev-origin http://127.0.0.1:4319` in one terminal
+and `npm --prefix ui/web run dev -- --port 4319 --strictPort` in another.
+
+For one-origin production serving (including Windows):
 
 ```sh
 npm --prefix ui/web run build

@@ -65,6 +65,18 @@ docker build -t zero-sandbox:latest -f docker/Dockerfile .
 Open **http://127.0.0.1:4319** and keep the launch terminal running. The local service listens on
 port 4318 and the frontend on 4319. Opening Studio does not start an assessment.
 
+On **Windows (PowerShell)**, run the same installation and Docker build commands, then
+replace `./ui/dev.sh` with:
+
+```powershell
+npm --prefix ui/web run build
+uv run --project ui/server zero-web
+```
+
+Open **http://127.0.0.1:4318**. Studio and its workers run directly on Windows and use the
+Codex or Claude login for the same user; no separate Docker login is required. Keep Docker
+Desktop running with Linux containers for the tool sandbox.
+
 For serving a built UI from a single port or selecting another data directory, see the
 [Studio setup guide](ui/README.md#install-and-launch).
 

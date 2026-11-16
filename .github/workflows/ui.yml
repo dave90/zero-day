@@ -9,7 +9,11 @@ permissions:
   contents: read
 jobs:
   service:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -18,6 +22,7 @@ jobs:
           python-version: '3.12'
       - run: uv sync --locked --project ui/server
       - run: uv run --no-sync --project ui/server pytest ui/server/tests -q
+      - run: uv run --no-sync --project ui/server pytest tests/unit/test_workspace_ownership.py tests/unit/test_headless_runtime.py -q
       - run: uv run --no-sync --project ui/server ruff check ui
   browser:
     runs-on: ubuntu-latest

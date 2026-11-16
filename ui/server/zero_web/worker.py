@@ -14,6 +14,7 @@ from zero.orchestrator.approval import Decision
 from zero.orchestrator.orchestrator import Orchestrator
 from zero.ui.events import InteractionResolved, PlanCheckpoint
 from zero_web.config import core_config
+from zero_web.stdio import CommandReader
 
 PROTOCOL = sys.stdout
 sys.stdout = sys.stderr
@@ -25,9 +26,7 @@ def send(data: dict):
 
 
 async def main():
-    reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+    reader = CommandReader(sys.stdin.fileno())
     first = json.loads(await reader.readline())
     if first.get("version") != 1 or first.get("action") != "init":
         raise ValueError("Expected versioned initialization")

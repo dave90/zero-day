@@ -198,6 +198,14 @@ for (const backend of ["codex", "claude"]) {
     await expect(
       page.getByLabel("Allow host exec", { exact: true }),
     ).toBeChecked({ checked: backend === "claude" });
+    // Remove this test's fixture so the template-management test starts empty.
+    expect(
+      (
+        await page.request.delete(`/api/v1/templates/${template.id}`, {
+          headers: { "X-Zero-CSRF": csrf },
+        })
+      ).ok(),
+    ).toBe(true);
   });
 }
 
@@ -316,6 +324,13 @@ test("new Swarm attacks save the selected size and start that many peers", async
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await page.getByRole("button", { name: "Configure", exact: true }).click();
   await expect(page.getByLabel("Swarm size", { exact: true })).toHaveValue("3");
+  expect(
+    (
+      await page.request.delete(`/api/v1/templates/${template.id}`, {
+        headers: { "X-Zero-CSRF": csrf },
+      })
+    ).ok(),
+  ).toBe(true);
 });
 
 test("findings show severity and combine severity, verdict, and search filters", async ({
