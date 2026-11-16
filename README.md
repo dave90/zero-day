@@ -70,19 +70,26 @@ For serving a built UI from a single port or selecting another data directory, s
 
 ## Create your first attack
 
-### 1. Add the target, scope, and goal
+An **attack** is a workspace for one assessment: its target, settings, conversation, and findings.
+You can choose the main settings during creation, without opening Configure afterward.
 
-Click **New attack** in the sidebar. Choose **Blank assessment** under **Start from**, then fill in:
+For your first run, choose **Blank assessment** and **Orchestrated**, use the backend you have
+already signed into, and keep the default budgets and manual approvals.
 
-| Field | Example |
-| --- | --- |
-| Attack name | Staging application review |
-| Target / start URL | `https://staging.example.com` — replace this with your authorized target |
-| Engagement context | Allowed hosts, routes, test accounts, exclusions, and testing constraints |
-| First goal | Review authentication and access control within the defined scope. Validate reproducible findings and explain the evidence. |
+### 1. Describe what you want to test
 
-Write the engagement context directly or use **Import file** to load an existing `pentest.md`.
-For example:
+Click **New attack** in the sidebar. In **A new assessment**, leave **Start from** set to
+**Blank assessment** and fill in these fields:
+
+| Field | What to enter | Example |
+| --- | --- | --- |
+| **Attack name** | A name you will recognize in your workspace. | Staging application review |
+| **Target / start URL** | The application you have permission to test. | `https://staging.example.com` — replace this example with your target. |
+| **Engagement context** | What Zero may test, what it should leave alone, and any test accounts or constraints. | Only the staging host; test accounts only; no destructive actions. |
+| **First goal** | The task you want Zero to investigate first. | Review login and access controls. Validate reproducible findings and explain the evidence. |
+
+You can type the engagement context or choose **Import file** to load an existing `pentest.md`.
+For example, replace the host below with your authorized target:
 
 ```markdown
 # Staging application assessment
@@ -93,47 +100,75 @@ For example:
 - Exclude production, denial-of-service, and destructive actions.
 
 ## Credentials
-- Add dedicated test accounts here when required.
+- Add dedicated test accounts here if needed.
 
 ## Goal
 Review authentication and access-control boundaries.
 ```
 
-Attach source snapshots, request samples, or Burp exports when useful. Imports are limited to
-1 MB per file. Select a working style, then set the backend, model, investigation turn budgets,
-max subagents, and approvals directly in **A new assessment**. Defaults are 50 turns per agent,
-100 concurrent subagents, and no automatic approvals. Click **Create attack** to save this setup;
-you can start the assessment without opening Configure. Select **Swarm** to reveal
-**Swarm size** and choose how many peer orchestrators to run (minimum 2).
+Context files are optional. Use **Add context files** to attach request samples, source files,
+or Burp exports if they would help the investigation. Each imported file can be up to 1 MB.
 
-![Configure backend, model, budgets, and approvals while creating an attack](docs/images/studio-new-attack.png)
+### 2. Choose how Zero will run
 
-Studio creates a dedicated workspace and saves the first goal in the conversation composer.
-Creating the attack saves its setup; sending the goal starts the assessment.
+Continue down the same **A new assessment** form to choose the working style and run settings.
 
-### 2. Start the assessment
+**Working style** controls how the agents organize their work:
 
-Review the settings chosen during creation. **Configure** remains available for advanced
-settings such as sandbox options and rate limits, or to change the saved setup later.
-
-| Working style | What it does |
+| Working style | When to use it |
 | --- | --- |
-| **Orchestrated** | An orchestrator investigates and dispatches pentesters and validators. The default starting point. |
-| **Swarm** | Several peer orchestrators coordinate work, each with its own pentesters and validators. |
-| **Ralph** | Review a proposed plan, then run bounded orchestrated passes with durable progress. |
-| **Single agent** | One pentester investigates with background validators. |
+| **Orchestrated** | Start here. One lead agent investigates and assigns focused tasks to pentesters and independent validators. |
+| **Swarm** | Use several collaborating lead agents. Selecting it reveals **Swarm size**, which starts at **2** and must be a whole number of at least **2**. |
+| **Ralph** | Review a proposed plan, then run a sequence of bounded investigation passes. |
+| **Single agent** | Use one pentester with background validators. |
 
-With Codex, **Model** in the creation form and **Configure → Model & sessions → Model** offer
-a searchable model list discovered from the installed CLI. An explicit selection applies to that Zero runtime and its agents. Configuration
-saved during an open runtime applies to the next runtime; end the current session to switch.
+A pentester investigates a possible issue; a validator checks the evidence independently.
+In Swarm, each lead agent has its own investigation budgets and subagent limits.
 
-In **Conversation**, send the saved first goal with **Enter** or the send arrow. Studio checks backend authentication and sandbox readiness before starting.
-Review [Agents & budgets and Approvals](#important-configuration) below before starting a run.
+Under **Backend & model**, choose the CLI that Zero will use:
 
-Tool approvals, questions, and Ralph plan checkpoints appear in the conversation. Review each
-request and use its displayed controls to allow, deny, answer, or revise the plan.
+- **Backend:** choose **Codex** or **Claude**, matching the CLI you installed and authenticated.
+  Codex is the default. The selection applies to the lead agent, pentesters, and validators.
+- **Model:** with Codex, keep **Codex default** or choose a model from the searchable list.
+  With Claude, keep the prefilled model, enter another available Claude model, or clear the field
+  to use its account default. Switching backends keeps their model choices separate.
 
-### 3. Follow progress and review results
+Under **Investigation budgets**, you can keep these defaults for your first run:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| **Max turns** | **50** | Maximum investigation steps for the main agent on one goal. |
+| **Pentester max turns** | **50** | Maximum steps for each assigned pentester. |
+| **Validator max turns** | **50** | Maximum steps for each independent validator. |
+| **Max subagents** | **100** | Concurrent pentesters and validators in Orchestrated mode; in Swarm, the limit applies to each lead agent. |
+
+These are upper limits. Agents can finish earlier, and Zero creates subagents as needed.
+
+Under **Approvals**, start with **Auto approve** empty and **Yolo**, **I understand**, and
+**Allow host exec** switched off. When a tool needs approval, Zero will show a decision card in
+the conversation. You can review the proposed action and allow or deny it.
+
+If you later enable automatic approvals, selecting **Exploit** also requires **I understand**.
+See [Important configuration](#important-configuration) for the full approval rules and advanced
+budget settings.
+
+![Backend, model, investigation budgets, and approvals in the new-assessment form](docs/images/studio-new-attack.png)
+
+### 3. Create the workspace, then start testing
+
+1. Click **Create attack**. Studio saves your settings and opens the attack's **Conversation**.
+   Your first goal is ready in the message box. **No assessment has started yet.**
+2. Review the goal, then click **Start assessment** or press **Enter** to send it. Studio checks
+   the selected backend's authentication and the sandbox setup before starting. Live assessments
+   consume the selected backend's allowance.
+3. Watch the conversation. Answer questions and review any approval cards. Ralph also asks you to
+   review its plan before the investigation passes begin.
+
+**Configure** remains available for advanced options, such as sandbox settings and rate limits,
+or to change the saved setup later. An open runtime keeps its current configuration; end that
+runtime before starting another with different settings.
+
+### 4. Follow progress and review results
 
 - **Conversation** shows messages, tool activity, operator decisions, and assessment progress.
   **Goal finished** means Zero is ready for another goal; the runtime remains open. **Background
