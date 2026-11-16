@@ -18,15 +18,15 @@ describe("mode configuration", () => {
       ralph: true,
       execution_mode: "c",
     });
-    expect(preset(config, "mcp")).toMatchObject({
-      backend: "claude",
-      execution_mode: "b",
+    expect(preset(swarm, "single")).toMatchObject({
+      backend: "codex",
+      execution_mode: "a",
       ralph: false,
       swarm_size: 1,
     });
     expect(preset(config, "single").execution_mode).toBe("a");
   });
-  it("offers five labeled, keyboard accessible mode presets", () => {
+  it("offers four labeled, keyboard accessible mode presets", () => {
     let updated = config;
     render(
       <ModeCards
@@ -36,9 +36,11 @@ describe("mode configuration", () => {
         }}
       />,
     );
-    expect(screen.getAllByRole("button")).toHaveLength(5);
-    fireEvent.click(screen.getByRole("button", { name: /MCP delegated/ }));
-    expect(updated.backend).toBe("claude");
+    expect(screen.getAllByRole("button")).toHaveLength(4);
+    expect(screen.queryByRole("button", { name: /MCP delegated/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Single agent/ }));
+    expect(updated.execution_mode).toBe("a");
+    expect(updated.backend).toBe("codex");
     cleanup();
   });
 });

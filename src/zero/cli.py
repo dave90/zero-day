@@ -48,13 +48,13 @@ def main() -> None:
 )
 @click.option(
     "--execution-mode",
-    type=click.Choice(["a", "b", "c"]),
+    type=click.Choice(["a", "c"]),
     default="c",
     show_default=True,
     help=(
         "Execution mode: c=orchestrated (DEFAULT) — a senior-pentester orchestrator"
-        " dispatches concurrent pentester/validator subagents; a=single agent;"
-        " b=MCP delegated. Tool calls prompt for approval unless you pass"
+        " dispatches concurrent pentester/validator subagents; a=single agent."
+        " Tool calls prompt for approval unless you pass"
         " --auto-approve/--yolo (use --yolo for unattended runs)."
     ),
 )
@@ -139,7 +139,7 @@ def main() -> None:
 @click.option(
     "--max-subagents",
     type=int,
-    default=10,
+    default=100,
     show_default=True,
     help="Max CONCURRENT subagents in orchestrated mode (c) — how many run at once.",
 )

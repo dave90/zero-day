@@ -30,6 +30,11 @@ import {
   modeName,
 } from "../components/common";
 import { ModeCards } from "./configuration";
+import { SwarmSizeField } from "../components/SwarmSizeField";
+import {
+  InitialRunSettings,
+  approvalError,
+} from "../components/InitialRunSettings";
 export function NewAttack({
   schema,
   health,
@@ -58,9 +63,10 @@ export function NewAttack({
     [target, setTarget] = useState(initialTemplate?.target || ""),
     [scope, setScope] = useState(initialTemplate?.context || emptyScope),
     [goal, setGoal] = useState(String(initialTemplate?.config.goal || "")),
-    [config, setConfig] = useState<Config>(
-      initialTemplate?.config || schema.defaults,
-    ),
+    [config, setConfig] = useState<Config>({
+      ...schema.defaults,
+      ...initialTemplate?.config,
+    }),
     [files, setFiles] = useState<File[]>([]),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
@@ -73,11 +79,12 @@ export function NewAttack({
     setTarget(template?.target || "");
     setScope(template?.context || emptyScope);
     setGoal(String(template?.config.goal || ""));
-    setConfig(template?.config || schema.defaults);
+    setConfig({ ...schema.defaults, ...template?.config });
     setFiles([]);
   }
   async function create(e: FormEvent) {
     e.preventDefault();
+    if (approvalError(config)) return;
     setBusy(true);
     setError("");
     try {
@@ -224,6 +231,19 @@ export function NewAttack({
           </label>
           <span className="block-label">Working style</span>
           <ModeCards config={config} onChange={setConfig} />
+          {Number(config.swarm_size) > 1 && (
+            <SwarmSizeField
+              key={"swarm-" + (selected || "blank")}
+              value={Number(config.swarm_size)}
+              onChange={(swarm_size) => setConfig({ ...config, swarm_size })}
+            />
+          )}
+          <InitialRunSettings
+            key={selected || "blank"}
+            config={config}
+            schema={schema}
+            onChange={setConfig}
+          />
           <label
             className="drop-zone"
             onDragOver={(e) => e.preventDefault()}
@@ -257,7 +277,10 @@ export function NewAttack({
           <button type="button" className="button" onClick={onClose}>
             Cancel
           </button>
-          <button className="button primary" disabled={busy}>
+          <button
+            className="button primary"
+            disabled={busy || !!approvalError(config)}
+          >
             {busy ? "Creating…" : "Create attack"}
             <ArrowRight size={15} />
           </button>

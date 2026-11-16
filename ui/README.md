@@ -42,6 +42,12 @@ Scope is advisory; `scope_host` preserves `web_fetch` blocklist semantics.
 
 ## Using the workspace
 
+- **New attack:** choose the working style, backend and model, main/pentester/validator turn
+  budgets, max subagents, and approvals directly during creation. Codex uses the discovered model
+  picker; Claude accepts its model value. Backend switches retain separate model selections.
+  Templates prefill these settings and can be adjusted before saving. Exploit auto-approval
+  requires **I understand**. Selecting **Swarm** reveals **Swarm size** (at least two peers);
+  saved templates prefill the peer count. Creating the attack saves the settings without starting a run.
 - **All attacks:** create, search, open, archive, or restore conversations. Switching attacks
   keeps assessments running. Unsent drafts are stored by the local service.
 - **Attack actions (⋯):** available on each attack card and beside Configure. **Create template**
@@ -71,10 +77,11 @@ Scope is advisory; `scope_host` preserves `web_fetch` blocklist semantics.
   is the timestamp of the latest runtime event, not a browser heartbeat. A quiet or disconnected
   run is never presented as finished. A finished goal leaves the runtime open for follow-up;
   background validation still running is shown separately.
-- **Configure:** all 38 effective CLI defaults in eight sections, five mode presets, server
+- **Configure:** all 38 effective CLI defaults in eight sections, four working-style presets, server
   validation, and a quoted copyable CLI command. Changes during an active session are
   next-session drafts. End that session before starting a different runtime configuration.
-  Main-agent, pentester, and validator investigation budgets default to **50** turns each.
+  Main-agent, pentester, and validator investigation budgets default to **50** turns each;
+  up to **100** subagents can run concurrently per peer by default.
   See [important configuration](../README.md#important-configuration) for budgets and approvals.
 - **Findings:** independent verdict filters, endpoint/CWE search, submitted evidence,
   validator rationale/reproducer, CVSS vector, duplicate links, and artifact exports.

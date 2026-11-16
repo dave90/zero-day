@@ -12,11 +12,14 @@ def test_every_cli_option_and_effective_default_is_mapped():
     command = main.commands["run"]
     options = {p.name: p for p in command.params}
     assert len(SCHEMA) == 38
+    assert options["execution_mode"].type.choices == ("a", "c")
+    assert next(f for f in SCHEMA if f["key"] == "execution_mode")["choices"] == ["a", "c"]
     assert {f["key"] for f in SCHEMA} == set(options)
     cfg = RunConfig().model_dump()
     runtime = core_config(Path("/tmp/test"), cfg)
     for key in ("max_turns", "pentester_max_turns", "validator_max_turns"):
         assert cfg[key] == getattr(runtime, key) == 50
+    assert cfg["max_subagents"] == runtime.max_concurrent_subagents == 100
     with command.make_context("run", []) as context:
         defaults = context.params
     for field in SCHEMA:
@@ -35,6 +38,7 @@ def test_every_cli_option_and_effective_default_is_mapped():
         {"swarm_size": 2, "execution_mode": "a"},
         {"swarm_size": 2, "ralph": True},
         {"execution_mode": "b", "backend": "codex"},
+        {"execution_mode": "b", "backend": "claude"},
         {"ralph": True, "execution_mode": "a"},
         {"auto_approve": ["exploit"]},
         {"max_turns": "ten"},

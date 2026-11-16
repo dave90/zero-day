@@ -77,7 +77,7 @@ uv run zero run --execution-mode c --swarm-size 4 \
 Peers have separate model sessions, memory, tool state, turn budgets, and focused children. They
 coordinate through `.pentest/swarm/state.sqlite3`, share one sandbox and approval policy, hand off
 content-addressed evidence, and produce one consolidated response and report. `--swarm-size 1`
-keeps the original mode-c runtime. Swarms are intentionally unavailable with modes `a`/`b` and
+keeps the original mode-c runtime. Swarms are intentionally unavailable with single-agent mode (`a`) and
 Ralph.
 
 The first swarm cycle has a mandatory ownership bootstrap. Each peer inspects the shared ledger,
@@ -141,7 +141,7 @@ variables are required; `zero` uses the selected CLI's existing authentication.
 | `--pentester-max-turns <n>` | `50` | Bound each dispatched pentester's investigation steps |
 | `--validator-max-turns <n>` | `50` | Bound each independent validator's investigation steps |
 | `--swarm-size <n>` | `1` | Run fixed-size collaborating top-level peers in mode `c` |
-| `--max-subagents <n>` | `10` | Limit concurrent pentester and validator children **per swarm peer** |
+| `--max-subagents <n>` | `100` | Limit concurrent pentester and validator children **per swarm peer** |
 | `--max-total-subagents <n>` | `0` (unlimited) | Cap total children **per swarm peer** (`N × cap` maximum for a swarm of size `N`) |
 | `--rate-limit <spec>` | `100/min` | Limit requests per host, for example `5/sec` |
 | `--files-root <path>` | `./zero_files` | Expose local files to the jailed read-only file tools |

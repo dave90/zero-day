@@ -313,7 +313,7 @@ async def context_files(request):
 async def preflight(cfg: dict, scripted: bool):
     if scripted:
         return
-    binary = "claude" if cfg["execution_mode"] == "b" else cfg["backend"]
+    binary = cfg["backend"]
     if shutil.which(binary) is None:
         raise ValueError(f"{binary} CLI is not on PATH. Install and authenticate it first.")
     args = [binary, "login", "status"] if binary == "codex" else [binary, "auth", "status"]

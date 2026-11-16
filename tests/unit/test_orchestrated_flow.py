@@ -956,7 +956,7 @@ def test_default_execution_mode_is_orchestrated():
     cfg = OrchestratorConfig(cwd=Path("."))
     assert cfg.backend == "codex"
     assert cfg.execution_mode == "c"
-    assert cfg.max_concurrent_subagents == 10
+    assert cfg.max_concurrent_subagents == 100
     assert cfg.max_turns == 50  # orchestrator turn budget (turn awareness)
     assert cfg.llm_timeout_seconds == 900  # shared per-call timeout (orchestrator + subagents)
     assert cfg.pentester_max_turns == 50   # independent per-pentester turn budget

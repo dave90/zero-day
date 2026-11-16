@@ -100,17 +100,21 @@ Review authentication and access-control boundaries.
 ```
 
 Attach source snapshots, request samples, or Burp exports when useful. Imports are limited to
-1 MB per file. Select a working style and click **Create attack**.
+1 MB per file. Select a working style, then set the backend, model, investigation turn budgets,
+max subagents, and approvals directly in **A new assessment**. Defaults are 50 turns per agent,
+100 concurrent subagents, and no automatic approvals. Click **Create attack** to save this setup;
+you can start the assessment without opening Configure. Select **Swarm** to reveal
+**Swarm size** and choose how many peer orchestrators to run (minimum 2).
 
-![Create an attack with a name, target URL, engagement context, and first goal](docs/images/studio-new-attack.png)
+![Configure backend, model, budgets, and approvals while creating an attack](docs/images/studio-new-attack.png)
 
 Studio creates a dedicated workspace and saves the first goal in the conversation composer.
 Creating the attack saves its setup; sending the goal starts the assessment.
 
-### 2. Configure and start the assessment
+### 2. Start the assessment
 
-Open **Configure** to choose the backend, model, working style, budgets, sandbox, rate limits,
-and approval settings.
+Review the settings chosen during creation. **Configure** remains available for advanced
+settings such as sandbox options and rate limits, or to change the saved setup later.
 
 | Working style | What it does |
 | --- | --- |
@@ -118,14 +122,12 @@ and approval settings.
 | **Swarm** | Several peer orchestrators coordinate work, each with its own pentesters and validators. |
 | **Ralph** | Review a proposed plan, then run bounded orchestrated passes with durable progress. |
 | **Single agent** | One pentester investigates with background validators. |
-| **MCP delegated** | Claude Code manages the agent loop through MCP. Requires the Claude backend. |
 
-With Codex, **Model & sessions → Model** offers a searchable model list discovered from the
-installed CLI. An explicit selection applies to that Zero runtime and its agents. Configuration
+With Codex, **Model** in the creation form and **Configure → Model & sessions → Model** offer
+a searchable model list discovered from the installed CLI. An explicit selection applies to that Zero runtime and its agents. Configuration
 saved during an open runtime applies to the next runtime; end the current session to switch.
 
-Save the configuration, return to **Conversation**, and send the first goal with **Enter** or the
-send arrow. Studio checks backend authentication and sandbox readiness before starting.
+In **Conversation**, send the saved first goal with **Enter** or the send arrow. Studio checks backend authentication and sandbox readiness before starting.
 Review [Agents & budgets and Approvals](#important-configuration) below before starting a run.
 
 Tool approvals, questions, and Ralph plan checkpoints appear in the conversation. Review each
@@ -161,6 +163,24 @@ Open **Configure** on an attack to review these settings. The defaults below app
 attacks and CLI runs. Existing attacks and templates keep their saved values; update them in
 Configure when you want different budgets. An open runtime keeps its configuration until it ends.
 
+### Backend: Codex or Claude
+
+Choose **Backend** in **A new assessment**, or **Configure → Execution → Backend** later:
+
+| Backend | Required CLI | Authentication |
+| --- | --- | --- |
+| **Codex** (`codex`, default) | `codex` on `PATH` | Uses your existing authenticated Codex CLI session. |
+| **Claude** (`claude`) | `claude` on `PATH` | Uses your existing authenticated Claude Code session. |
+
+The selected backend runs the main agent, pentesters, and validators for that runtime. Both
+backends support all four working styles. Studio checks that the selected CLI is installed and
+authenticated before starting. Live runs consume the selected backend's subscription or API
+allowance.
+
+Choose the model under **Model & sessions → Model**. Codex provides a discovered model picker;
+Claude accepts a model value for its backend. From the terminal, select the backend with
+`uv run zero run --backend codex` or `uv run zero run --backend claude`.
+
 ### Agents & budgets
 
 In **Configure → Agents & budgets**, the three investigation turn limits default to **50**:
@@ -170,7 +190,7 @@ In **Configure → Agents & budgets**, the three investigation turn limits defau
 | **Max turns** | **50** | Main agent's turn limit for a goal; each Swarm peer has its own budget. |
 | **Pentester max turns** | **50** | Investigation steps for each dispatched pentester. |
 | **Validator max turns** | **50** | Investigation steps for each independent validator. |
-| **Max subagents** | `10` | Pentesters and validators allowed to run concurrently per peer. |
+| **Max subagents** | `100` | Pentesters and validators allowed to run concurrently per peer. |
 | **Max total subagents** | `0` (unlimited) | Total child dispatches per peer; set a positive value to cap dispatches. |
 | **Subagent deadline** | `1200` seconds | Elapsed-time limit per subagent, checked between turns. |
 | **LLM timeout** | `900` seconds | Maximum wait for one model call, shared by main agents and subagents. |

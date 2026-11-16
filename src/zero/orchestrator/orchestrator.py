@@ -178,7 +178,7 @@ class OrchestratorConfig:
     # without this. Bounds a runaway subagent regardless of turn count.
     subagent_deadline_seconds: int = 1200
     # Orchestrated mode (M8): cap on concurrently-running subagents.
-    max_concurrent_subagents: int = 10
+    max_concurrent_subagents: int = 100
     # Hard ceiling on the TOTAL subagents (pentesters + validators) dispatched over
     # the whole run — distinct from the concurrency cap above. 0 = unlimited. Once
     # reached, dispatch_pentester/dispatch_validator are refused and the orchestrator

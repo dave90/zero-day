@@ -14,6 +14,25 @@ def store_for(client):
     return client._transport.app.state.store
 
 
+async def test_new_attack_persists_schema_budget_defaults(client):
+    response = await client.get(API + "/config-schema")
+    assert response.status_code == 200
+    schema = response.json()
+    expected = {
+        "max_turns": 50,
+        "pentester_max_turns": 50,
+        "validator_max_turns": 50,
+        "max_subagents": 100,
+    }
+    field_defaults = {field["key"]: field["default"] for field in schema["fields"]}
+    attack = await create(client, config=schema["defaults"])
+    saved = (await client.get(API + f"/engagements/{attack['id']}")).json()
+    for key, value in expected.items():
+        assert schema["defaults"][key] == field_defaults[key] == value
+        assert attack["config"][key] == saved["config"][key] == value
+    assert store_for(client).sessions(attack["id"]) == []
+
+
 async def test_template_is_independent_setup_and_creates_fresh_attacks(client):
     source = await create(client, "Source")
     eid = source["id"]

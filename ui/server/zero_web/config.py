@@ -54,8 +54,6 @@ def validate_config(raw: dict) -> dict:
             minimum = 0 if field["key"] == "max_total_subagents" else 1
             if value < minimum or value > 10_000_000:
                 raise ValueError(f"{field['label']} must be between {minimum} and 10000000")
-    if cfg["execution_mode"] == "b" and cfg["backend"] != "claude":
-        raise ValueError("MCP delegated execution requires Claude")
     if cfg["swarm_size"] > 1 and (cfg["execution_mode"] != "c" or cfg["ralph"]):
         raise ValueError("Swarm requires orchestrated mode and cannot be combined with Ralph")
     if cfg["ralph"] and cfg["execution_mode"] != "c":

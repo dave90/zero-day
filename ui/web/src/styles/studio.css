@@ -2477,6 +2477,66 @@ kbd {
 .drop-zone input {
   display: none;
 }
+.initial-swarm-size {
+  margin-top: 18px;
+}
+
+.initial-run-settings {
+  margin-top: 26px;
+}
+.initial-settings-section {
+  min-width: 0;
+  padding: 18px 0 0;
+  margin: 24px 0 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.initial-settings-section > legend {
+  padding: 0 10px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.initial-setting-label {
+  display: block;
+  margin: 15px 0 9px;
+  font-size: 12px;
+}
+.initial-setting-label:first-of-type {
+  margin-top: 0;
+}
+.initial-budget-grid {
+  margin-bottom: 0;
+}
+.initial-approval-help {
+  margin: 0 0 16px;
+}
+.initial-auto-approve {
+  padding: 0;
+  margin: 0 0 18px;
+  border: 0;
+}
+.initial-auto-approve legend {
+  padding: 0;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.initial-auto-approve .risk-options {
+  flex-wrap: wrap;
+}
+.initial-approval-option {
+  margin-top: 15px;
+}
+.initial-approval-option .field-help {
+  margin: 4px 0 0 22px;
+}
+.initial-run-settings .error-banner {
+  margin: 16px 0 0;
+}
+@media (max-width: 600px) {
+  .initial-budget-grid {
+    grid-template-columns: 1fr;
+  }
+}
 .mode-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

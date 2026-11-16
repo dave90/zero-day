@@ -121,7 +121,7 @@ export const modeName = (c: Record<string, unknown>) =>
       : c.execution_mode === "a"
         ? "Single agent"
         : c.execution_mode === "b"
-          ? "MCP delegated"
+          ? "Legacy session"
           : "Orchestrated";
 export const active = (state?: string) =>
   !!state && !["draft", "closed", "failed", "interrupted"].includes(state);

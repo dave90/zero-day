@@ -1,5 +1,323 @@
 import { test, expect, type Page } from "../../web/test-support";
 
+for (const backend of ["codex", "claude"]) {
+  test(`new attacks apply ${backend} model, budgets and approvals to their first runtime`, async ({
+    page,
+  }) => {
+    await page.route("**/api/v1/models?**", (route) =>
+      route.fulfill({
+        json: {
+          backend: "codex",
+          source: "codex_cache",
+          configured_default: null,
+          warning: "Offline model fixture",
+          retrieved_at: 1,
+          cached_at: 1,
+          models: [
+            {
+              id: "creation-model",
+              name: "Creation model",
+              description: "Offline fixture",
+            },
+          ],
+        },
+      }),
+    );
+    await page.goto("/");
+    const schema = await (
+      await page.request.get("/api/v1/config-schema")
+    ).json();
+    const csrf = (await (await page.request.get("/api/v1/health")).json())
+      .csrf_token;
+    // The template preserves the hidden container preference while creation edits
+    // the visible settings. Runtime verification remains offline and host-only.
+    const source = await (
+      await page.request.post("/api/v1/engagements", {
+        headers: { "X-Zero-CSRF": csrf },
+        data: {
+          name: "Offline runtime setup",
+          target: "https://fixture.example",
+          config: { ...schema.defaults, container: false },
+        },
+      })
+    ).json();
+    const template = await (
+      await page.request.post("/api/v1/templates", {
+        headers: { "X-Zero-CSRF": csrf },
+        data: { source_id: source.id, name: "Offline runtime setup" },
+      })
+    ).json();
+    await page
+      .getByRole("button", { name: "New attack", exact: true })
+      .first()
+      .click();
+    await page.getByLabel("Start from").selectOption(template.id);
+    const name = `${backend} creation settings ` + Date.now();
+    await page.getByLabel("Attack name", { exact: true }).fill(name);
+    await page.getByLabel("Target / start URL").fill("https://fixture.example");
+    await page.getByLabel("First goal").fill("Inspect the offline fixture");
+    for (const label of [
+      "Max turns",
+      "Pentester max turns",
+      "Validator max turns",
+    ]) {
+      await expect(page.getByLabel(label, { exact: true })).toHaveValue("50");
+    }
+    await expect(page.getByLabel("Max subagents", { exact: true })).toHaveValue(
+      "100",
+    );
+    await page
+      .getByLabel("Model", { exact: true })
+      .selectOption("creation-model");
+    await page.getByLabel("Backend", { exact: true }).selectOption("claude");
+    await page
+      .getByLabel("Model", { exact: true })
+      .fill("claude-creation-choice");
+    await page.getByLabel("Backend", { exact: true }).selectOption("codex");
+    await expect(page.getByLabel("Model", { exact: true })).toHaveValue(
+      "creation-model",
+    );
+    if (backend === "claude") {
+      await page.getByLabel("Backend", { exact: true }).selectOption("claude");
+      await expect(page.getByLabel("Model", { exact: true })).toHaveValue(
+        "claude-creation-choice",
+      );
+      await page.getByLabel("Yolo", { exact: true }).check();
+      await page.getByLabel("Allow host exec", { exact: true }).check();
+    }
+    for (const [label, value] of [
+      ["Max turns", "17"],
+      ["Pentester max turns", "23"],
+      ["Validator max turns", "29"],
+      ["Max subagents", "73"],
+    ]) {
+      await page.getByLabel(label, { exact: true }).fill(value);
+    }
+    await page.getByLabel("safe", { exact: true }).check();
+    await page.getByLabel("active", { exact: true }).check();
+    await page.getByLabel("exploit", { exact: true }).check();
+    await expect(
+      page.getByRole("button", { name: "Create attack", exact: true }),
+    ).toBeDisabled();
+    await page.getByLabel("I understand", { exact: true }).check();
+    await page.screenshot({
+      path: `test-results/studio-initial-run-settings-${backend}.png`,
+    });
+    await page
+      .getByRole("button", { name: "Create attack", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name, exact: true }),
+    ).toBeVisible();
+    const eid = page.url().split("/attacks/")[1].split("/")[0];
+    const attack = await (
+      await page.request.get(`/api/v1/engagements/${eid}`)
+    ).json();
+    expect(attack.session_id).toBeNull();
+    const expected = {
+      backend,
+      model: backend === "codex" ? "creation-model" : "claude-creation-choice",
+      max_turns: 17,
+      pentester_max_turns: 23,
+      validator_max_turns: 29,
+      max_subagents: 73,
+      auto_approve: ["safe", "active", "exploit"],
+      i_understand: true,
+      yolo: backend === "claude",
+      allow_host_exec: backend === "claude",
+      container: false,
+    };
+    expect(attack.config).toMatchObject(expected);
+    await page
+      .getByRole("button", { name: "Start assessment", exact: true })
+      .click();
+    await expect
+      .poll(
+        async () =>
+          (await (await page.request.get(`/api/v1/engagements/${eid}`)).json())
+            .session_id,
+      )
+      .toBeTruthy();
+    const sid = (
+      await (await page.request.get(`/api/v1/engagements/${eid}`)).json()
+    ).session_id;
+    await expect
+      .poll(async () => {
+        const session = await (
+          await page.request.get(`/api/v1/sessions/${sid}/snapshot`)
+        ).json();
+        return Object.values(session.snapshot.tools).some(
+          (tool: { tool?: string; ok?: boolean }) =>
+            tool.tool === "offline_fixture" && tool.ok === true,
+        );
+      })
+      .toBe(true);
+    const running = await (
+      await page.request.get(`/api/v1/sessions/${sid}/snapshot`)
+    ).json();
+    expect(running.config).toMatchObject(expected);
+    expect(
+      Object.values(running.snapshot.interactions).some(
+        (item: { kind?: string }) => item.kind === "approval_prompt",
+      ),
+    ).toBe(false);
+    await page
+      .getByRole("button", { name: "End runtime session", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "End session", exact: true })
+      .click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await page.getByRole("button", { name: "Configure", exact: true }).click();
+    await expect(page.getByLabel("Backend", { exact: true })).toHaveValue(
+      backend,
+    );
+    await page.getByRole("button", { name: /Agents & budgets/ }).click();
+    for (const [label, value] of [
+      ["Max turns", "17"],
+      ["Pentester max turns", "23"],
+      ["Validator max turns", "29"],
+      ["Max subagents", "73"],
+    ]) {
+      await expect(page.getByLabel(label, { exact: true })).toHaveValue(value);
+    }
+    await page.getByRole("button", { name: /Model & sessions/ }).click();
+    await expect(page.getByLabel("Model", { exact: true })).toHaveValue(
+      expected.model,
+    );
+    await page.getByRole("button", { name: /06 Approvals/ }).click();
+    for (const risk of ["safe", "active", "exploit"]) {
+      await expect(page.getByLabel(risk, { exact: true })).toBeChecked();
+    }
+    await expect(
+      page.getByLabel("I understand", { exact: true }),
+    ).toBeChecked();
+    await expect(page.getByLabel("Yolo", { exact: true })).toBeChecked({
+      checked: backend === "claude",
+    });
+    await expect(
+      page.getByLabel("Allow host exec", { exact: true }),
+    ).toBeChecked({ checked: backend === "claude" });
+  });
+}
+
+test("new Swarm attacks save the selected size and start that many peers", async ({
+  page,
+}) => {
+  await page.route("**/api/v1/models?**", (route) =>
+    route.fulfill({
+      json: {
+        backend: "codex",
+        models: [],
+        source: "codex_cache",
+        configured_default: null,
+        warning: "Offline fixture",
+        retrieved_at: 1,
+        cached_at: 1,
+      },
+    }),
+  );
+  await page.goto("/");
+  const schema = await (await page.request.get("/api/v1/config-schema")).json();
+  const csrf = (await (await page.request.get("/api/v1/health")).json())
+    .csrf_token;
+  const source = await (
+    await page.request.post("/api/v1/engagements", {
+      headers: { "X-Zero-CSRF": csrf },
+      data: {
+        name: "Offline Swarm setup",
+        target: "https://fixture.example",
+        config: {
+          ...schema.defaults,
+          container: false,
+          auto_approve: ["safe", "active", "exploit"],
+          i_understand: true,
+        },
+      },
+    })
+  ).json();
+  const template = await (
+    await page.request.post("/api/v1/templates", {
+      headers: { "X-Zero-CSRF": csrf },
+      data: { source_id: source.id, name: "Offline Swarm setup" },
+    })
+  ).json();
+  await page
+    .getByRole("button", { name: "New attack", exact: true })
+    .first()
+    .click();
+  const dialog = page.getByRole("dialog", { name: "A new assessment" });
+  await dialog.getByLabel("Start from").selectOption(template.id);
+  const name = "Three-peer creation " + Date.now();
+  await dialog.getByLabel("Attack name", { exact: true }).fill(name);
+  await dialog
+    .getByLabel("First goal")
+    .fill("Inspect the offline Swarm fixture");
+  await expect(dialog.getByLabel("Swarm size", { exact: true })).toHaveCount(0);
+  const swarm = dialog.getByRole("button", { name: /^Swarm / });
+  await swarm.click();
+  const size = dialog.getByLabel("Swarm size", { exact: true });
+  await expect(size).toHaveValue("2");
+  for (const invalid of ["", "1", "2.5"]) {
+    await size.fill(invalid);
+    await dialog
+      .getByRole("button", { name: "Create attack", exact: true })
+      .click();
+    await expect(dialog).toBeVisible();
+    await expect(swarm).toHaveAttribute("aria-pressed", "true");
+    await expect(size).toBeVisible();
+  }
+  await size.fill("3");
+  await page.screenshot({ path: "test-results/studio-new-swarm-size.png" });
+  await dialog
+    .getByRole("button", { name: "Create attack", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  const eid = page.url().split("/attacks/")[1].split("/")[0];
+  const attack = await (
+    await page.request.get(`/api/v1/engagements/${eid}`)
+  ).json();
+  expect(attack.config).toMatchObject({
+    execution_mode: "c",
+    swarm_size: 3,
+    ralph: false,
+  });
+  await page
+    .getByRole("button", { name: "Start assessment", exact: true })
+    .click();
+  await expect
+    .poll(
+      async () =>
+        (await (await page.request.get(`/api/v1/engagements/${eid}`)).json())
+          .session_id,
+    )
+    .toBeTruthy();
+  const sid = (
+    await (await page.request.get(`/api/v1/engagements/${eid}`)).json()
+  ).session_id;
+  await expect
+    .poll(async () => {
+      const runtime = await (
+        await page.request.get(`/api/v1/sessions/${sid}/snapshot`)
+      ).json();
+      return Object.values(runtime.snapshot.actors).filter(
+        (actor: { subkind?: string }) => actor.subkind === "peer",
+      ).length;
+    })
+    .toBe(3);
+  const runtime = await (
+    await page.request.get(`/api/v1/sessions/${sid}/snapshot`)
+  ).json();
+  expect(runtime.config.swarm_size).toBe(3);
+  await page
+    .getByRole("button", { name: "End runtime session", exact: true })
+    .click();
+  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.getByRole("button", { name: "Configure", exact: true }).click();
+  await expect(page.getByLabel("Swarm size", { exact: true })).toHaveValue("3");
+});
+
 test("findings show severity and combine severity, verdict, and search filters", async ({
   page,
 }) => {

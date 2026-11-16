@@ -8,7 +8,6 @@ import {
   Users,
   Repeat,
   User,
-  Network,
 } from "lucide-react";
 import { api } from "../api/client";
 import type { Config, Schema, ConfigField } from "../api/types";
@@ -51,11 +50,10 @@ const GROUPS: Record<string, string[]> = {
 export function preset(c: Config, mode: string): Config {
   return {
     ...c,
-    execution_mode: mode === "single" ? "a" : mode === "mcp" ? "b" : "c",
+    execution_mode: mode === "single" ? "a" : "c",
     swarm_size: mode === "swarm" ? Math.max(2, Number(c.swarm_size) || 2) : 1,
     ralph: mode === "ralph",
     ralph_resume: mode === "ralph" ? c.ralph_resume : false,
-    ...(mode === "mcp" ? { backend: "claude" } : {}),
   };
 }
 export function ModeCards({
@@ -71,9 +69,9 @@ export function ModeCards({
       ? "swarm"
       : config.execution_mode === "a"
         ? "single"
-        : config.execution_mode === "b"
-          ? "mcp"
-          : "orchestrated";
+        : config.execution_mode === "c"
+          ? "orchestrated"
+          : "";
   return (
     <div className="mode-grid">
       {[
@@ -100,12 +98,6 @@ export function ModeCards({
           title: "Single agent",
           text: "One investigator + validators.",
           Icon: User,
-        },
-        {
-          id: "mcp",
-          title: "MCP delegated",
-          text: "Claude controls its own loop.",
-          Icon: Network,
         },
       ].map(({ id, title, text, Icon }) => (
         <button
