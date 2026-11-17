@@ -25,7 +25,8 @@ jobs:
       - run: uv run --no-sync --project ui/server pytest tests/unit/test_workspace_ownership.py tests/unit/test_headless_runtime.py -q
       - run: uv run --no-sync --project ui/server ruff check ui
   browser:
-    runs-on: ubuntu-latest
+    # Keep the pinned Playwright release on a supported browser/dependency image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

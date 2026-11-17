@@ -162,7 +162,7 @@ class Store:
         self.save_engagement(data)
         work = self.work(data["id"])
         work.mkdir(parents=True, mode=0o700)
-        (work / "pentest.md").write_text(context, encoding="utf-8")
+        (work / "pentest.md").write_text(context, encoding="utf-8", newline="")
         (work / "zero_files").mkdir()
         return data
 

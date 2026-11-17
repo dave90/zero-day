@@ -12,6 +12,23 @@ from zero_web import models
 from zero_web.config import core_config
 
 
+@pytest.fixture
+def codex_cli(tmp_path, monkeypatch):
+    cli = tmp_path / "codex-fixture.py"
+    monkeypatch.setattr(models.shutil, "which", lambda name: str(cli))
+    spawn = asyncio.create_subprocess_exec
+
+    async def launch(binary, *args, **kwargs):
+        assert binary == str(cli)
+        assert args == ("app-server", "--listen", "stdio://")
+        # Windows CreateProcess cannot execute a Python shebang script directly.
+        # Keep the real pipe/RPC lifecycle while using the interpreter on every OS.
+        return await spawn(sys.executable, binary, *args, **kwargs)
+
+    monkeypatch.setattr(models.asyncio, "create_subprocess_exec", launch)
+    return cli
+
+
 def codex_home(tmp_path, monkeypatch):
     home = tmp_path / "codex-home"
     home.mkdir()
@@ -47,12 +64,13 @@ def test_picker_metadata_is_dynamic_and_does_not_expose_cache_contents():
     assert all(set(m) == {"id", "name", "description"} for m in result)
 
 
-async def test_rpc_lists_every_page_without_threads_turns_or_settings_writes(tmp_path, monkeypatch):
+async def test_rpc_lists_every_page_without_threads_turns_or_settings_writes(
+    tmp_path, monkeypatch, codex_cli
+):
     home = codex_home(tmp_path, monkeypatch)
     original = (home / "config.toml").read_bytes()
     transcript = tmp_path / "requests.jsonl"
-    cli = tmp_path / "codex-fixture"
-    cli.write_text(f"""#!{sys.executable}
+    codex_cli.write_text(f"""
 import json,sys
 with open({str(transcript)!r},'a') as output:
     for line in sys.stdin:
@@ -71,8 +89,6 @@ with open({str(transcript)!r},'a') as output:
                 cursor=None
             print(json.dumps({{'id':req['id'],'result':{{'data':data,'nextCursor':cursor}}}}),flush=True)
 """)
-    cli.chmod(0o755)
-    monkeypatch.setattr(models.shutil, "which", lambda name: str(cli))
     result = await models.query_codex_models(tmp_path)
     assert [m["id"] for m in result] == ["fixture-first", "fixture-future-model"]
     requests = [json.loads(line) for line in transcript.read_text().splitlines()]
@@ -134,11 +150,8 @@ async def test_unavailable_rpc_uses_explicitly_labeled_cache_hints(tmp_path, mon
     assert empty["source"] == "unavailable" and empty["models"] == []
 
 
-async def test_catalog_process_is_reaped_on_timeout(tmp_path, monkeypatch):
-    cli = tmp_path / "hanging-codex"
-    cli.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
-    cli.chmod(0o755)
-    monkeypatch.setattr(models.shutil, "which", lambda name: str(cli))
+async def test_catalog_process_is_reaped_on_timeout(tmp_path, monkeypatch, codex_cli):
+    codex_cli.write_text("import time\ntime.sleep(60)\n")
     spawn = asyncio.create_subprocess_exec
     children = []
 

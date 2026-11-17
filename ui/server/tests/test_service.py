@@ -54,6 +54,38 @@ async def resolve(client, sid, interaction, decision="yes"):
     )
 
 
+@pytest.mark.parametrize("kind", ["approvals", "questions", "plans"])
+async def test_ack_retires_interaction_before_delayed_worker_event(client, monkeypatch, kind):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    a = await create(client)
+    store = client._transport.app.state.store
+    manager = client._transport.app.state.manager
+    session = store.create_session(a["id"], RunConfig().model_dump())
+    sid, rid = session["id"], "waiting-for-operator"
+    event_kind = {
+        "approvals": "approval_prompt",
+        "questions": "ask_user",
+        "plans": "plan_checkpoint",
+    }[kind]
+    store.append(sid, {"kind": event_kind, "request_id": rid, "free_form": True})
+    # The worker accepts the reply, but its event pump has not published
+    # InteractionResolved yet. This ordering is common on Windows.
+    command = AsyncMock(return_value={})
+    monkeypatch.setattr(manager, "worker", lambda _: SimpleNamespace(command=command))
+    url = API + f"/sessions/{sid}/{kind}/{rid}"
+    body = {"answer": "Orders"} if kind == "questions" else {"decision": "yes"}
+    if kind == "plans":
+        body = {"decision": "approve", "revision": "fixture-revision"}
+    response = await client.post(url, json={**body, "idempotency_key": "first"})
+    assert response.status_code == 200, response.text
+    assert rid not in store.session(sid)["snapshot"]["interactions"]
+    assert (await client.post(url, json={**body, "idempotency_key": "first"})).status_code == 200
+    assert (await client.post(url, json={**body, "idempotency_key": "second"})).status_code == 409
+    command.assert_awaited_once()
+
+
 async def test_local_boundary_context_conflict_and_containment(client):
     assert (
         await client.post(API + "/engagements", json={}, headers={"Origin": "https://evil.example"})
@@ -338,6 +370,30 @@ async def test_recorded_replay_is_separate_from_live_and_import_is_readonly(clie
     assert state["snapshot"]["effective"]["backend"] == "replay"
     assert any("Recorded fixture answer" in m["text"] for m in state["snapshot"]["messages"])
     assert not state["snapshot"]["findings"]
+
+
+async def test_replay_recording_path_is_portable_in_worker_protocol(client, monkeypatch):
+    from pathlib import PureWindowsPath
+    from unittest.mock import AsyncMock
+
+    from starlette.responses import JSONResponse
+
+    from zero_web import app
+
+    a = await create(client)
+    store = client._transport.app.state.store
+    work = PureWindowsPath("C:/workspace/engagement/work")
+    recording = ".recordings/fixture.jsonl"
+    monkeypatch.setattr(store, "work", lambda _: work)
+    monkeypatch.setattr(app, "artifact", lambda *args: ({"path": recording}, work / recording))
+    begin = AsyncMock(return_value=JSONResponse({"session_id": "fixture"}, 201))
+    monkeypatch.setattr(app, "begin_session", begin)
+    response = await client.post(
+        API + f"/engagements/{a['id']}/replay",
+        json={"artifact_id": "fixture", "config": {"container": False}, "idempotency_key": "run"},
+    )
+    assert response.status_code == 201, response.text
+    assert begin.call_args.kwargs["replay_path"] == recording
 
 
 async def test_followup_retains_goal_artifacts_and_original_context(client):

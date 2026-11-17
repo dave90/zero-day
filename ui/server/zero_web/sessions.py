@@ -240,7 +240,7 @@ class Worker:
                 shutil.copytree(
                     log_root, destination / ".pentest/llm", symlinks=True, dirs_exist_ok=True
                 )
-        (destination / "pentest.md").write_text(context, encoding="utf-8")
+        (destination / "pentest.md").write_text(context, encoding="utf-8", newline="")
         return destination.relative_to(self.store.root).as_posix()
 
     async def close(self):

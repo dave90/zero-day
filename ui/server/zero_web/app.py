@@ -265,7 +265,7 @@ async def context_document(request):
                 {"error": "Scope was changed in another tab. Reload before saving."}, 409
             )
         content = text_value(data, "content", MAX_PREVIEW, required=False)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="")
         row["context_revision"] += 1
         store.save_engagement(row)
     return JSONResponse(
@@ -469,7 +469,7 @@ async def replay_session(request):
     return await begin_session(
         request,
         {"config": cfg, "idempotency_key": data["idempotency_key"]},
-        replay_path=str(path.relative_to(store.work(eid))),
+        replay_path=path.relative_to(store.work(eid)).as_posix(),
     )
 
 
@@ -611,6 +611,10 @@ async def decision(request):
         else:
             action = "plan"
         result = await manager.worker(sid).command(action, {**data, "request_id": rid})
+        # The ACK can arrive before the worker's queued resolution event. Retire
+        # the request now so another tab cannot send a second reply in that gap.
+        if rid in store.session(sid)["snapshot"]["interactions"]:
+            store.append(sid, {"kind": "interaction_resolved", "request_id": rid})
         store.remember(key, result)
         return JSONResponse(result)
 
