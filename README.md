@@ -1,57 +1,69 @@
-<div align="center">
+# Zero
 
-<pre>
- ███████╗███████╗██████╗  ██████╗
- ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗
-   ███╔╝ █████╗  ██████╔╝██║   ██║
-  ███╔╝  ██╔══╝  ██╔══██╗██║   ██║
- ███████╗███████╗██║  ██║╚██████╔╝
- ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝
-</pre>
+Zero is an autonomous, multi-agent system for authorized web application pentesting and
+bug-bounty research. It coordinates investigations, independently validates candidate findings,
+and saves evidence and reports in a local workspace.
 
-<p><strong>An autonomous, multi-agent system for web application pentesting and bug-bounty work.</strong></p>
+Use **Zero Studio**, the browser interface, to manage assessments and review results, or use the
+independent [command-line interface](CLI.md) from your terminal. Both use the same core runtime
+and your authenticated Codex or Claude CLI.
 
-<p>Parallel testing · independent validation · sandboxed tools · auditable reports</p>
-
-</div>
-
-`zero` investigates web applications through **Zero Studio**, a local browser interface for
-creating attacks, coordinating agents, reviewing evidence, and exporting reports.
+> [!CAUTION]
+> Test only systems you own or have explicit permission to assess. Scope is advisory, not a
+> network firewall. Live assessments consume the selected model backend's allowance.
 
 ![Zero Studio conversation with assessment progress, agents, and findings](docs/images/studio-overview.png)
 
 *Screenshots show the actual interface with synthetic offline demonstration data.*
 
-> [!CAUTION]
-> Use `zero` only on systems you own or have explicit permission to test.
+## Contents
 
-## Why zero?
+- [Key features](#key-features)
+- [Prerequisites](#prerequisites)
+- [Quick start](#quick-start)
+- [Installation and launch options](#installation-and-launch-options)
+- [Usage](#usage)
+- [Important configuration](#important-configuration)
+- [Data and reports](#data-and-reports)
+- [Architecture and tech stack](#architecture-and-tech-stack)
+- [Project structure](#project-structure)
+- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Documentation](#documentation)
+- [Contributing and license](#contributing-and-license)
 
-- **One workspace per attack** — keep scope, goals, conversations, configuration, and evidence
-  together. Switch between attacks while their assessments continue.
-- **Parallel investigation** — an orchestrator dispatches focused pentesters; Swarm mode adds
-  collaborating peer orchestrators with shared work and evidence.
-- **Independent validation** — separate validators confirm or reject candidate findings.
-- **Visible progress** — inspect active agents, tools, memory, todos, and pending decisions.
-- **Useful results** — filter findings by verdict and severity, inspect reproduction steps,
-  copy a finding to the clipboard, or export the report.
-- **Your model backend** — use an authenticated Codex or Claude CLI, with configuration per attack.
-- **Sandboxed tools** — Docker runs security tools while the agent loops run on the host.
+## Key features
 
-Prefer the terminal? See the separate [command-line guide](CLI.md).
+- **Parallel investigation:** a lead orchestrator investigates directly and dispatches focused
+  pentesters; Swarm adds collaborating peer orchestrators.
+- **Independent validation:** validators reinvestigate candidate findings and assign
+  `confirmed`, `rejected`, or `pending` verdicts, with CVSS 4.0 scoring where available.
+- **Local assessment workspaces:** keep scope, settings, conversations, imported files, and
+  evidence together; reuse configurations through saved templates.
+- **Operator controls:** review tool approvals, answer agent questions, and set investigation
+  budgets. Ralph adds reviewed planning and resumable investigation passes.
+- **Sandboxed tooling:** run security tools in Docker while agent loops and model CLIs run on
+  the host. Tools include HTTP replay, Python, Burp XML queries, sqlmap, nmap, ffuf, and nuclei.
+- **Inspectable results:** follow agents, memory, todos, and audit events; filter findings,
+  inspect reproduction steps, and export reports.
+
+## Prerequisites
+
+| Requirement | Needed for |
+| --- | --- |
+| Git | Cloning this repository. |
+| Python **3.11+** and [`uv`](https://docs.astral.sh/uv/) | Core runtime, Studio service, and Python development. |
+| Node.js **22.12+**, including npm | Installing and building Studio's frontend; optional for CLI-only use. |
+| An installed, authenticated **Codex** (`codex`) or **Claude Code** (`claude`) CLI on `PATH` | Live assessments. Zero reuses that CLI's authentication for the current user. |
+| A running Docker daemon | Recommended tool sandbox and Docker integration tests. On Windows, use Docker Desktop with Linux containers. |
+
+Allow roughly **6 GB** for the Kali-based sandbox image; the first build downloads tools and
+wordlists and can take time. Burp Suite is optional: Zero reads exported XML traffic without
+requiring a live Burp integration. Offline unit tests do not need model authentication or Docker.
 
 ## Quick start
 
-### Prerequisites
-
-- Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/).
-- Node.js 22.12 or newer, including npm.
-- An authenticated `codex` or `claude` CLI available on `PATH`. Studio uses it to run the agents.
-- Docker, running locally, for the recommended tool sandbox. Allow roughly 6 GB for the image.
-
-### Install and open Studio
-
-Run these commands from your checkout:
+Run from a terminal with the prerequisites installed and your chosen model CLI authenticated:
 
 ```bash
 git clone https://github.com/dave90/zero-day.git
@@ -59,67 +71,87 @@ cd zero-day
 uv sync --project ui/server
 npm --prefix ui/web ci
 docker build -t zero-sandbox:latest -f docker/Dockerfile .
-./ui/dev.sh
-```
-
-Open **http://127.0.0.1:4319** and keep the launch terminal running. The local service listens on
-port 4318 and the frontend on 4319. Opening Studio does not start an assessment.
-
-On **Windows (PowerShell)**, run the same installation and Docker build commands, then
-replace `./ui/dev.sh` with:
-
-```powershell
 npm --prefix ui/web run build
 uv run --project ui/server zero-web
 ```
 
-Open **http://127.0.0.1:4318**. Studio and its workers run directly on Windows and use the
-Codex or Claude login for the same user; no separate Docker login is required. Keep Docker
-Desktop running with Linux containers for the tool sandbox.
+Open **http://127.0.0.1:4318** and keep the terminal running. These commands also work in
+Windows PowerShell. Opening Studio does not start an assessment or make a model call.
 
-For serving a built UI from a single port or selecting another data directory, see the
-[Studio setup guide](ui/README.md#install-and-launch).
+To start your first assessment:
 
-## Create your first attack
+1. Click **New attack** and keep **Start from → Blank assessment**. An *attack* is a workspace
+   for one assessment.
+2. Enter an **Attack name** and your authorized **Target / start URL**.
+3. Fill in **Engagement context** with scope and constraints. Use **Fill from template →
+   Generate pentest.md**, import an existing file, or write the context directly. Review the
+   generated text before running.
+4. Choose **Orchestrated**, select your authenticated **Backend**, and review **First goal**.
+   Keep automatic approvals off for the first run.
+5. Click **Create attack and run**. Follow the conversation, review approval cards, and inspect
+   **Findings** as evidence arrives.
 
-An **attack** is a workspace for one assessment: its target, settings, conversation, and findings.
-You can choose the main settings during creation, without opening Configure afterward.
+Choose **Only create attack** to save a draft instead; use **Start assessment** when ready.
+If startup fails, Studio keeps the saved attack and goal so you can fix setup and retry.
 
-For your first run, choose **Blank assessment** and **Orchestrated**, use the backend you have
-already signed into, and keep the default budgets and manual approvals.
+For a terminal-only workflow, see [CLI installation](#cli-only-installation).
 
-### 1. Describe what you want to test
+## Installation and launch options
 
-Click **New attack** in the sidebar. In **A new assessment**, leave **Start from** set to
-**Blank assessment** and fill in these fields:
+Run commands in this section from the repository root unless stated otherwise.
 
-| Field | What to enter | Example |
-| --- | --- | --- |
-| **Attack name** | A name you will recognize in your workspace. | Staging application review |
-| **Target / start URL** | The application you have permission to test. | `https://staging.example.com` — replace this example with your target. |
-| **Engagement context** | What Zero may test, what it should leave alone, and any test accounts or constraints. | Only the staging host; test accounts only; no destructive actions. |
-| **First goal** | A useful assessment goal is prefilled with your target URL. Edit it to focus the investigation. | Review login and access controls. Validate reproducible findings and explain the evidence. |
+### Studio development server
 
-**Engagement context starts blank.** To prepare it without writing Markdown yourself:
+After installing dependencies and building the sandbox as above, on macOS/Linux:
 
-1. Enter **Target / start URL** above, then click **Fill from template** beside the context editor.
-2. Add any **Additional in-scope URLs** and **Out-of-scope URLs**, one per line. Use an origin
-   such as `https://staging.example.com/` for the whole application, or a path for a limited area.
-3. Optionally add **Test credentials**: account roles, usernames/passwords, tokens, cookies,
-   or sign-in steps. Leave this empty to begin with unauthenticated testing.
-4. Click **Generate pentest.md**, review the result, and edit it as needed. If you already have
-   context, **Replace pentest.md** explicitly replaces that text. Generation does not start a run.
+```bash
+./ui/dev.sh
+```
 
-The generated brief includes scope rules, authentication details, the current first goal (or a
-default first goal), investigation guidance, and evidence requirements. It is saved
-with the attack and passed to its agents. Scope remains advisory.
+Open **http://127.0.0.1:4319**. The script runs the service on **4318** and Vite on **4319**,
+with `/api` requests proxied to the service. Stop an existing single-port service before starting
+this workflow. On Windows, use the [two-terminal development commands](ui/README.md#install-and-launch).
 
-The source is an editable [Markdown template](ui/web/src/templates/pentest.md). Change it to
-improve future generated briefs; rebuild the UI after editing it. Existing attacks keep their
-saved context. You can reuse a completed setup through **Attack actions → Create template**.
+### Local serving options
 
-You can also type the context directly or choose **Import file** to load an existing `pentest.md`.
-For example, replace the host below with your authorized target:
+The quick start serves the built frontend and API from one service. Rebuild after frontend
+changes with `npm --prefix ui/web run build`. To select another port and data directory:
+
+```bash
+uv run --project ui/server zero-web --port 4321 --data-root /path/to/workspace
+```
+
+Replace the path with your chosen directory and open **http://127.0.0.1:4321**. The service binds
+to loopback. Run one service per data directory and keep the checkout available: Studio depends
+on the shared core as an editable package. Stop the service with **Ctrl+C**; it cleans up its
+owned workers.
+
+### CLI-only installation
+
+Node.js and the Studio service are unnecessary for this workflow. From the cloned repository:
+
+```bash
+uv sync
+docker build -t zero-sandbox:latest -f docker/Dockerfile .
+mkdir -p targets/staging
+cd targets/staging
+uv run zero init
+```
+
+`zero init` creates `pentest.md`, `.pentest/`, and `zero_files/` without overwriting an existing
+`pentest.md`. Edit the context file before running the [CLI examples](#command-line-usage).
+Use one dedicated directory per engagement: Docker mounts that directory read/write at `/work`.
+Keep these directories inside the checkout, as above, so `uv run` can discover the project.
+
+## Usage
+
+### Define engagement context
+
+Studio saves **Engagement context** as the attack's `pentest.md`; the CLI reads `pentest.md` from
+its current directory. This is assessment context, separate from repository guidance in
+[`AGENTS.md`](AGENTS.md). Its contents are passed to the model as written.
+
+Replace the example host with your authorized target:
 
 ```markdown
 # Staging application assessment
@@ -133,225 +165,317 @@ For example, replace the host below with your authorized target:
 - Add dedicated test accounts here if needed.
 
 ## Goal
-Review authentication and access-control boundaries.
+Review authentication and access-control boundaries. Validate reproducible findings.
 ```
 
-Context files are optional. Use **Add context files** to attach request samples, source files,
-or Burp exports if they would help the investigation. Each imported file can be up to 1 MB.
+**Fill from template** accepts additional in-scope URLs, exclusions, optional test credentials,
+and a goal. Enter one URL per line; use an origin for a whole application or a path for a limited
+area. Generation is local; **Replace pentest.md** explicitly replaces existing context. Edit the
+[source template](ui/web/src/templates/pentest.md) and rebuild the frontend to change future
+briefs. Saved attacks retain their existing context.
 
-### 2. Choose how Zero will run
+Optionally attach request samples, source files, or Burp exports through **Add context files**
+(up to **1 MB per file**). In the CLI, place files under `zero_files/`; `list_dir`, `grep`, and
+`read_file` are read-only and confined to that root. This tool-level boundary does not isolate
+other code or binary tools from the wider mounted engagement directory.
 
-Continue down the same **A new assessment** form to choose the working style and run settings.
+### Choose a working style
 
-**Working style** controls how the agents organize their work:
-
-| Working style | When to use it |
-| --- | --- |
-| **Orchestrated** | Start here. One lead agent investigates and assigns focused tasks to pentesters and independent validators. |
-| **Swarm** | Use several collaborating lead agents. Selecting it reveals **Swarm size**, which starts at **2** and must be a whole number of at least **2**. |
-| **Ralph** | Review a proposed plan, then run a sequence of bounded investigation passes. |
-| **Single agent** | Use one pentester with background validators. |
-
-A pentester investigates a possible issue; a validator checks the evidence independently.
-In Swarm, each lead agent has its own investigation budgets and subagent limits.
-
-Under **Backend & model**, choose the CLI that Zero will use:
-
-- **Backend:** choose **Codex** or **Claude**, matching the CLI you installed and authenticated.
-  Codex is the default. The selection applies to the lead agent, pentesters, and validators.
-- **Model:** with Codex, keep **Codex default** or choose a model from the searchable list.
-  With Claude, keep the prefilled model, enter another available Claude model, or clear the field
-  to use its account default. Switching backends keeps their model choices separate.
-
-Under **Investigation budgets**, you can keep these defaults for your first run:
-
-| Setting | Default | Meaning |
+| Studio style | CLI selection | Behavior |
 | --- | --- | --- |
-| **Max turns** | **50** | Maximum investigation steps for the main agent on one goal. |
-| **Pentester max turns** | **50** | Maximum steps for each assigned pentester. |
-| **Validator max turns** | **50** | Maximum steps for each independent validator. |
-| **Max subagents** | **100** | Concurrent pentesters and validators in Orchestrated mode; in Swarm, the limit applies to each lead agent. |
+| **Orchestrated** | `--execution-mode c` (default) | One lead agent investigates and assigns focused pentesters and independent validators. |
+| **Swarm** | `--execution-mode c --swarm-size 2` | Two or more collaborating leads share work and evidence; each has its own budgets and child-agent limits. |
+| **Ralph** | `--ralph` | Reviewed planning followed by bounded orchestrated passes, durable progress, and resume support. |
+| **Single agent** | `--execution-mode a` | One pentester with background validators. |
 
-These are upper limits. Agents can finish earlier, and Zero creates subagents as needed.
-
-Under **Approvals**, start with **Auto approve** empty and **Yolo**, **I understand**, and
-**Allow host exec** switched off. When a tool needs approval, Zero will show a decision card in
-the conversation. You can review the proposed action and allow or deny it.
-
-If you later enable automatic approvals, selecting **Exploit** also requires **I understand**.
-See [Important configuration](#important-configuration) for the full approval rules and advanced
-budget settings.
+Both model backends support these styles. Swarm cannot be combined with Ralph or Single agent.
+Ralph's plan checkpoint is enabled by default; `--ralph --ralph-resume` continues prior progress.
 
 ![Backend, model, investigation budgets, and approvals in the new-assessment form](docs/images/studio-new-attack.png)
 
-### 3. Create the attack and choose when to run
+### Review results in Studio
 
-The **First goal** is prefilled and follows the target URL until you edit it. Custom saved setup goals
-are preserved. Review the goal, scope, and run settings, then choose:
+| View | Use it to |
+| --- | --- |
+| **Conversation** | Follow messages and tool activity, answer questions, and allow or deny proposed actions. |
+| **Agents** | Inspect objectives, tools, memory, and todos; expand Swarm peers to inspect their children. |
+| **Findings** | Filter by verdict, severity, or search; inspect evidence and reproduction steps. Severity hints are marked **estimate**; missing validator scores remain **Unscored**. |
+| **Workspace** | Browse scope, imported files, reports, and saved snapshots. |
+| **Activity** | Inspect the audit trail, reasoning, model I/O, and Swarm records. |
 
-- **Create attack and run:** saves the attack, imports its context files, checks backend
-  authentication and sandbox readiness, and starts the first assessment immediately.
-- **Only create attack:** saves a draft and opens Conversation without starting an assessment.
-  Your first goal stays in the message box; use **Start assessment** when ready.
+**Goal finished** means the runtime is ready for another goal; **Background work running** means
+agents or tools are still active. A report alone does not establish that all work has finished.
+Send another goal to continue, or choose **End runtime session** to stop the runtime and its
+background work while preserving the conversation and evidence.
 
-Live assessments consume the selected backend's allowance. If starting fails, the saved attack
-still opens with an error; fix the setup and retry **Start assessment** in that same workspace.
-
-Watch the conversation, answer questions, and review approval cards. Ralph also asks you to
-review its plan before the investigation passes begin.
-
-**Configure** remains available for advanced options, such as sandbox settings and rate limits,
-or to change the saved setup later. An open runtime keeps its current configuration; end that
-runtime before starting another with different settings.
-
-### 4. Follow progress and review results
-
-- **Conversation** shows messages, tool activity, operator decisions, and assessment progress.
-  **Goal finished** means Zero is ready for another goal; the runtime remains open. **Background
-  work running** means agents or tools are still active. Last activity shows how recently the
-  runtime reported an event.
-- **Agents** shows each actor's objective, tools, memory, and todos. In Swarm mode, expand or
-  collapse a peer to inspect its pentesters and validators. Memory and todos open inside the
-  selected agent's tabs.
-- **Findings** shows evidence, independent validation, severity, and reproduction steps. Click a
-  confirmed/pending/rejected summary card to filter by verdict; click it again to clear that
-  filter. Combine it with **Severity** and search. Agent severity hints are marked **estimate**;
-  missing validator scores remain **Unscored**.
-- **Workspace** contains scope, imported files, reports, and saved run snapshots.
-- **Activity** contains the audit trail, reasoning, model I/O, and Swarm records.
+Open a finding to **Copy to clipboard** or **Export finding**. Use **Export report** on Findings,
+or **Report** in the attack header, when a report is available.
 
 ![Finding verdict cards, severity filtering, and validated evidence in Zero Studio](docs/images/studio-findings.png)
 
-Open a finding and choose **Copy to clipboard** or **Export finding**. Use **Export report** on
-the Findings page, or **Report** in the attack header, when a report is available.
+To reuse a setup, choose **Attack actions (⋯) → Create template**, then select it under
+**New attack → Start from** or in **Templates**. Templates save configuration and the first goal,
+with optional `pentest.md` (including any credentials); they do not copy messages, findings,
+uploads, or run history. **Archive** preserves an attack's evidence; **Delete attack** permanently
+removes its workspace and conversation after confirmation.
 
-To continue, send another goal in the same conversation. To stop the runtime and its background
-work, use **End runtime session** in the attack header; conversation and evidence are preserved.
+### Command-line usage
+
+Run these from the engagement directory initialized above, after editing `pentest.md`:
+
+```bash
+# Start an orchestrated assessment with the default Codex backend.
+uv run zero run --goal "Review authentication and access controls within pentest.md scope."
+
+# Use Claude with its account-default model.
+uv run zero run --backend claude --model '' --goal "Review the application within pentest.md scope."
+
+# Run two collaborating orchestrators with a total child cap per peer.
+uv run zero run --swarm-size 2 --max-total-subagents 20 --goal "Investigate the scoped application."
+
+# Inspect all available options without starting an assessment.
+uv run zero run --help
+```
+
+Choose one live example; the session stays open for follow-up goals. Use `/help` for interactive
+commands, `/running` for active agents, and `/findings` for confirmed findings. See the
+[CLI guide](CLI.md) for Burp traffic, Ralph, replay, and additional controls.
 
 ## Important configuration
 
-Open **Configure** on an attack to review these settings. The defaults below apply to new blank
-attacks and CLI runs. Existing attacks and templates keep their saved values; update them in
-Configure when you want different budgets. An open runtime keeps its configuration until it ends.
+No project-specific environment variables or `.env` file are required. Configure assessments in
+Studio's creation form or **Configure**, or use `zero run` flags. A running session keeps its
+configuration; end it before starting a session with changed settings. Saved attacks and templates
+retain their saved values rather than adopting new defaults automatically.
 
-### Backend: Codex or Claude
+### Backend and model
 
-Choose **Backend** in **A new assessment**, or **Configure → Execution → Backend** later:
+**Codex** is the default backend. Studio discovers available Codex models; **Codex default**
+follows the CLI configuration. Claude accepts a model value or an empty field for its account
+default. The CLI's Claude default is `claude-opus-5[1m]`; use `--model ''` for the account default.
+A selected model applies to the main agent, pentesters, and validators for that runtime.
 
-| Backend | Required CLI | Authentication |
+Studio checks CLI installation and authentication before starting. To check manually, run
+`codex login status` or `claude auth status` from the terminal/user that launches Zero.
+
+### Agents and budgets
+
+Defaults below apply to new blank attacks and CLI runs:
+
+| Setting | CLI flag | Default |
 | --- | --- | --- |
-| **Codex** (`codex`, default) | `codex` on `PATH` | Uses your existing authenticated Codex CLI session. |
-| **Claude** (`claude`) | `claude` on `PATH` | Uses your existing authenticated Claude Code session. |
+| Main-agent turns per goal | `--max-turns` | `50` |
+| Turns per pentester | `--pentester-max-turns` | `50` |
+| Turns per validator | `--validator-max-turns` | `50` |
+| Concurrent child agents | `--max-subagents` | `100` |
+| Total child dispatches | `--max-total-subagents` | `0` (unlimited) |
+| Elapsed deadline per subagent | `--subagent-deadline` | `1200` seconds |
+| Timeout per model call | `--llm-timeout` | `900` seconds |
+| Per-host request rate | `--rate-limit` | `100/min` |
 
-The selected backend runs the main agent, pentesters, and validators for that runtime. Both
-backends support all four working styles. Studio checks that the selected CLI is installed and
-authenticated before starting. Live runs consume the selected backend's subscription or API
-allowance.
+Turn budgets are independent and agents can finish early. Swarm budgets and child caps apply
+**per peer**: four peers capped at 20 children can dispatch up to 80. These controls bound work,
+not a monetary or token allowance. Subagent deadlines are checked between turns and do not
+interrupt tool calls or approval waits. Model and tool timeouts are separate. **Validator Claude
+max turns** controls Claude's internal per-call behavior, not its investigation budget.
 
-Choose the model under **Model & sessions → Model**. Codex provides a discovered model picker;
-Claude accepts a model value for its backend. From the terminal, select the backend with
-`uv run zero run --backend codex` or `uv run zero run --backend claude`.
+### Approvals and scope
 
-### Agents & budgets
+Automatic approvals are off by default. Tools that require approval show a decision card with
+**Allow once** or **Deny**; eligible tools also offer **Allow tool this session**.
 
-In **Configure → Agents & budgets**, the three investigation turn limits default to **50**:
+| Setting | Effect |
+| --- | --- |
+| **Auto approve** / `--auto-approve` | Approve selected `safe`, `active`, or `exploit` classes. Risk-class exploit approval also requires **I understand** / `--i-understand`. |
+| **Yolo** / `--yolo` | Approve `safe` and `active` classes automatically. |
+| **Allow host exec** / `--allow-host-exec` | Let host code/binary calls use the configured approval policy; this does not itself approve calls. |
 
-| Setting | Default | What it controls |
-| --- | --- | --- |
-| **Max turns** | **50** | Main agent's turn limit for a goal; each Swarm peer has its own budget. |
-| **Pentester max turns** | **50** | Investigation steps for each dispatched pentester. |
-| **Validator max turns** | **50** | Investigation steps for each independent validator. |
-| **Max subagents** | `100` | Pentesters and validators allowed to run concurrently per peer. |
-| **Max total subagents** | `0` (unlimited) | Total child dispatches per peer; set a positive value to cap dispatches. |
-| **Subagent deadline** | `1200` seconds | Elapsed-time limit per subagent, checked between turns. |
-| **LLM timeout** | `900` seconds | Maximum wait for one model call, shared by main agents and subagents. |
+Destructive actions always prompt. Host code/binary calls prompt unless **Allow host exec** is
+on, including when a risk class or session grant would otherwise allow them. These settings do
+not remove agent questions or Ralph's plan checkpoint. Some read-only tools do not need approval;
+see [architecture.md](architecture.md) for policy details and intercepted-operation limits.
 
-Turn limits are independent: changing Max turns does not change the pentester or validator
-budget. Agents can finish before reaching their limit. Deadlines are checked between turns and
-do not interrupt an in-flight approval wait or tool call; model and tool timeouts are separate.
-**Validator Claude max turns** controls Claude's internal per-call behavior, separately from the
-50-step validator investigation budget.
+`pentest.md` guides the agents; it does not enforce network isolation. `--scope-host` only
+blocklists that hostname in the safe `web_fetch` tool, routing target work toward assessment
+tools. It is not an allowlist for other tools. If sandbox startup fails, the runtime can fall
+back to host execution; Studio displays that state and the host approval policy applies.
 
-In Swarm mode, concurrency and total-child caps apply **per peer**. For example, four peers with
-Max total subagents set to 20 can dispatch up to 80 children in total. These settings bound work,
-not a monetary or token allowance.
+### Paths and logging
 
-### Approvals
+- **Sandbox:** enabled by default, using `zero-sandbox:latest`, with a **4 CPU / 4 GB** cap.
+  Set `--container-image`, `--container-cpus`, or `--container-memory` to change these values.
+- **File root:** `--files-root` defaults to `./zero_files`, relative to the engagement directory.
+- **Model traces:** enabled under `.pentest/llm/` by default; `--no-llm-log` disables them unless
+  `ZERO_LLM_LOG_DIR` is set. That optional environment variable overrides the trace location and
+  enables logging. Studio namespaces it by attack and session; see [runtime persistence](ui/README.md#runtime-and-persistence).
 
-In **Configure → Approvals**, automatic approvals are disabled by default. Calls that require
-approval show a decision card in the conversation.
+## Data and reports
 
-| Setting | Default | Effect when enabled |
-| --- | --- | --- |
-| **Auto approve** | No risk classes selected | Automatically approve the selected `safe`, `active`, or `exploit` classes. Exploit also requires **I understand**. |
-| **Yolo** | Off | Automatically approve `safe` and `active` calls. Exploit and destructive calls are not covered. |
-| **I understand** | Off | Acknowledgement required together with `exploit` in Auto approve. It does not grant approvals by itself. |
-| **Allow host exec** | Off | Permit code/binary tools running on the host to use the configured approval policy. It does not approve calls by itself. |
-
-For each approval card, choose **Allow once** or **Deny**. Eligible tools also offer **Allow tool
-this session**; this grant lasts for the current runtime. Destructive actions always require a
-decision. Host-executed code/binary tools still prompt unless Allow host exec is enabled, even
-when a risk class or session grant would otherwise approve them. Approval settings do not remove
-Ralph plan checkpoints or agent questions.
-
-## Reuse and organize attacks
-
-Open an attack's **⋯ menu → Create template** to save its configuration and first goal. Optionally
-include `pentest.md`, including any credentials it contains. **Save & create attack** immediately
-opens a fresh assessment; saved templates are also available under **New attack → Start from**.
-New attacks start without the source's messages, findings, uploads, agents, or run history.
-
-Use **Templates** in the sidebar to create attacks from saved setups or delete a template.
-Deleting a template preserves attacks already created from it.
-
-An attack's **⋯ menu** also offers **Archive** and **Delete attack**. Archive keeps its evidence;
-deleting an attack permanently removes its workspace and conversation after confirmation.
-
-## Where your data is stored
-
-Studio stores its workspace locally under `ui/.local/` by default:
+Studio stores local data under `ui/.local/` unless `--data-root` selects another directory:
 
 ```text
 ui/.local/
-├── workspace.sqlite3                     attacks, templates, drafts, sessions, and events
+├── workspace.sqlite3                  # Attacks, templates, drafts, sessions, and events
 └── engagements/<attack-id>/
     ├── work/
-    │   ├── pentest.md                    engagement context
-    │   ├── zero_files/                   imported files (default files root)
-    │   └── .pentest/                     findings, reports, audit, memory, todos, and model logs
-    └── history/<session-id>/             sealed session evidence and goal snapshots
+    │   ├── pentest.md                 # Engagement context
+    │   ├── zero_files/                # Imported files (default files root)
+    │   └── .pentest/                  # Findings, reports, audit, memory, todos, model logs
+    └── history/<session-id>/          # Sealed evidence and goal snapshots
 ```
 
-Ralph also records planning and progress in `.ralph/` and `.ralph_logs/` within the attack's
-working directory. These directories and model traces can contain credentials and full prompts;
-handle them according to your engagement's data-handling rules.
+CLI runs store the same engagement artifacts in their current directory:
 
-Scope context guides the agents; it is not a network firewall. If sandbox startup fails after
-preflight, Zero can fall back to host execution and displays that state. Review tool approvals
-and the execution location shown by Studio. Live assessments consume the selected backend's
-allowance; use turn budgets and total subagent caps to bound work.
+| Path | Contents |
+| --- | --- |
+| `.pentest/report.md` | Findings across verdicts and unsuccessful investigation paths. |
+| `.pentest/findings/` | Individual Markdown findings in `confirmed/`, `rejected/`, and `pending/`, plus `index.json`. |
+| `.pentest/audit.jsonl`, `.pentest/thinking.log` | Audit events and readable agent reasoning. |
+| `.pentest/llm/`, `.pentest/memory/`, `.pentest/todo/` | Model traces, per-agent scratchpads, and task plans. |
+| `.ralph/`, `.ralph_logs/` | Ralph planning, durable progress, snapshots, and cumulative report. |
 
-## Documentation
+Context, logs, templates, and model traces can contain credentials and full prompts. Handle them
+according to your engagement's data-handling rules. Saved evidence does not restore native model
+sessions after service or worker loss; continuation starts a new worker, or uses explicit Ralph
+resume. See the [Studio guide](ui/README.md) for history, replay, reset, and recovery behavior.
 
-- [Command-line guide](CLI.md) — terminal setup, flags, scope files, approvals, Swarm, and Ralph.
-- [Studio guide](ui/README.md) — configuration, storage, launch options, and UI verification.
-- [Architecture](architecture.md) — shared runtime, orchestration, tools, and ownership.
-- [BountyBench integration](benchmarks/bountybench/README.md) — external capability evaluation.
+## Architecture and tech stack
+
+```mermaid
+flowchart LR
+    Studio[Studio browser] --> Service[Local service]
+    Service --> Runtime[Host runtime / engagement worker]
+    CLI[Terminal CLI] --> Runtime
+    Runtime --> Backend[Codex / Claude CLI on host]
+    Runtime <-->|HTTP tool RPC| Sandbox[Docker tool sandbox]
+```
+
+**All agent loops run on the host.** Docker executes proxied tool calls; memory, todos, and
+orchestration controls stay host-side. Validators independently assess candidate findings before
+the runtime persists verdicts and generates reports. Swarm peers share coordination and evidence
+through SQLite; Ralph wraps orchestrated passes with planning and completion review.
+
+| Layer | Primary technologies |
+| --- | --- |
+| Core and CLI | Python 3.11+, Click, Pydantic, HTTPX, Rich, prompt_toolkit, MCP. |
+| Model backends | Authenticated Codex and Claude Code CLI subprocesses. |
+| Studio service | Starlette, Uvicorn, SQLite, dedicated worker processes. |
+| Studio frontend | React 19, TypeScript, Vite, TanStack Query, React Router. |
+| Tool sandbox | Docker, Kali Linux, Python, security binaries and wordlists. |
+| Development | uv, pytest / pytest-asyncio, Ruff, Vitest, Playwright (Chromium). |
+
+See [architecture.md](architecture.md) for component contracts, tool extensibility, safety
+boundaries, and the distinction between implemented behavior and roadmap items.
+
+## Project structure
+
+```text
+.
+├── src/zero/
+│   ├── cli.py                 # CLI entry point
+│   ├── agents/                # Agent loops, roles, and prompts
+│   ├── orchestrator/          # Runtime, approvals, dispatch, validation, audit
+│   ├── llm/                   # Codex/Claude adapters and fixture backends
+│   ├── tools/                 # Tool implementations and registry
+│   ├── container/             # Docker lifecycle and RPC client
+│   ├── findings/              # Finding schema, deduplication, persistence, reports
+│   ├── ralph/                 # Planning, passes, snapshots, resume
+│   ├── swarm/                 # Peer coordination and shared evidence
+│   ├── traffic/               # Burp XML parsing and traffic store
+│   └── ui/                    # Terminal interface
+├── ui/
+│   ├── server/                # Studio service, Python project, service tests
+│   ├── web/                   # React frontend, npm project, frontend unit tests
+│   └── tests/                 # Browser, manual, and opt-in live verification
+├── docker/                    # Sandbox image, entrypoint, tool RPC server
+├── tests/                     # Core unit, Docker/e2e, and capability regression tests
+├── benchmarks/bountybench/    # External capability evaluation integration
+├── docs/images/               # Studio screenshots
+├── pyproject.toml             # Core dependencies, CLI entry point, pytest/Ruff settings
+├── uv.lock                    # Locked core Python dependencies
+├── AGENTS.md                  # Repository development guidance
+├── CLI.md                     # Detailed terminal guide
+└── architecture.md            # As-built architecture reference
+```
 
 ## Development
 
+Use `uv run` for Python commands so the local package and dependencies are available. Core and
+Studio are separate uv projects with their own lockfiles; the frontend uses npm's lockfile.
+
+### Core checks and build
+
 ```bash
 uv sync
-uv run pytest tests/unit -q  # offline core tests
-uv run pytest -q             # core + Docker tests; live model tests are excluded
+uv run pytest tests/unit -q   # Offline; no Docker, target, or model calls
+uv run pytest -q              # Core unit + Docker tests; excludes live model runs
 uv run ruff check .
-uv build
+uv build                      # Wheel and source distribution in dist/
 ```
 
-Run UI checks separately using the [Studio test commands](ui/README.md#tests). Docker tests skip
-with guidance when the image is unavailable. Live and regression suites spend model tokens and
-require explicit opt-in; see [regression tests](tests/regression/) before running them.
+Docker tests skip with a build hint if the sandbox image is unavailable. Rebuild the image after
+changing sandboxed tool code or dependencies: the image contains a copy of `src/zero`.
 
-## License
+### Studio checks
+
+After the Studio dependency installation in the quick start:
+
+```bash
+uv run --project ui/server pytest ui/server/tests -q
+uv run --project ui/server ruff check ui
+npm --prefix ui/web run test
+npm --prefix ui/web run build
+npm --prefix ui/web exec -- playwright install chromium
+npm --prefix ui/web run test:e2e
+```
+
+Studio checks run separately from the root Python suite. Browser tests use a real service and
+worker with scripted model adapters, so they do not spend model tokens. CI checks the service on
+Ubuntu and Windows; browser verification currently uses Chromium. See [Studio tests](ui/README.md#tests)
+and the [CI workflow](.github/workflows/ui.yml).
+
+### Opt-in live and regression tests
+
+**These commands spend model tokens** and require authenticated model CLIs and the sandbox:
+
+```bash
+uv run pytest -m live
+uv run pytest -m regression                  # All known-vulnerable regression targets
+uv run pytest -m regression -k '<target>'    # Replace with a target name to narrow the run
+```
+
+A command-line `-m` overrides the default `not live` filter. Capability regressions assert
+confirmed vulnerabilities against the targets in [`tests/regression/manifest.py`](tests/regression/manifest.py).
+The Studio [live matrix and release checklist](ui/README.md#explicit-live-release-verification)
+remain separate; the Studio guide records the unverified live and manual release checks.
+
+## Troubleshooting
+
+| Symptom | Check or solution |
+| --- | --- |
+| `zero` cannot import its package or dependencies | Run `uv sync` and invoke commands through `uv run` from within the checkout. Studio uses `uv sync --project ui/server`. |
+| Backend CLI missing or authentication fails | Check the chosen backend is on the launching terminal's `PATH`; run `codex login status` or `claude auth status` as that user, authenticate, then retry **Start assessment**. |
+| Sandbox image unavailable | Start Docker and run `docker build -t zero-sandbox:latest -f docker/Dockerfile .` from the repository root. Inspect readiness with `docker image inspect zero-sandbox:latest`. |
+| Studio reports host execution | Sandbox startup failed after preflight. Check Docker and the selected image; host code/binary calls use the host approval policy. End the runtime before retrying with changed settings. |
+| Port already in use | Stop the existing service or launch the built UI with `--port 4321`. The dev script expects service port 4318 and frontend port 4319. |
+| Studio page missing or frontend changes absent | Run `npm --prefix ui/web ci` and `npm --prefix ui/web run build`, then open the service URL; use port 4319 only with the dev server. |
+| A container cannot reach a target on the host | Container `127.0.0.1` refers to the container. Use `host.docker.internal` and make the target listen on an interface reachable from Docker. |
+| Changed settings have no effect | End the active runtime and start a new session; configuration is fixed for each runtime. |
+| Another process owns the workspace | Use the existing service/runtime or stop it before reopening; run only one Studio service per data directory. |
+
+## Documentation
+
+- [Command-line guide](CLI.md) — terminal workflow, flags, files, approvals, Swarm, and Ralph.
+- [Studio guide](ui/README.md) — detailed UI workflows, configuration, storage, tests, and release limits.
+- [Studio contracts](ui/contracts.md) — API, worker IPC, events, and ownership.
+- [Architecture](architecture.md) — shared runtime, components, tools, and roadmap.
+- [BountyBench integration](benchmarks/bountybench/README.md) — external capability evaluation.
+
+## Contributing and license
+
+Read [`AGENTS.md`](AGENTS.md) and the relevant architecture sections before making changes.
+Match the surrounding style and run the checks for the components you change. Reproduce runtime
+failures with offline scripted-backend tests; sandbox tool or dependency failures need Docker
+integration coverage. Regenerate lockfiles with the package manager rather than editing them by hand.
 
 Licensed under the [GNU General Public License v3.0](LICENSE).
