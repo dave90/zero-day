@@ -103,6 +103,8 @@ The service starts `sys.executable -m zero_web.worker` with an argument array an
 initialization. No goal/config is interpolated into shell text. NDJSON IPC has `version: 1`,
 correlated `command_id` and acknowledgement/error. Worker stdout is protocol only; ordinary logs
 and backend diagnostics use stderr. The service drains stderr to a bounded in-memory tail.
+The worker emits its initial runtime state before acknowledging initialization, so a successful
+session-start response already has the effective execution location in its durable snapshot.
 
 Every engagement has a separate worker cwd/environment, model sessions, tool state and sandbox.
 Pipe EOF ends operator input and triggers cleanup. Service shutdown sends close, then bounded

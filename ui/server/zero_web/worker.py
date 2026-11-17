@@ -114,6 +114,7 @@ async def main():
         return {"kind": "actor_snapshot", "actors": actors}
 
     async def emit_events():
+        initialized = False
         while True:
             event = await orch.ui_queue.get()
             payload = asdict(event)
@@ -125,6 +126,12 @@ async def main():
                 if payload["kind"] == "agent_text_end":
                     messages.pop(actor, None)
             send({"type": "event", "payload": payload, "message_id": mid, "run_id": event_run})
+            if not initialized and payload["kind"] == "runtime_state":
+                # The service persists stdout in order. Publish the actual
+                # execution location before acknowledging startup, so its first
+                # session snapshot cannot race the event pump's scheduling.
+                send({"type": "ack", "command_id": first["command_id"], "result": {"ready": True}})
+                initialized = True
             if payload["kind"] in {"status", "subagent_started", "subagent_progress", "turn_start"}:
                 send({"type": "event", "payload": actor_snapshot()})
             if payload["kind"] == "session_end":
@@ -216,7 +223,6 @@ async def main():
 
     async def frontend(_):
         pump = asyncio.create_task(emit_events())
-        send({"type": "ack", "command_id": first["command_id"], "result": {"ready": True}})
         try:
             stop = asyncio.create_task(shutdown.wait())
             done, _ = await asyncio.wait(
