@@ -51,9 +51,17 @@ Scope is advisory; `scope_host` preserves `web_fetch` blocklist semantics.
 - **New attack:** choose the working style, backend and model, main/pentester/validator turn
   budgets, max subagents, and approvals directly during creation. Codex uses the discovered model
   picker; Claude accepts its model value. Backend switches retain separate model selections.
+  Engagement context starts blank. **Fill from template** uses the target URL, optional
+  additional in-scope URLs, exclusions, credentials, and current first goal to produce editable
+  `pentest.md` text. URL lists use one HTTP(S) URL per line; exclusions take precedence.
+  Generation is local, makes no model/target calls, and does not start or create an attack.
+  **Replace pentest.md** replaces existing context only when selected; cancel preserves it.
   Templates prefill these settings and can be adjusted before saving. Exploit auto-approval
   requires **I understand**. Selecting **Swarm** reveals **Swarm size** (at least two peers);
-  saved templates prefill the peer count. Creating the attack saves the settings without starting a run.
+  saved templates prefill the peer count. The editable first goal is prefilled and follows the target
+  URL until manually edited. **Create attack and run** saves settings, imports files, and starts the
+  first session; **Only create attack** saves a draft. Startup failures preserve the saved attack
+  and its goal for retry through Conversation.
 - **All attacks:** create, search, open, archive, or restore conversations. Switching attacks
   keeps assessments running. Unsent drafts are stored by the local service.
 - **Attack actions (⋯):** available on each attack card and beside Configure. **Create template**
@@ -133,6 +141,23 @@ Keyboard: Cmd/Ctrl+N creates an attack, Cmd/Ctrl+K focuses attack search, Enter 
 Shift+Enter adds a newline, Escape closes a dialog. Dialogs use native focus trapping and
 return focus. Panel resize separators support pointer dragging and left/right arrow keys.
 The inspector collapses below 1190px to preserve the desktop workspace.
+
+## Edit the pentest.md generator
+
+The shared source for **Fill from template** is
+[`web/src/templates/pentest.md`](web/src/templates/pentest.md). Edit this file to improve
+future assessment briefs. Vite includes it in the frontend build; development reloads changes,
+and a built Studio needs `npm --prefix ui/web run build` from the repository root.
+
+Supported placeholders are `{{target_url}}`, `{{in_scope_urls}}`, `{{out_of_scope_urls}}`,
+`{{credentials}}`, and `{{goal}}`. Keep these names when moving or rewriting sections.
+The default first goal lives in [`web/src/templates/first-goal.txt`](web/src/templates/first-goal.txt),
+with `{{target_url}}` filled from the target input. It is also the fallback goal in generated briefs.
+The renderer validates and deduplicates HTTP(S) URLs, preserves path boundaries, and inserts
+credentials as indented literal text. Credentials and template-like text are never evaluated.
+Generator fields live only in the open assessment dialog; generated context is persisted by the
+normal creation API, not browser storage. Editing the source does not change saved attacks or
+saved attack templates. Existing **Import file** and manual editing remain available.
 
 ## Runtime and persistence
 

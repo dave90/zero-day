@@ -2291,6 +2291,10 @@ kbd {
   font-size: 10px;
   max-width: 60%;
 }
+.new-attack-footer > .field-help {
+  flex-basis: 100%;
+  max-width: none;
+}
 .dialog-body .intro {
   color: var(--secondary);
   font-size: 12px;
@@ -2318,6 +2322,46 @@ kbd {
   font-size: 10px;
   color: var(--secondary);
   margin-left: 4px;
+}
+.scope-actions,
+.context-template-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.scope-actions .text-button {
+  font-size: 11px;
+}
+.context-template-builder {
+  margin: 0 0 16px;
+  padding: 14px 16px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  min-width: 0;
+}
+.context-template-builder legend {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 6px;
+}
+.context-template-builder > label {
+  display: block;
+  font-size: 12px;
+  margin-top: 14px;
+}
+.context-template-builder textarea {
+  margin-top: 8px;
+  font-size: 11px;
+}
+.context-template-actions {
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.context-template-actions .field-help {
+  flex-basis: 100%;
+  margin: 0;
 }
 .scope-input {
   font-family: "SFMono-Regular", monospace;

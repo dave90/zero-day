@@ -67,6 +67,18 @@ drafts; a never-started draft supplies the goal only if configuration has none. 
 cleared because its durable files are not copied. Scope context is opt-in and copied verbatim.
 Templates have no dependency on their source attack.
 
+New blank assessments explicitly send an empty `context`. The browser's **Fill from template**
+uses `web/src/templates/pentest.md` to generate editable text locally from the target URL,
+optional additional scope/exclusions/credentials, and current first goal. It makes no model or
+target calls and persists nothing until normal assessment creation. Importing or selecting a
+saved context remains supported; generation never changes an existing attack automatically.
+
+**Only create attack** performs creation/import only. **Create attack and run** additionally
+calls the existing session-start API with the saved effective configuration after all context
+uploads finish. Startup/import failures preserve the created workspace and expose the error in
+Conversation instead of resubmitting creation. Default first goals use
+`web/src/templates/first-goal.txt`; manual goals and custom saved-template goals are retained.
+
 Deletion and per-engagement edits share the session manager's lock, preventing delayed draft or
 upload writes from recreating a deleted attack. Cross-process workspace ownership and symlink
 containment also apply. File deletion failure retains the index for an explicit retry; success

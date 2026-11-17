@@ -98,9 +98,27 @@ Click **New attack** in the sidebar. In **A new assessment**, leave **Start from
 | **Attack name** | A name you will recognize in your workspace. | Staging application review |
 | **Target / start URL** | The application you have permission to test. | `https://staging.example.com` — replace this example with your target. |
 | **Engagement context** | What Zero may test, what it should leave alone, and any test accounts or constraints. | Only the staging host; test accounts only; no destructive actions. |
-| **First goal** | The task you want Zero to investigate first. | Review login and access controls. Validate reproducible findings and explain the evidence. |
+| **First goal** | A useful assessment goal is prefilled with your target URL. Edit it to focus the investigation. | Review login and access controls. Validate reproducible findings and explain the evidence. |
 
-You can type the engagement context or choose **Import file** to load an existing `pentest.md`.
+**Engagement context starts blank.** To prepare it without writing Markdown yourself:
+
+1. Enter **Target / start URL** above, then click **Fill from template** beside the context editor.
+2. Add any **Additional in-scope URLs** and **Out-of-scope URLs**, one per line. Use an origin
+   such as `https://staging.example.com/` for the whole application, or a path for a limited area.
+3. Optionally add **Test credentials**: account roles, usernames/passwords, tokens, cookies,
+   or sign-in steps. Leave this empty to begin with unauthenticated testing.
+4. Click **Generate pentest.md**, review the result, and edit it as needed. If you already have
+   context, **Replace pentest.md** explicitly replaces that text. Generation does not start a run.
+
+The generated brief includes scope rules, authentication details, the current first goal (or a
+default first goal), investigation guidance, and evidence requirements. It is saved
+with the attack and passed to its agents. Scope remains advisory.
+
+The source is an editable [Markdown template](ui/web/src/templates/pentest.md). Change it to
+improve future generated briefs; rebuild the UI after editing it. Existing attacks keep their
+saved context. You can reuse a completed setup through **Attack actions → Create template**.
+
+You can also type the context directly or choose **Import file** to load an existing `pentest.md`.
 For example, replace the host below with your authorized target:
 
 ```markdown
@@ -166,15 +184,21 @@ budget settings.
 
 ![Backend, model, investigation budgets, and approvals in the new-assessment form](docs/images/studio-new-attack.png)
 
-### 3. Create the workspace, then start testing
+### 3. Create the attack and choose when to run
 
-1. Click **Create attack**. Studio saves your settings and opens the attack's **Conversation**.
-   Your first goal is ready in the message box. **No assessment has started yet.**
-2. Review the goal, then click **Start assessment** or press **Enter** to send it. Studio checks
-   the selected backend's authentication and the sandbox setup before starting. Live assessments
-   consume the selected backend's allowance.
-3. Watch the conversation. Answer questions and review any approval cards. Ralph also asks you to
-   review its plan before the investigation passes begin.
+The **First goal** is prefilled and follows the target URL until you edit it. Custom saved setup goals
+are preserved. Review the goal, scope, and run settings, then choose:
+
+- **Create attack and run:** saves the attack, imports its context files, checks backend
+  authentication and sandbox readiness, and starts the first assessment immediately.
+- **Only create attack:** saves a draft and opens Conversation without starting an assessment.
+  Your first goal stays in the message box; use **Start assessment** when ready.
+
+Live assessments consume the selected backend's allowance. If starting fails, the saved attack
+still opens with an error; fix the setup and retry **Start assessment** in that same workspace.
+
+Watch the conversation, answer questions, and review approval cards. Ralph also asks you to
+review its plan before the investigation passes begin.
 
 **Configure** remains available for advanced options, such as sandbox settings and rate limits,
 or to change the saved setup later. An open runtime keeps its current configuration; end that

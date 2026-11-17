@@ -15,9 +15,15 @@ import type {
   Schema,
 } from "../src/api/types";
 import { NewAttack } from "../src/features/attacks";
+import { uploadFile } from "../src/api/client";
+import { defaultFirstGoal } from "../src/templates/first-goal";
 
 const apiMock = vi.hoisted(() => vi.fn());
-vi.mock("../src/api/client", () => ({ api: apiMock, uploadFile: vi.fn() }));
+vi.mock("../src/api/client", () => ({
+  api: apiMock,
+  uploadFile: vi.fn(),
+  key: () => "creation-run-key",
+}));
 const schema: Schema = {
   version: 1,
   fields: fields as ConfigField[],
@@ -119,7 +125,7 @@ describe("new attack run configuration", () => {
     fireEvent.change(screen.getByLabelText("Swarm size"), {
       target: { value: "4" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()).toMatchObject({
       execution_mode: "c",
@@ -141,14 +147,16 @@ describe("new attack run configuration", () => {
         "aria-pressed",
         "true",
       );
-      fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Only create attack" }),
+      );
       expect(created).not.toHaveBeenCalled();
       expect(postedConfig()).toBeUndefined();
     }
     fireEvent.change(screen.getByLabelText("Swarm size"), {
       target: { value: "3" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()?.swarm_size).toBe(3);
   });
@@ -162,7 +170,7 @@ describe("new attack run configuration", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /^Single agent / }));
     expect(screen.queryByLabelText("Swarm size")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()).toMatchObject({
       execution_mode: "a",
@@ -179,7 +187,7 @@ describe("new attack run configuration", () => {
     fireEvent.change(screen.getByLabelText("Swarm size"), {
       target: { value: "5" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()?.swarm_size).toBe(5);
   });
@@ -199,7 +207,7 @@ describe("new attack run configuration", () => {
     for (const checkbox of screen.getAllByRole("checkbox"))
       expect(checkbox).not.toBeChecked();
     fillIdentity();
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()).toMatchObject({
       max_turns: 50,
@@ -232,7 +240,7 @@ describe("new attack run configuration", () => {
     }
     fireEvent.click(screen.getByLabelText("exploit"));
     expect(
-      screen.getByRole("button", { name: "Create attack" }),
+      screen.getByRole("button", { name: "Only create attack" }),
     ).toBeDisabled();
     expect(screen.getByRole("alert")).toHaveTextContent(
       'Select "I understand"',
@@ -241,7 +249,7 @@ describe("new attack run configuration", () => {
     fireEvent.click(screen.getByLabelText("I understand"));
     fireEvent.click(screen.getByLabelText("Yolo"));
     fireEvent.click(screen.getByLabelText("Allow host exec"));
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()).toMatchObject({
       backend: "claude",
@@ -298,8 +306,330 @@ describe("new attack run configuration", () => {
     fireEvent.change(screen.getByLabelText("Max turns"), {
       target: { value: "37" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Create attack" }));
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
     await waitFor(() => expect(created).toHaveBeenCalledOnce());
     expect(postedConfig()).toMatchObject({ ...template.config, max_turns: 37 });
   });
+});
+
+describe("new attack engagement context", () => {
+  it("starts blank and keeps blank context when creating without the generator", async () => {
+    const created = setup();
+    expect(screen.getByLabelText(/Engagement context/)).toHaveValue("");
+    fillIdentity();
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+    expect(
+      apiMock.mock.calls.find(
+        ([path, method]) => path === "/engagements" && method === "POST",
+      )?.[2].context,
+    ).toBe("");
+  });
+
+  it("generates editable context using the target, scope, credentials and current goal", async () => {
+    const created = setup();
+    fillIdentity();
+    fireEvent.change(screen.getByLabelText("First goal"), {
+      target: { value: "Review account boundaries" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    fireEvent.change(screen.getByLabelText("Additional in-scope URLs"), {
+      target: { value: "https://api.example/v1/" },
+    });
+    fireEvent.change(screen.getByLabelText("Out-of-scope URLs"), {
+      target: { value: "https://app.example/billing/" },
+    });
+    fireEvent.change(screen.getByLabelText("Test credentials"), {
+      target: { value: "Reader: user=fixture; password=not-a-real-secret" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Generate pentest.md" }),
+    );
+    expect(created).not.toHaveBeenCalled();
+    expect(
+      apiMock.mock.calls.some(
+        ([path, method]) => path === "/engagements" && method === "POST",
+      ),
+    ).toBe(false);
+    const editor = screen.getByLabelText(
+      /Engagement context/,
+    ) as HTMLTextAreaElement;
+    expect(editor.value).toContain("Start URL: https://app.example/");
+    expect(editor.value).toContain("- https://api.example/v1/");
+    expect(editor.value).toContain("- https://app.example/billing/");
+    expect(editor.value).toContain(
+      "    Reader: user=fixture; password=not-a-real-secret",
+    );
+    expect(editor.value).toContain("Review account boundaries");
+    expect(
+      screen.queryByRole("group", { name: "Build pentest.md" }),
+    ).not.toBeInTheDocument();
+    const edited = editor.value + "\nOperator note: use synthetic records.\n";
+    fireEvent.change(editor, { target: { value: edited } });
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+    expect(
+      apiMock.mock.calls.find(
+        ([path, method]) => path === "/engagements" && method === "POST",
+      )?.[2],
+    ).toMatchObject({
+      target: "https://app.example",
+      context: edited,
+    });
+  });
+
+  it("preserves existing text on cancel and only replaces it on explicit generation", () => {
+    setup();
+    fillIdentity();
+    const editor = screen.getByLabelText(/Engagement context/);
+    fireEvent.change(editor, { target: { value: "# My manual scope" } });
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    fireEvent.change(screen.getByLabelText("Test credentials"), {
+      target: { value: "Role: reader" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Cancel template fill" }),
+    );
+    expect(editor).toHaveValue("# My manual scope");
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    expect(screen.getByLabelText("Test credentials")).toHaveValue(
+      "Role: reader",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Replace pentest.md" }));
+    expect((editor as HTMLTextAreaElement).value).toContain("    Role: reader");
+  });
+
+  it("shows validation errors without overwriting context or creating an attack", () => {
+    const created = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Generate pentest.md" }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Target / start URL");
+    expect(screen.getByLabelText(/Engagement context/)).toHaveValue("");
+    fillIdentity();
+    fireEvent.change(screen.getByLabelText("Additional in-scope URLs"), {
+      target: { value: "not-a-url" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Generate pentest.md" }),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Additional in-scope URLs, line 1",
+    );
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("keeps saved context, resets blank context, and does not carry generator credentials into another setup", async () => {
+    setup(template);
+    expect(screen.getByLabelText(/Engagement context/)).toHaveValue(
+      template.context,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    fireEvent.change(screen.getByLabelText("Test credentials"), {
+      target: { value: "Do not carry to another setup" },
+    });
+    fireEvent.change(screen.getByLabelText("Start from"), {
+      target: { value: "" },
+    });
+    expect(screen.getByLabelText(/Engagement context/)).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+    expect(screen.getByLabelText("Test credentials")).toHaveValue("");
+    await screen.findByRole("option", { name: "Saved setup" });
+    fireEvent.change(screen.getByLabelText("Start from"), {
+      target: { value: template.id },
+    });
+    expect(screen.getByLabelText(/Engagement context/)).toHaveValue(
+      template.context,
+    );
+    expect(
+      screen.queryByRole("group", { name: "Build pentest.md" }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+it("preserves unfinished generator fields across template management and requires applying them before creation", async () => {
+  const created = setup();
+  fillIdentity();
+  fireEvent.click(screen.getByRole("button", { name: "Fill from template" }));
+  fireEvent.change(screen.getByLabelText("Additional in-scope URLs"), {
+    target: { value: "https://api.example/" },
+  });
+  fireEvent.change(screen.getByLabelText("Test credentials"), {
+    target: { value: "Keep this unsent account" },
+  });
+  expect(
+    screen.getByRole("button", { name: "Only create attack" }),
+  ).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
+  expect(created).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Manage templates" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to assessment" }));
+  expect(screen.getByLabelText("Additional in-scope URLs")).toHaveValue(
+    "https://api.example/",
+  );
+  expect(screen.getByLabelText("Test credentials")).toHaveValue(
+    "Keep this unsent account",
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Generate pentest.md" }));
+  expect(
+    screen.getByRole("button", { name: "Only create attack" }),
+  ).toBeEnabled();
+});
+
+describe("default first goal and creation actions", () => {
+  it("prefills a useful goal, follows the URL, and preserves a manually edited goal", () => {
+    setup();
+    expect(screen.getByLabelText("First goal")).toHaveValue(defaultFirstGoal());
+    fillIdentity();
+    expect(screen.getByLabelText("First goal")).toHaveValue(
+      defaultFirstGoal("https://app.example"),
+    );
+    fireEvent.change(screen.getByLabelText("First goal"), {
+      target: { value: "Focus on account boundaries" },
+    });
+    fireEvent.change(screen.getByLabelText("Target / start URL"), {
+      target: { value: "https://other.example" },
+    });
+    expect(screen.getByLabelText("First goal")).toHaveValue(
+      "Focus on account boundaries",
+    );
+  });
+
+  it("keeps a saved template goal and restores automatic goals for blank assessments", () => {
+    setup(template);
+    expect(screen.getByLabelText("First goal")).toHaveValue(
+      String(template.config.goal),
+    );
+    fireEvent.change(screen.getByLabelText("Target / start URL"), {
+      target: { value: "https://another.example" },
+    });
+    expect(screen.getByLabelText("First goal")).toHaveValue(
+      String(template.config.goal),
+    );
+    fireEvent.change(screen.getByLabelText("Start from"), {
+      target: { value: "" },
+    });
+    expect(screen.getByLabelText("First goal")).toHaveValue(defaultFirstGoal());
+  });
+
+  it("only creates a draft when Only create attack is selected", async () => {
+    const created = setup();
+    fillIdentity();
+    fireEvent.click(screen.getByRole("button", { name: "Only create attack" }));
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+    expect(postedConfig()?.goal).toBe(defaultFirstGoal("https://app.example"));
+    expect(
+      apiMock.mock.calls.some(([path]) => path.endsWith("/sessions")),
+    ).toBe(false);
+  });
+
+  it("uploads context before starting with the saved configuration and clears the sent draft", async () => {
+    const created = setup();
+    const original = apiMock.getMockImplementation()!;
+    apiMock.mockImplementation(
+      async (path: string, method?: string, body?: unknown) => {
+        if (path === "/engagements/new-attack/sessions") {
+          expect(uploadFile).toHaveBeenCalledOnce();
+          return { session_id: "first-session" };
+        }
+        return original(path, method, body);
+      },
+    );
+    vi.mocked(uploadFile).mockResolvedValue({});
+    fillIdentity();
+    fireEvent.change(screen.getByLabelText("Backend"), {
+      target: { value: "claude" },
+    });
+    fireEvent.change(screen.getByLabelText("Model"), {
+      target: { value: "creation-run-model" },
+    });
+    fireEvent.change(screen.getByLabelText("Max turns"), {
+      target: { value: "37" },
+    });
+    fireEvent.change(
+      screen.getByLabelText(/Add context files or drop them here/),
+      {
+        target: {
+          files: [new File(["Synthetic request context"], "request.txt")],
+        },
+      },
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Create attack and run" }),
+    );
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+    const start = apiMock.mock.calls.find(
+      ([path]) => path === "/engagements/new-attack/sessions",
+    );
+    expect(start?.[2]).toEqual({
+      config: postedConfig(),
+      idempotency_key: "creation-run-key",
+    });
+    expect(start?.[2].config).toMatchObject({
+      backend: "claude",
+      model: "creation-run-model",
+      max_turns: 37,
+    });
+    expect(created).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: "first-session", draft: "" }),
+      undefined,
+    );
+  });
+
+  it("opens the saved draft with a startup error rather than creating another attack", async () => {
+    const created = setup();
+    const original = apiMock.getMockImplementation()!;
+    apiMock.mockImplementation(
+      async (path: string, method?: string, body?: unknown) => {
+        if (path === "/engagements/new-attack/sessions")
+          throw new Error("Sandbox unavailable");
+        return original(path, method, body);
+      },
+    );
+    fillIdentity();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Create attack and run" }),
+    );
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+    expect(created).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "new-attack",
+        draft: defaultFirstGoal("https://app.example"),
+      }),
+      "Attack created, but starting the assessment failed: Sandbox unavailable",
+    );
+    expect(
+      apiMock.mock.calls.filter(
+        ([path, method]) => path === "/engagements" && method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("allows an empty goal for a draft and requires a goal for running", () => {
+    setup();
+    fillIdentity();
+    fireEvent.change(screen.getByLabelText("First goal"), {
+      target: { value: "" },
+    });
+    expect(
+      screen.getByRole("button", { name: "Only create attack" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Create attack and run" }),
+    ).toBeDisabled();
+  });
+});
+
+it("updates a saved automatic goal for a new target instead of assessing the old URL", () => {
+  setup({
+    ...template,
+    config: { ...template.config, goal: defaultFirstGoal(template.target) },
+  });
+  fireEvent.change(screen.getByLabelText("Target / start URL"), {
+    target: { value: "https://new-target.example/" },
+  });
+  expect(screen.getByLabelText("First goal")).toHaveValue(
+    defaultFirstGoal("https://new-target.example/"),
+  );
 });

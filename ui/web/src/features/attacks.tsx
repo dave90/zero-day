@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Plus,
@@ -12,15 +12,10 @@ import {
   MoreHorizontal,
   Copy,
   Trash2,
+  FileText,
 } from "lucide-react";
-import { uploadFile, api } from "../api/client";
-import type {
-  Attack,
-  AttackTemplate,
-  Config,
-  Health,
-  Schema,
-} from "../api/types";
+import { uploadFile, api, key } from "../api/client";
+import type { Attack, AttackTemplate, Config, Schema } from "../api/types";
 import {
   Dialog,
   ErrorBox,
@@ -31,45 +26,68 @@ import {
 } from "../components/common";
 import { ModeCards } from "./configuration";
 import { SwarmSizeField } from "../components/SwarmSizeField";
+import { defaultFirstGoal } from "../templates/first-goal";
+import {
+  PentestContextBuilder,
+  type PentestContextDetails,
+} from "../components/PentestContextBuilder";
 import {
   InitialRunSettings,
   approvalError,
 } from "../components/InitialRunSettings";
+function goalForTemplate(template?: AttackTemplate): string {
+  const goal = String(template?.config.goal || "");
+  return goal.trim() ? goal : defaultFirstGoal(template?.target);
+}
+
+function automaticGoalForTemplate(template?: AttackTemplate): boolean {
+  const goal = String(template?.config.goal || "");
+  return !goal.trim() || goal === defaultFirstGoal(template?.target);
+}
+
 export function NewAttack({
   schema,
-  health,
   initialTemplate,
   onClose,
   onCreated,
 }: {
   schema: Schema;
-  health?: Health;
   initialTemplate?: AttackTemplate;
   onClose: () => void;
-  onCreated: (a: Attack) => void;
+  onCreated: (a: Attack, creationError?: string) => void;
 }) {
+  const submitting = useRef(false);
+  const scopeEditor = useRef<HTMLTextAreaElement>(null);
+  const fillButton = useRef<HTMLButtonElement>(null);
   const { data: templates = [], error: templateError } = useQuery({
     queryKey: ["templates"],
     queryFn: () => api<AttackTemplate[]>("/templates"),
   });
-  const emptyScope =
-    health?.template ||
-    "# Engagement context\n\n## Scope\n\n## Credentials\n\n## Goal\n";
   const [selected, setSelected] = useState(initialTemplate?.id || ""),
     [managingTemplates, setManagingTemplates] = useState(false),
+    [buildingContext, setBuildingContext] = useState(false),
+    [contextDetails, setContextDetails] = useState<PentestContextDetails>({
+      additionalUrls: "",
+      excludedUrls: "",
+      credentials: "",
+    }),
     [name, setName] = useState(
       initialTemplate ? `${initialTemplate.name} copy` : "",
     ),
     [target, setTarget] = useState(initialTemplate?.target || ""),
-    [scope, setScope] = useState(initialTemplate?.context || emptyScope),
-    [goal, setGoal] = useState(String(initialTemplate?.config.goal || "")),
+    [scope, setScope] = useState(initialTemplate?.context ?? ""),
+    [goal, setGoal] = useState(goalForTemplate(initialTemplate)),
+    [automaticGoal, setAutomaticGoal] = useState(
+      automaticGoalForTemplate(initialTemplate),
+    ),
     [config, setConfig] = useState<Config>({
       ...schema.defaults,
       ...initialTemplate?.config,
     }),
     [files, setFiles] = useState<File[]>([]),
-    [busy, setBusy] = useState(false),
+    [creatingAction, setCreatingAction] = useState<"save" | "run" | null>(null),
     [error, setError] = useState("");
+  const busy = creatingAction !== null;
   function selectTemplate(tid: string) {
     applyTemplate(templates.find((t) => t.id === tid));
   }
@@ -77,20 +95,38 @@ export function NewAttack({
     setSelected(template?.id || "");
     setName(template ? `${template.name} copy` : "");
     setTarget(template?.target || "");
-    setScope(template?.context || emptyScope);
-    setGoal(String(template?.config.goal || ""));
+    setScope(template?.context ?? "");
+    setBuildingContext(false);
+    setContextDetails({
+      additionalUrls: "",
+      excludedUrls: "",
+      credentials: "",
+    });
+    setGoal(goalForTemplate(template));
+    setAutomaticGoal(automaticGoalForTemplate(template));
     setConfig({ ...schema.defaults, ...template?.config });
     setFiles([]);
   }
   async function create(e: FormEvent) {
     e.preventDefault();
-    if (approvalError(config)) return;
-    setBusy(true);
+    if (submitting.current || buildingContext || approvalError(config)) return;
+    const submitter = (e.nativeEvent as SubmitEvent).submitter;
+    const run =
+      submitter instanceof HTMLButtonElement && submitter.value === "run";
+    if (run && !goal.trim()) {
+      setError("Enter the first assessment goal before running.");
+      return;
+    }
+    submitting.current = true;
+    setCreatingAction(run ? "run" : "save");
     setError("");
+    let attack: Attack | undefined;
+    let creationError: string | undefined;
+    let stage = "saving the attack";
     try {
       const oversized = files.find((f) => f.size > 1_000_000);
       if (oversized) throw new Error(`${oversized.name} exceeds 1 MB`);
-      const attack = await api<Attack>("/engagements", "POST", {
+      attack = await api<Attack>("/engagements", "POST", {
         name,
         target,
         context: scope,
@@ -98,15 +134,30 @@ export function NewAttack({
         draft: goal,
         ...(selected ? { template_id: selected } : {}),
       });
-      for (const f of files) {
-        await uploadFile(attack.id, f);
+      stage = "importing context files";
+      for (const f of files) await uploadFile(attack.id, f);
+      if (run) {
+        stage = "starting the assessment";
+        const result = await api<{ session_id: string }>(
+          `/engagements/${attack.id}/sessions`,
+          "POST",
+          { config: attack.config, idempotency_key: key() },
+        );
+        attack = { ...attack, session_id: result.session_id, draft: "" };
       }
-      onCreated(attack);
     } catch (e) {
-      setError((e as Error).message);
+      if (attack) {
+        // Keep the saved workspace when imports/preflight/startup fail. Opening
+        // it lets the operator fix the problem and retry without duplicate attacks.
+        creationError = `Attack created, but ${stage} failed: ${(e as Error).message}`;
+      } else {
+        setError((e as Error).message);
+      }
     } finally {
-      setBusy(false);
+      submitting.current = false;
+      setCreatingAction(null);
     }
+    if (attack) onCreated(attack, creationError);
   }
   if (managingTemplates)
     return (
@@ -123,7 +174,12 @@ export function NewAttack({
       />
     );
   return (
-    <Dialog title="A new assessment" onClose={onClose}>
+    <Dialog
+      title="A new assessment"
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+    >
       <form onSubmit={create}>
         <div className="dialog-body">
           <p className="intro">
@@ -185,7 +241,10 @@ export function NewAttack({
                 type="url"
                 required
                 value={target}
-                onChange={(e) => setTarget(e.target.value)}
+                onChange={(e) => {
+                  setTarget(e.target.value);
+                  if (automaticGoal) setGoal(defaultFirstGoal(e.target.value));
+                }}
                 placeholder="https://app.example"
               />
             </label>
@@ -194,41 +253,82 @@ export function NewAttack({
             <label htmlFor="new-scope">
               Engagement context <code>pentest.md</code>
             </label>
-            <label className="text-button file-label">
-              <Upload size={14} /> Import file
-              <input
-                type="file"
-                accept=".md,.txt"
-                onChange={async (e) => {
-                  const f = e.target.files?.[0];
-                  if (f) {
-                    if (f.size > 1_000_000) setError("Scope file exceeds 1 MB");
-                    else setScope(await f.text());
-                  }
-                }}
-              />
-            </label>
+            <div className="scope-actions">
+              <button
+                type="button"
+                className="text-button"
+                ref={fillButton}
+                aria-expanded={buildingContext}
+                aria-controls="pentest-template-builder"
+                onClick={() => setBuildingContext(!buildingContext)}
+              >
+                <FileText size={14} /> Fill from template
+              </button>
+              <label className="text-button file-label">
+                <Upload size={14} /> Import file
+                <input
+                  type="file"
+                  accept=".md,.txt"
+                  onChange={async (e) => {
+                    const f = e.target.files?.[0];
+                    if (f) {
+                      if (f.size > 1_000_000)
+                        setError("Scope file exceeds 1 MB");
+                      else {
+                        setScope(await f.text());
+                        setBuildingContext(false);
+                      }
+                    }
+                  }}
+                />
+              </label>
+            </div>
           </div>
+          <PentestContextBuilder
+            key={"context-" + (selected || "blank")}
+            open={buildingContext}
+            target={target}
+            goal={goal}
+            hasContext={!!scope.trim()}
+            details={contextDetails}
+            onChange={setContextDetails}
+            onClose={() => {
+              setBuildingContext(false);
+              fillButton.current?.focus();
+            }}
+            onGenerate={(context) => {
+              setScope(context);
+              setBuildingContext(false);
+              scopeEditor.current?.focus();
+            }}
+          />
           <textarea
+            ref={scopeEditor}
             id="new-scope"
             className="scope-input"
+            placeholder="Write engagement context, import pentest.md, or choose Fill from template."
             value={scope}
             onChange={(e) => setScope(e.target.value)}
             rows={7}
           />
           <p className="field-help">
-            Freeform context passed verbatim to the agent. Credentials stay in
-            the local service. Scope is advisory.
+            Saved locally as pentest.md and passed verbatim to this attack’s
+            agents. You can edit it before creating the attack. Scope is
+            advisory.
           </p>
-          <label className="block-label">
+          <label className="block-label" htmlFor="new-goal">
             First goal
-            <textarea
-              value={goal}
-              onChange={(e) => setGoal(e.target.value)}
-              placeholder="What should Zero investigate?"
-              rows={3}
-            />
           </label>
+          <textarea
+            id="new-goal"
+            value={goal}
+            onChange={(e) => {
+              setGoal(e.target.value);
+              setAutomaticGoal(false);
+            }}
+            placeholder="What should Zero investigate?"
+            rows={3}
+          />
           <span className="block-label">Working style</span>
           <ModeCards config={config} onChange={setConfig} />
           {Number(config.swarm_size) > 1 && (
@@ -269,19 +369,40 @@ export function NewAttack({
           </label>
           <ErrorBox error={error} />
         </div>
-        <div className="dialog-footer">
+        <div className="dialog-footer new-attack-footer">
           <span className="field-help">
-            Creates a local conversation. Start when you’re ready.
+            {buildingContext
+              ? "Generate or cancel template fill to continue."
+              : "Run now with these settings, or save a draft to start later."}
           </span>
           <div className="spacer" />
-          <button type="button" className="button" onClick={onClose}>
+          <button
+            type="button"
+            className="button"
+            disabled={busy}
+            onClick={onClose}
+          >
             Cancel
           </button>
           <button
-            className="button primary"
-            disabled={busy || !!approvalError(config)}
+            type="submit"
+            value="save"
+            className="button"
+            disabled={busy || buildingContext || !!approvalError(config)}
           >
-            {busy ? "Creating…" : "Create attack"}
+            {creatingAction === "save" ? "Creating…" : "Only create attack"}
+          </button>
+          <button
+            type="submit"
+            value="run"
+            className="button primary"
+            disabled={
+              busy || buildingContext || !!approvalError(config) || !goal.trim()
+            }
+          >
+            {creatingAction === "run"
+              ? "Creating and starting…"
+              : "Create attack and run"}
             <ArrowRight size={15} />
           </button>
         </div>

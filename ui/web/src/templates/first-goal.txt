@@ -1,0 +1,1 @@
+Assess {{target_url}} using the scope and credentials in pentest.md. Map the in-scope attack surface, investigate authentication, authorization, input handling, and sensitive-data exposure, and independently validate reproducible vulnerabilities. Report confirmed findings with evidence and reproduction steps, and summarize coverage, blockers, and unresolved questions.

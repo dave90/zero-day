@@ -97,14 +97,14 @@ for (const backend of ["codex", "claude"]) {
     await page.getByLabel("active", { exact: true }).check();
     await page.getByLabel("exploit", { exact: true }).check();
     await expect(
-      page.getByRole("button", { name: "Create attack", exact: true }),
+      page.getByRole("button", { name: "Only create attack", exact: true }),
     ).toBeDisabled();
     await page.getByLabel("I understand", { exact: true }).check();
     await page.screenshot({
       path: `test-results/studio-initial-run-settings-${backend}.png`,
     });
     await page
-      .getByRole("button", { name: "Create attack", exact: true })
+      .getByRole("button", { name: "Only create attack", exact: true })
       .click();
     await expect(
       page.getByRole("heading", { name, exact: true }),
@@ -269,7 +269,7 @@ test("new Swarm attacks save the selected size and start that many peers", async
   for (const invalid of ["", "1", "2.5"]) {
     await size.fill(invalid);
     await dialog
-      .getByRole("button", { name: "Create attack", exact: true })
+      .getByRole("button", { name: "Only create attack", exact: true })
       .click();
     await expect(dialog).toBeVisible();
     await expect(swarm).toHaveAttribute("aria-pressed", "true");
@@ -278,7 +278,7 @@ test("new Swarm attacks save the selected size and start that many peers", async
   await size.fill("3");
   await page.screenshot({ path: "test-results/studio-new-swarm-size.png" });
   await dialog
-    .getByRole("button", { name: "Create attack", exact: true })
+    .getByRole("button", { name: "Only create attack", exact: true })
     .click();
   await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
   const eid = page.url().split("/attacks/")[1].split("/")[0];
@@ -495,7 +495,7 @@ test("templates reuse setup in fresh attacks and survive source deletion", async
   await page.getByLabel("Attack name").fill(copy);
   await page.getByLabel("Target / start URL").fill("https://another.example");
   await page
-    .getByRole("button", { name: "Create attack", exact: true })
+    .getByRole("button", { name: "Only create attack", exact: true })
     .click();
   await expect(page.getByRole("heading", { name: copy })).toBeVisible();
   const copyId = page.url().split("/attacks/")[1].split("/")[0];
@@ -636,7 +636,7 @@ test("templates reuse setup in fresh attacks and survive source deletion", async
     "Preserve my unsent goal",
   );
   await page
-    .getByRole("button", { name: "Create attack", exact: true })
+    .getByRole("button", { name: "Only create attack", exact: true })
     .click();
   await expect(
     page.getByRole("heading", {
@@ -710,7 +710,7 @@ async function createAttack(page: Page, name: string) {
     .getByLabel("First goal")
     .fill("Inspect the synthetic access control fixture");
   await page
-    .getByRole("button", { name: "Create attack", exact: true })
+    .getByRole("button", { name: "Only create attack", exact: true })
     .click();
   await expect(page.getByRole("heading", { name })).toBeVisible();
 }
@@ -1210,4 +1210,420 @@ test("discovers, searches, refreshes, and saves a model for only one Zero conver
   await expect(
     config.getByRole("combobox", { name: "Model", exact: true }),
   ).toHaveValue("fixture-security-model");
+});
+
+test("fills blank pentest.md from the editable template and applies it to the first runtime", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "New attack", exact: true })
+    .first()
+    .click();
+  const context = page.getByLabel("Engagement context pentest.md", {
+    exact: true,
+  });
+  await expect(context).toHaveValue("");
+  const name = "Generated engagement " + Date.now();
+  await page.getByLabel("Attack name", { exact: true }).fill(name);
+  await page
+    .getByLabel("Target / start URL")
+    .fill("https://fixture.example/assessment/");
+  await page
+    .getByLabel("First goal", { exact: true })
+    .fill("Review cross-account access on the synthetic application.");
+  await page
+    .getByRole("button", { name: "Fill from template", exact: true })
+    .click();
+  const builder = page.getByRole("group", { name: "Build pentest.md" });
+  await expect(builder).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Only create attack", exact: true }),
+  ).toBeDisabled();
+  await page.getByLabel("Additional in-scope URLs").fill("not a URL");
+  await builder
+    .getByRole("button", { name: "Generate pentest.md", exact: true })
+    .click();
+  await expect(builder.getByRole("alert")).toContainText(
+    "Additional in-scope URLs, line 1",
+  );
+  await expect(context).toHaveValue("");
+  await page
+    .getByLabel("Additional in-scope URLs")
+    .fill("https://api.fixture.example/v1/\nhttps://api.fixture.example/v1/");
+  await page
+    .getByLabel("Out-of-scope URLs")
+    .fill("https://fixture.example/assessment/billing/");
+  const credentials =
+    "Reader: user=fixture-reader; password=synthetic-only-$&-{{goal}}\nAdmin: use the second synthetic account";
+  await page.getByLabel("Test credentials").fill(credentials);
+  await expect(builder.getByRole("alert")).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Manage templates", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Back to assessment", exact: true })
+    .click();
+  await expect(page.getByLabel("Test credentials")).toHaveValue(credentials);
+  await expect(page.getByLabel("Additional in-scope URLs")).toHaveValue(
+    "https://api.fixture.example/v1/\nhttps://api.fixture.example/v1/",
+  );
+  await page.screenshot({
+    path: "test-results/studio-pentest-template-builder.png",
+  });
+  await builder
+    .getByRole("button", { name: "Generate pentest.md", exact: true })
+    .click();
+  await expect(builder).toHaveCount(0);
+  await expect(context).toBeFocused();
+  const generated = await context.inputValue();
+  expect(generated).toContain("Start URL: https://fixture.example/assessment/");
+  expect(generated).toContain("- https://api.fixture.example/v1/");
+  expect(
+    generated.match(/^- https:\/\/api.fixture.example\/v1\/$/gm),
+  ).toHaveLength(1);
+  expect(generated).toContain("- https://fixture.example/assessment/billing/");
+  expect(generated).toContain("password=synthetic-only-$&-{{goal}}");
+  expect(generated).toContain(
+    "Review cross-account access on the synthetic application.",
+  );
+  expect(generated).toContain("## Evidence and reporting");
+  const edited =
+    generated + "\n## Operator note\nUse only synthetic records.\n";
+  await context.fill(edited);
+  await page
+    .getByRole("button", { name: "Fill from template", exact: true })
+    .click();
+  await expect(page.getByLabel("Test credentials")).toHaveValue(credentials);
+  await expect(
+    builder.getByRole("button", { name: "Replace pentest.md" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel template fill" }).click();
+  await expect(context).toHaveValue(edited);
+  await expect(
+    page.getByRole("button", { name: "Fill from template", exact: true }),
+  ).toBeFocused();
+  await page
+    .getByRole("button", { name: "Only create attack", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  const eid = page.url().split("/attacks/")[1].split("/")[0];
+  const csrf = (await (await page.request.get("/api/v1/health")).json())
+    .csrf_token;
+  const saved = await (
+    await page.request.get(`/api/v1/engagements/${eid}/context`)
+  ).json();
+  expect(saved.content).toBe(edited);
+  const inventory = await (
+    await page.request.get(`/api/v1/engagements/${eid}/artifacts`)
+  ).json();
+  const brief = inventory.find(
+    (file: { path: string }) => file.path === "pentest.md",
+  );
+  const artifact = await (
+    await page.request.get(`/api/v1/engagements/${eid}/artifacts/${brief.id}`)
+  ).json();
+  expect(artifact.content).toBe(edited);
+  const attack = await (
+    await page.request.get(`/api/v1/engagements/${eid}`)
+  ).json();
+  expect(attack.session_id).toBeNull();
+  expect(
+    (
+      await page.request.patch(`/api/v1/engagements/${eid}`, {
+        headers: { "X-Zero-CSRF": csrf },
+        data: {
+          config: { ...attack.config, execution_mode: "a", container: false },
+        },
+      })
+    ).ok(),
+  ).toBe(true);
+  await page.reload();
+  await page
+    .getByRole("button", { name: "Start assessment", exact: true })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Tool approval" }),
+  ).toBeVisible();
+  const running = await (
+    await page.request.get(`/api/v1/engagements/${eid}`)
+  ).json();
+  const session = await (
+    await page.request.get(`/api/v1/sessions/${running.session_id}/snapshot`)
+  ).json();
+  expect(session.context).toBe(edited);
+  await page
+    .getByRole("button", { name: "End runtime session", exact: true })
+    .click();
+  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+test("blank creation and scope-file import remain available alongside template fill", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "New attack", exact: true })
+    .first()
+    .click();
+  const editor = page.getByLabel("Engagement context pentest.md", {
+    exact: true,
+  });
+  await expect(editor).toHaveValue("");
+  await page
+    .getByRole("button", { name: "Fill from template", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Generate pentest.md", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toContainText("Target / start URL");
+  await expect(editor).toHaveValue("");
+  await page.getByRole("button", { name: "Cancel template fill" }).click();
+  const imported =
+    "# Imported operator scope\n\nOnly the synthetic fixture application.\n";
+  await page.getByLabel("Import file").setInputFiles({
+    name: "pentest.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from(imported),
+  });
+  await expect(editor).toHaveValue(imported);
+  await page
+    .getByRole("button", { name: "Fill from template", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Replace pentest.md" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Cancel template fill" }).click();
+  await expect(editor).toHaveValue(imported);
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page
+    .getByRole("button", { name: "New attack", exact: true })
+    .first()
+    .click();
+  await expect(editor).toHaveValue("");
+  const name = "Blank engagement " + Date.now();
+  await page.getByLabel("Attack name", { exact: true }).fill(name);
+  await page.getByLabel("Target / start URL").fill("https://fixture.example/");
+  await page
+    .getByRole("button", { name: "Only create attack", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  const eid = page.url().split("/attacks/")[1].split("/")[0];
+  const saved = await (
+    await page.request.get(`/api/v1/engagements/${eid}/context`)
+  ).json();
+  expect(saved.content).toBe("");
+});
+
+async function creationRunFixture(page: Page, backend = "codex") {
+  const csrf = (await (await page.request.get("/api/v1/health")).json())
+    .csrf_token;
+  const schema = await (await page.request.get("/api/v1/config-schema")).json();
+  const config = {
+    ...schema.defaults,
+    backend,
+    model: `offline-create-run-${backend}`,
+    container: false,
+    execution_mode: "a",
+    swarm_size: 1,
+    goal: null,
+    max_turns: 31,
+    pentester_max_turns: 27,
+    validator_max_turns: 21,
+    max_subagents: 64,
+  };
+  const source = await (
+    await page.request.post("/api/v1/engagements", {
+      headers: { "X-Zero-CSRF": csrf },
+      data: {
+        name: "Create-run offline setup",
+        target: "https://fixture.example/",
+        config,
+      },
+    })
+  ).json();
+  const template = await (
+    await page.request.post("/api/v1/templates", {
+      headers: { "X-Zero-CSRF": csrf },
+      data: { source_id: source.id, name: "Create-run offline setup" },
+    })
+  ).json();
+  return { csrf, config, template };
+}
+
+for (const backend of ["codex", "claude"]) {
+  test(`Create attack and run starts ${backend} with the default goal, saved settings and imported context`, async ({
+    page,
+  }) => {
+    const fixture = await creationRunFixture(page, backend);
+    const sessionRequests: string[] = [];
+    page.on("request", (request) => {
+      if (
+        request.method() === "POST" &&
+        /\/engagements\/[^/]+\/sessions$/.test(request.url())
+      )
+        sessionRequests.push(request.url());
+    });
+    await page.goto("/");
+    await page
+      .getByRole("button", { name: "New attack", exact: true })
+      .first()
+      .click();
+    await page.getByLabel("Start from").selectOption(fixture.template.id);
+    const name = `Create and run ${backend} ` + Date.now();
+    const target = `https://fixture.example/assessment/${backend}/`;
+    await page.getByLabel("Attack name", { exact: true }).fill(name);
+    await page.getByLabel("Target / start URL").fill(target);
+    const goal = await page
+      .getByLabel("First goal", { exact: true })
+      .inputValue();
+    expect(goal).toContain(target);
+    expect(goal).toContain("independently validate");
+    await page
+      .getByRole("button", { name: "Fill from template", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Create attack and run", exact: true }),
+    ).toBeDisabled();
+    await page
+      .getByRole("button", { name: "Generate pentest.md", exact: true })
+      .click();
+    const context = await page
+      .getByLabel("Engagement context pentest.md", { exact: true })
+      .inputValue();
+    expect(context).toContain(goal);
+    await page.locator('.drop-zone input[type="file"]').setInputFiles({
+      name: "request-context.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("Synthetic uploaded request context"),
+    });
+    await page.screenshot({
+      path: `test-results/studio-create-and-run-${backend}.png`,
+    });
+    await page
+      .getByRole("button", { name: "Create attack and run", exact: true })
+      .click();
+    await expect(
+      page.getByRole("heading", { name, exact: true }),
+    ).toBeVisible();
+    await expect(
+      page.getByRole("region", { name: "Tool approval" }),
+    ).toBeVisible();
+    const eid = page.url().split("/attacks/")[1].split("/")[0];
+    const attack = await (
+      await page.request.get(`/api/v1/engagements/${eid}`)
+    ).json();
+    expect(attack.session_id).toBeTruthy();
+    const session = await (
+      await page.request.get(`/api/v1/sessions/${attack.session_id}/snapshot`)
+    ).json();
+    expect(session.config).toMatchObject({ ...fixture.config, goal });
+    expect(session.context).toBe(context);
+    expect(sessionRequests).toHaveLength(1);
+    const artifacts = await (
+      await page.request.get(`/api/v1/engagements/${eid}/artifacts`)
+    ).json();
+    const uploaded = artifacts.find(
+      (file: { path: string }) =>
+        file.path === "zero_files/request-context.txt",
+    );
+    expect(uploaded).toBeTruthy();
+    const content = await (
+      await page.request.get(
+        `/api/v1/engagements/${eid}/artifacts/${uploaded.id}`,
+      )
+    ).json();
+    expect(content.content).toBe("Synthetic uploaded request context");
+    await expect(page.getByLabel("Assessment goal or message")).toHaveValue("");
+    await expect
+      .poll(
+        async () =>
+          (await (await page.request.get(`/api/v1/engagements/${eid}`)).json())
+            .draft,
+      )
+      .toBe("");
+    await page.reload();
+    await expect(
+      page.getByRole("region", { name: "Tool approval" }),
+    ).toBeVisible();
+    await expect(page.getByLabel("Assessment goal or message")).toHaveValue("");
+    expect(sessionRequests).toHaveLength(1);
+    await page
+      .getByRole("button", { name: "End runtime session", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "End session", exact: true })
+      .click();
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await page.request.delete(`/api/v1/templates/${fixture.template.id}`, {
+      headers: { "X-Zero-CSRF": fixture.csrf },
+    });
+  });
+}
+
+test("create-and-run startup failure preserves one attack and allows retry in its conversation", async ({
+  page,
+}) => {
+  const fixture = await creationRunFixture(page);
+  await page.route("**/api/v1/engagements/*/sessions", (route) =>
+    route.fulfill({
+      status: 422,
+      json: { error: "Synthetic sandbox readiness failure" },
+    }),
+  );
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "New attack", exact: true })
+    .first()
+    .click();
+  await page.getByLabel("Start from").selectOption(fixture.template.id);
+  const name = "Recover created attack " + Date.now();
+  await page.getByLabel("Attack name", { exact: true }).fill(name);
+  const goal = await page
+    .getByLabel("First goal", { exact: true })
+    .inputValue();
+  await page
+    .getByRole("button", { name: "Create attack and run", exact: true })
+    .click();
+  await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "Attack created, but starting the assessment failed",
+  );
+  await expect(page.getByRole("alert")).toContainText(
+    "Synthetic sandbox readiness failure",
+  );
+  await expect(page.getByLabel("Assessment goal or message")).toHaveValue(goal);
+  const eid = page.url().split("/attacks/")[1].split("/")[0];
+  const attacks = await (await page.request.get("/api/v1/engagements")).json();
+  expect(
+    attacks.filter((attack: { name: string }) => attack.name === name),
+  ).toHaveLength(1);
+  expect(
+    attacks.find((attack: { id: string }) => attack.id === eid).session_id,
+  ).toBeNull();
+  await page.unroute("**/api/v1/engagements/*/sessions");
+  await page
+    .getByRole("button", { name: "Start assessment", exact: true })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Tool approval" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("alert")
+      .filter({ hasText: "Synthetic sandbox readiness failure" }),
+  ).toHaveCount(0);
+  expect(page.url()).toContain(`/attacks/${eid}/`);
+  await page
+    .getByRole("button", { name: "End runtime session", exact: true })
+    .click();
+  await page.getByRole("button", { name: "End session", exact: true }).click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await page.request.delete(`/api/v1/templates/${fixture.template.id}`, {
+    headers: { "X-Zero-CSRF": fixture.csrf },
+  });
 });

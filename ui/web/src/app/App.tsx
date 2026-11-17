@@ -185,6 +185,10 @@ export default function App() {
     [endOpen, setEndOpen] = useState(false),
     [search, setSearch] = useState(""),
     [error, setError] = useState(""),
+    [creationError, setCreationError] = useState<{
+      id: string;
+      message: string;
+    } | null>(null),
     [closing, setClosing] = useState(false),
     [inspector, setInspector] = useState(
       localStorage.getItem("zero.inspector") !== "closed",
@@ -521,7 +525,16 @@ export default function App() {
             execute again under the approval gate.
           </div>
         )}
-        <ErrorBox error={listError || healthError || error} />
+        <ErrorBox
+          error={
+            listError ||
+            healthError ||
+            error ||
+            (creationError && creationError.id === id
+              ? creationError.message
+              : "")
+          }
+        />
         {!id ? (
           <AllAttacks
             attacks={attacks}
@@ -662,6 +675,9 @@ export default function App() {
                       onConfigure={() => setConfigOpen(true)}
                       onOpenFindings={() => go("findings")}
                       onStarted={(newSid) => {
+                        setCreationError((current) =>
+                          current?.id === id ? null : current,
+                        );
                         client.setQueryData<Attack>(["attack", id], (old) =>
                           old ? { ...old, session_id: newSid } : old,
                         );
@@ -985,13 +1001,16 @@ export default function App() {
       {newOpen && schema && (
         <NewAttack
           schema={schema}
-          health={healthData}
           initialTemplate={initialTemplate}
           onClose={() => {
             setNewOpen(false);
             setInitialTemplate(undefined);
           }}
-          onCreated={(a) => {
+          onCreated={(a, issue) => {
+            drafts.current[a.id] = a.draft;
+            client.setQueryData(["attack", a.id], a);
+            client.invalidateQueries({ queryKey: ["attack", a.id] });
+            setCreationError(issue ? { id: a.id, message: issue } : null);
             setNewOpen(false);
             setInitialTemplate(undefined);
             client.invalidateQueries({ queryKey: ["attacks"] });
