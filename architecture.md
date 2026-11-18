@@ -39,8 +39,8 @@ Each top-level peer retains the hierarchy above while coordinating through a
 transactional work/evidence/message store. Size one follows the legacy mode-c
 path unchanged.
 
-Two simpler execution modes also ship (see §3.2): a single Pentest agent
-(mode `a`) and a fully delegated MCP loop (mode `b`).
+Single-agent execution (mode `a`) runs one Pentest agent with background
+validators (see §3.2).
 
 The optional **Ralph** workflow wraps bounded orchestrated passes with reviewed
 task planning, completion checks, and durable progress (§3.15). Engagement-local
@@ -53,7 +53,7 @@ task planning, completion checks, and durable progress (§3.15). Engagement-loca
 | Containerized **tool execution** (Docker), ON by default | Isolates offensive tooling from the host. Note: only *tool calls* run in the container — the agent loops run on the host (see §2, §4). |
 | Burp Suite as the traffic source (not MCP browser) | Burp handles auth, websockets, TLS interception, and complex SPAs that browser MCPs choke on. |
 | Authenticated CLI backends | `CodexCLIBackend` is the default; `ClaudeCodeBackend` is also supported. Each reuses the selected CLI's authentication. |
-| Pluggable `LLMBackend` interface | Modes `a`/`c` share a turn-based interface for Codex and Claude. Mode `b` uses the Claude MCP adapter specifically. |
+| Pluggable `LLMBackend` interface | Modes `a`/`c` share a turn-based interface for Codex and Claude. |
 | Human-in-the-loop by default | Registry tool execution follows the approval policy, with declared no-approval tools and session approvals (§3.9). |
 | Project context file (`pentest.md`) | Per-engagement scope, credentials, and rules of engagement; separate from repository guidance in `AGENTS.md`. |
 | Hierarchical orchestration (mode `c`) | A senior agent fans out cheap, independent attack ideas in parallel, then chains and validates the results. |
@@ -156,11 +156,11 @@ Orchestrator
  └── ThinkingLog → readable reasoning per agent/turn
 ```
 
-### 3.2 Execution modes (`--execution-mode a | b | c`, default `c`)
+### 3.2 Execution modes (`--execution-mode a | c`, default `c`)
 
-The system supports three runtime shapes behind one switch. (This is distinct
-from the Mode A / Mode B *tool-execution* axis of the LLM backend in §3.5.1 —
-modes `a` and `c` are both built on backend Mode A.)
+The CLI selects single-agent or orchestrated execution. Studio offers four working
+styles: Orchestrated, Swarm, Ralph, and Single agent. Swarm and Ralph build on
+orchestrated execution; both execution modes use the tool loop in §3.5.1.
 
 - **`c` — orchestrated (DEFAULT).** The senior-pentester Orchestrator does recon
   directly and dispatches concurrent pentester/validator subagents via the
@@ -169,16 +169,9 @@ modes `a` and `c` are both built on backend Mode A.)
   the tool catalog directly and submits findings via `finding_submit`, which the
   orchestrator intercepts and routes to a background Validator. There is no
   mode-c pentester dispatch manager.
-- **`b` — delegated / MCP.** Control is handed to the `claude` CLI for the whole
-  session via an in-process MCP bridge (`ClaudeCodeBackendModeB` +
-  `zero/llm/mcp_bridge.py`); the CLI runs its own loop and calls our tools as MCP
-  tools. The registry approval policy applies inside the MCP tool boundary.
-  This path instantiates `ClaudeCodeBackendModeB` regardless of `--backend`;
-  it is not a Codex MCP mode.
 
 Modes `a`/`c` return to an idle input loop after a final response (or `finalize`
-in mode `c`). Mode `b` runs one delegated CLI session and emits `SessionEnd`
-when it finishes, which closes the UI. `--ralph` selects the outer workflow in
+in mode `c`). `--ralph` selects the outer workflow in
 §3.15 instead of these top-level loops. The operator can also exit the UI with
 `/exit` or a double Ctrl+C.
 
@@ -189,7 +182,7 @@ catalog is the **recon tools** (safe + active registry tools, minus
 `finding_submit`) plus **orchestrator-only dispatch, memory inspection, and
 custom-tool management tools** (`zero/tools/dispatch.py`,
 `zero/tools/custom_tools.py`). The dispatch tools are *not* in the default
-registry, so modes `a`/`b` never see them. They are intercepted by the
+registry, so mode `a` never sees them. They are intercepted by the
 orchestrator and never `run()` directly:
 
 | Dispatch tool | Effect |
@@ -224,7 +217,7 @@ A response cycle freezes its expected peers, collects one contribution or explic
 unavailable result from each, and passes an immutable snapshot to a dedicated
 tool-less summarizer. The coordinator writes one atomic report. Candidate dedup is
 global to the swarm and only an independent Validator result can commit a terminal
-verdict. Modes `a`/`b` and Ralph reject swarm sizes above one.
+verdict. Single-agent execution and Ralph reject swarm sizes above one.
 
 The initial response cycle is guarded by an ownership bootstrap. A peer must inspect
 the shared ledger, atomically claim at least one work item, announce its boundary,
@@ -236,7 +229,7 @@ JSON, and `SessionSummary`/report generation occurs again only when findings cha
 
 **SubagentManager** (`zero/orchestrator/subagents.py`) runs each subagent as an
 independent `asyncio` task, capped by a semaphore (`--max-subagents`, default
-10). It tracks live state for the status panel, records every attack attempt for
+100). It tracks live state for the status panel, records every attack attempt for
 the final report, and surfaces completed results through a queue the orchestrator
 drains via `await_subagents`.
 
@@ -377,24 +370,20 @@ class LLMBackend(ABC):
 
 **Implementations today:**
 
-- `CodexCLIBackend` — shells out to `codex exec` in backend Mode A. **Default.**
+- `CodexCLIBackend` — shells out to `codex exec`. **Default.**
   Reuses the user's authenticated Codex CLI and resumes one persistent thread per
   actor so subsequent turns retain server-side context and prompt caching.
 - `ClaudeCodeBackend` — shells out to `claude -p ... --output-format stream-json`
-  (backend Mode A). Reuses the user's Claude subscription; pins the
+  and reuses the user's Claude subscription; pins the
   model by default and disables its native tools (§3.5.1).
-- `ClaudeCodeBackendModeB` — registers an in-process MCP bridge and runs the
-  `claude` CLI in agent mode (backend Mode B; used by execution mode `b`).
 - `EchoBackend`, `ReplayBackend` — test/replay fixtures (not for production).
 
 > 📋 **Roadmap — `ApiBackend`.** The interface can also support a raw API backend
 > for pay-per-token use; that adapter is not implemented yet.
 
-#### 3.5.1 Tool execution: two backend modes
+#### 3.5.1 Envelope-driven tool execution
 
-There are two ways to plug the tool catalog into a coding-agent CLI. Both exist:
-
-**Backend Mode A — envelope-driven reasoning** (used by execution modes `a` and `c`).
+Execution modes `a` and `c` share the same host-driven tool loop.
 The host requests a JSON response per turn and executes the requested registry
 actions. With session resume enabled (the default), each actor has its own
 persistent Codex thread or Claude session, and subsequent calls send only new
@@ -422,7 +411,7 @@ fails.
    - **`--allowedTools ""`** — an empty *whitelist* grants no tools. (An empty
      `--tools ""` does **not** work — it's a greedy variadic and leaves Claude
      Code's defaults enabled; that bug let subagents still see and call `LSP`.)
-   - **`--strict-mcp-config`** — ignore the user's MCP servers (Mode A passes no
+   - **`--strict-mcp-config`** — ignore the user's MCP servers (the adapter passes no
      `--mcp-config`).
    - **`--disable-slash-commands`** — no skills.
    - **`DEFAULT_DISALLOWED_TOOLS`** denylist as a backstop (Bash/Read/…/`LSP`/
@@ -457,11 +446,6 @@ equivalent enforcement boundary (`zero/llm/codex_cli.py`).
 Registry actions are auditable and handled by the host's approval and rate-limit
 paths. Persistent sessions reduce repeated prompt input; they do not add
 harness-managed context compaction or guarantee deterministic replay.
-
-**Backend Mode B — delegated** (used by execution mode `b`). Claude runs its own
-loop; our catalog is exposed via an MCP server and the approval policy applies
-inside each MCP tool implementation. **Pros:** native tool-calling, the CLI handles
-history/streaming. **Cons:** less tight control; harder to replay.
 
 ### 3.6 Tool layer
 
@@ -731,7 +715,7 @@ final or died.
 ### 3.15 Ralph planning and iteration
 
 `--ralph` selects `RalphDriver` (`zero/ralph/driver.py`) instead of the top-level
-`a`/`b`/`c` loop. It composes the existing agent and orchestrator primitives:
+`a`/`c` loop. It composes the existing agent and orchestrator primitives:
 
 1. An **analyzer** and **analyzer_validator** review a task plan (PRD), with
    epic-level grouping enabled by default. The operator plan checkpoint is also
@@ -810,13 +794,13 @@ limits compose:
 | Knob (CLI flag) | Default | What it bounds |
 |---|---|---|
 | `--llm-timeout` | 900 s | Wall-clock for **one** model CLI call in modes `a`/`c` — shared by the orchestrator and pentester/validator backends. |
-| `--pentester-max-turns` | 14 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
+| `--pentester-max-turns` | 50 | Per-pentester turn budget. Pentesters do **not** inherit the orchestrator's `--max-turns`. |
 | `--subagent-deadline` | 1200 s | **Total** wall-clock per subagent, checked between turns (pentesters and validators). |
-| `--validator-max-turns` | 40 | Validator investigation steps (our loop). |
+| `--validator-max-turns` | 50 | Validator investigation steps (our loop). |
 | `--validator-claude-max-turns` | 4 | Claude's internal per-call turn budget; distinct from validator investigation steps and not used by Codex. |
-| `--max-subagents` | 10 | Max concurrent subagents (semaphore). |
+| `--max-subagents` | 100 | Max concurrent subagents (semaphore). |
 | `--max-total-subagents` | 0 (unlimited) | Total dispatches for one subagent manager; a fresh manager is created per Ralph pass. This is not a token or monetary budget. |
-| `--max-turns` | 10 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
+| `--max-turns` | 50 | The **orchestrator's** own turn budget (turn-awareness pacing toward `finalize`). |
 
 The subagent deadline is checked *between* turns; it does not cancel an in-flight
 approval wait or tool call. The model timeout only bounds a model call, and tools
@@ -942,10 +926,6 @@ User goal: *"Find access-control bugs in the orders API."*
    Community users stay on file export?
 2. Token-budget tuning once history summarization lands — the Validator's context
    is much narrower per finding than the Orchestrator's.
-3. **Per-agent backend mode.** Intuition: Validator wants backend Mode A (rigor,
-   per-step auditability), Pentester wants Mode B (exploration, native tool
-   calling). Needs paired evals on a benchmark of intentionally-vulnerable targets
-   before we pick defaults.
-4. The right default for `--subagent-deadline` vs `--llm-timeout` — should a
+3. The right default for `--subagent-deadline` vs `--llm-timeout` — should a
    stuck in-flight call be hard-killed at the deadline (risking cutting off a
    legitimate long exploitation step), or left to finish as it is today?

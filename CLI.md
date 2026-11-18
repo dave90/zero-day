@@ -1,0 +1,242 @@
+# Zero command-line guide
+
+For the browser interface, start with the [Zero Studio quick start](README.md#quick-start).
+This guide covers the independent terminal interface, flags, workspace layout, and advanced runs.
+
+Use Zero only on systems you own or have explicit permission to test.
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.11 or newer
+- [`uv`](https://docs.astral.sh/uv/)
+- An authenticated OpenAI Codex CLI (`codex` on `PATH`), or Claude Code when using
+  `--backend claude`
+- Use `--model <id>` to select a model for this Zero runtime. The default Codex backend uses
+  the model configured in Codex. With Claude, `--backend claude --model ''` follows its account
+  default; otherwise the Claude backend pins the default documented below.
+- Docker for the recommended sandboxed setup (allow roughly 6 GB for the Kali image)
+
+### Install
+
+```bash
+git clone https://github.com/dave90/zero-day.git
+cd zero-day
+uv sync
+docker build -t zero-sandbox:latest -f docker/Dockerfile .
+mkdir -p targets/testaspnet
+cd targets/testaspnet
+uv run zero init
+```
+
+Use one dedicated directory per target; `zero` mounts the current directory into the sandbox.
+`zero init` creates its `.pentest/` workspace, `zero_files/` file jail, and a starter
+`pentest.md` without overwriting an existing scope file.
+
+## Basic usage
+
+The Quick Start leaves you in `targets/testaspnet`. Replace the generated `pentest.md` with:
+
+```markdown
+# TestASP.NET engagement
+
+## Scope
+
+- Start URL: http://testaspnet.vulnweb.com/about.aspx
+- Same-origin pages on testaspnet.vulnweb.com may be tested when needed to discover or validate
+  findings.
+- Out of scope: every other host or subdomain.
+- Do not perform denial-of-service, destructive, or data-changing tests.
+
+## Credentials
+
+- None. Test unauthenticated behavior only.
+
+## Goal
+
+Find and independently validate all reproducible vulnerabilities within scope. Keep request
+volume low and report only evidence-backed results.
+```
+
+Start the default orchestrated run:
+
+```bash
+uv run zero run \
+  --max-turns 25 \
+  --goal "Find and independently validate all reproducible vulnerabilities starting from http://testaspnet.vulnweb.com/about.aspx. Follow pentest.md exactly."
+```
+
+To run several collaborating top-level orchestrators over the same engagement:
+
+```bash
+uv run zero run --execution-mode c --swarm-size 4 \
+  --goal "Find and independently validate all reproducible vulnerabilities"
+```
+
+Peers have separate model sessions, memory, tool state, turn budgets, and focused children. They
+coordinate through `.pentest/swarm/state.sqlite3`, share one sandbox and approval policy, hand off
+content-addressed evidence, and produce one consolidated response and report. `--swarm-size 1`
+keeps the original mode-c runtime. Swarms are intentionally unavailable with single-agent mode (`a`) and
+Ralph.
+
+The first swarm cycle has a mandatory ownership bootstrap. Each peer inspects the shared ledger,
+publishes and atomically claims lane-specific work, announces its boundaries, waits for peer
+coordination, and completes the bootstrap before target tools or child dispatches are enabled.
+Later read-only questions reuse durable findings and coordination state; they return a clean answer
+without repeating the engagement report when no findings changed.
+
+The terminal marks these runs as `swarm N` in the startup banner. Phase banners show bootstrap and
+consolidation boundaries, while the live footer tracks bootstrap/contribution progress, active
+peers, shared work, and message counts. Use `/agents`, `/work`, `/messages`, or `/groups` for detail.
+
+`zero` automatically loads the `pentest.md` in the current target directory. This is a bounded
+assessment, so “all vulnerabilities” is the investigation goal—not a guarantee of exhaustive
+coverage.
+
+`--max-turns 25` gives the orchestrator up to 25 turns for the current goal. Pentester and
+validator subagents use their own turn budgets. At the limit, `zero` waits for running subagents,
+writes `.pentest/report.md`, and returns to the interactive prompt. The session stays open, so you
+can discuss the findings or provide another goal; that next goal starts with a fresh turn budget.
+
+During the run, some tool calls pause for permission. Press `y` to allow once, `n` to deny, or
+`a` to always allow that tool for the rest of the session. To configure automatic approvals when
+starting `zero`, see [Approval controls](#approval-controls).
+
+### Provide files to the agents
+
+Place text files or folders in the engagement's `zero_files/` directory before or during a run:
+
+```bash
+cp /path/to/request.txt zero_files/
+cp -R /path/to/source-snapshot zero_files/
+```
+
+Agents access them with the built-in `list_dir`, `grep`, and `read_file` tools. These tools are
+read-only, use paths relative to `zero_files/`, and cannot access files outside that directory.
+Use `--files-root <path>` to provide a different directory.
+
+### Run output
+
+| Path | Contents |
+| --- | --- |
+| `.pentest/report.md` | Confirmed findings and rejected or failed test paths |
+| `.pentest/findings/` | Individual confirmed, rejected, and pending findings |
+| `.pentest/audit.jsonl` | Full event and tool-call audit trail |
+| `.pentest/thinking.log` | Readable reasoning from the orchestrator and subagents |
+| `.pentest/llm/` | Full model input/output traces, enabled by default |
+| `.pentest/memory/`, `.pentest/todo/` | Durable per-agent context and plans |
+
+## Configuration
+
+Most runs only need `pentest.md`, `--scope-host`, and a goal. No project-specific environment
+variables are required; `zero` uses the selected CLI's existing authentication.
+
+| Option | Default | Use it to |
+| --- | --- | --- |
+| `--backend <name>` | `codex` | Select `codex` or `claude` as the authenticated LLM CLI |
+| `--model <id>` | Codex CLI default; `claude-opus-5[1m]` for Claude | Pin one model for every agent |
+| `--scope-host <host>` | None | Route an in-scope host away from the safe `web_fetch` tool; repeat per host |
+| `--max-turns <n>` | `50` | Bound main-agent turns per goal; per peer in Swarm |
+| `--pentester-max-turns <n>` | `50` | Bound each dispatched pentester's investigation steps |
+| `--validator-max-turns <n>` | `50` | Bound each independent validator's investigation steps |
+| `--swarm-size <n>` | `1` | Run fixed-size collaborating top-level peers in mode `c` |
+| `--max-subagents <n>` | `100` | Limit concurrent pentester and validator children **per swarm peer** |
+| `--max-total-subagents <n>` | `0` (unlimited) | Cap total children **per swarm peer** (`N × cap` maximum for a swarm of size `N`) |
+| `--rate-limit <spec>` | `100/min` | Limit requests per host, for example `5/sec` |
+| `--files-root <path>` | `./zero_files` | Expose local files to the jailed read-only file tools |
+| `--no-container` | Container enabled | Explicitly run tools on the host |
+| `--no-llm-log` | Logging enabled | Disable full per-agent model I/O traces |
+
+See every option with:
+
+```bash
+uv run zero run --help
+```
+
+### Approval controls
+
+- With no approval flags, tool actions prompt in the terminal.
+- `--yolo` auto-approves safe and active actions only.
+- Exploit actions require both `--auto-approve exploit` and `--i-understand`.
+- Destructive actions always prompt.
+- Host-executing tools cannot be auto-approved unless `--allow-host-exec` is also set.
+
+## How it works
+
+`pentest.md + goal → orchestrator → parallel pentesters → independent validators → report`
+
+Candidate findings remain pending until a validator reinvestigates them from scratch. Confirmed
+findings are deduplicated and scored with CVSS 4.0 before the final report is written.
+
+## Useful commands
+
+| Command | Description |
+| --- | --- |
+| `uv run zero init` | Scaffold an engagement workspace without overwriting `pentest.md` |
+| `uv run zero run --goal "..."` | Start an interactive engagement |
+| `uv run zero replay .pentest/audit.jsonl` | Replay recorded assistant messages from a run |
+| `uv run zero reset` | Delete `.pentest/` after confirmation |
+| `uv run zero --help` | List top-level CLI commands |
+
+During a run:
+
+| Input | Description |
+| --- | --- |
+| `/running` | Show active pentester and validator agents |
+| `/agents`, `/work` | Inspect swarm peers and the shared work ledger |
+| `/messages`, `/groups`, `/history` | Inspect durable swarm coordination state |
+| `/respond-now` | Freeze current contributions and finish the active swarm response |
+| `/findings` | List confirmed findings |
+| `/show-rejected` | List rejected findings |
+| `/scope` | Display the loaded `pentest.md` |
+| `/help` | List all shell commands |
+| `Ctrl+C` | Cancel the current turn; press twice within two seconds to exit |
+
+## Advanced usage
+
+Use Claude Code instead of Codex:
+
+```bash
+uv run zero run --backend claude \
+  --scope-host host.docker.internal \
+  --goal "Assess http://host.docker.internal:3000"
+```
+
+Use Ralph mode for a reviewed task plan followed by bounded orchestrated passes:
+
+```bash
+uv run zero run \
+  --ralph \
+  --ralph-iterations 5 \
+  --yolo \
+  --max-total-subagents 20 \
+  --scope-host host.docker.internal \
+  --goal "Assess http://host.docker.internal:3000"
+```
+
+Resume it with `--ralph --ralph-resume`. `--yolo` still does not approve exploit or destructive
+actions.
+
+For external capability evaluation, see the
+[BountyBench integration](benchmarks/bountybench/README.md).
+
+## Important notes
+
+- `pentest.md` is passed to the agents as context; it is not a network firewall.
+  `--scope-host` only blocks that hostname in the safe `web_fetch` tool. Other security tools are
+  not restricted to hosts listed in `pentest.md`.
+- If the Docker sandbox cannot start, `zero` prints a warning and falls back to host execution.
+  Host code and binary calls then require approval unless `--allow-host-exec` is enabled.
+- The sandbox mounts the engagement directory read/write at `/work`. Run `zero` from a dedicated
+  engagement directory when the current directory contains unrelated sensitive files.
+- `.pentest/audit.jsonl`, `thinking.log`, and `.pentest/llm/` can contain credentials, payloads,
+  and full prompts. Protect or delete them according to the engagement's data-handling rules.
+- Live runs consume the selected backend's subscription or API allowance. Set
+  `--max-total-subagents` when you need a hard subagent cost cap.
+
+## Further reading
+
+- [Zero Studio and UI development](ui/README.md)
+- [Architecture](architecture.md)
+- [Development and tests](README.md#development)

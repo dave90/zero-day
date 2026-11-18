@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "availability_verified_at": null,
+  "source": "Run matrix.py --discover for local hints; --preflight verifies CLI/account acceptance explicitly.",
+  "account_default": {"declared_support": true, "verified_at": null},
+  "models": [],
+  "exclusions": [],
+  "release_inventory_complete": false,
+  "status": "Live inventory and capability verification have not been run. No model is represented as verified."
+}

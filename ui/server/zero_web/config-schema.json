@@ -1,0 +1,358 @@
+[
+  {
+    "key": "goal",
+    "flag": "--goal",
+    "label": "Goal",
+    "type": "text",
+    "default": null,
+    "choices": [],
+    "help": "One-shot goal seeded as the first user message."
+  },
+  {
+    "key": "backend",
+    "flag": "--backend",
+    "label": "Backend",
+    "type": "select",
+    "default": "codex",
+    "choices": [
+      "claude",
+      "codex"
+    ],
+    "help": "LLM backend. Shells out to the authenticated Claude Code CLI ('claude') or the OpenAI Codex CLI ('codex'). With 'codex', pass a Codex --model or omit it."
+  },
+  {
+    "key": "execution_mode",
+    "flag": "--execution-mode",
+    "label": "Execution mode",
+    "type": "select",
+    "default": "c",
+    "choices": [
+      "a",
+      "c"
+    ],
+    "help": "Execution mode: c=orchestrated (DEFAULT) — a senior-pentester orchestrator dispatches concurrent pentester/validator subagents; a=single agent. Tool calls prompt for approval unless you pass --auto-approve/--yolo (use --yolo for unattended runs)."
+  },
+  {
+    "key": "swarm_size",
+    "flag": "--swarm-size",
+    "label": "Swarm size",
+    "type": "number",
+    "default": 1,
+    "choices": [],
+    "help": "Top-level collaborating orchestrators (mode c only). Size 1 preserves legacy mode c."
+  },
+  {
+    "key": "auto_approve",
+    "flag": "--auto-approve",
+    "label": "Auto approve",
+    "type": "multi-select",
+    "default": [],
+    "choices": [
+      "safe",
+      "active",
+      "exploit"
+    ],
+    "help": "Auto-approve tools at this risk class. Repeatable."
+  },
+  {
+    "key": "yolo",
+    "flag": "--yolo",
+    "label": "Yolo",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Auto-approve safe + active tool calls. Does NOT cover exploit (use --auto-approve exploit --i-understand) or destructive (always prompts)."
+  },
+  {
+    "key": "i_understand",
+    "flag": "--i-understand",
+    "label": "I understand",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Required together with auto-approve=exploit."
+  },
+  {
+    "key": "allow_host_exec",
+    "flag": "--allow-host-exec",
+    "label": "Allow host exec",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Allow code/binary tools (python_exec, sqlmap, nmap, …) to be AUTO-APPROVED while running on the host. Off by default: without it, host-executing tools always prompt unless sandboxed with --container."
+  },
+  {
+    "key": "scope_host",
+    "flag": "--scope-host",
+    "label": "Scope host",
+    "type": "list",
+    "default": [],
+    "choices": [],
+    "help": "In-scope host for web_fetch (repeatable)."
+  },
+  {
+    "key": "max_turns",
+    "flag": "--max-turns",
+    "label": "Max turns",
+    "type": "number",
+    "default": 50,
+    "choices": [],
+    "help": "Orchestrator turn budget. It is told its turns-remaining and stops opening new attack ideas as the budget runs out."
+  },
+  {
+    "key": "validator_max_turns",
+    "flag": "--validator-max-turns",
+    "label": "Validator max turns",
+    "type": "number",
+    "default": 50,
+    "choices": [],
+    "help": "Validator investigation steps (its own turn budget, separate from --max-turns)."
+  },
+  {
+    "key": "validator_claude_max_turns",
+    "flag": "--validator-claude-max-turns",
+    "label": "Validator claude max turns",
+    "type": "number",
+    "default": 1,
+    "choices": [],
+    "help": "claude's INTERNAL per-call --max-turns for the Validator (NOT its investigation budget — that's --validator-max-turns). Keep 1: we drive the loop, and a higher value lets the model drift into a native tool call."
+  },
+  {
+    "key": "llm_timeout",
+    "flag": "--llm-timeout",
+    "label": "Llm timeout",
+    "type": "number",
+    "default": 900,
+    "choices": [],
+    "help": "Per-call LLM backend wall-clock timeout (seconds), shared by the orchestrator AND the pentester/validator subagents (one value for all). Raise it for heavy iterative exploitation / large-context turns."
+  },
+  {
+    "key": "pentester_max_turns",
+    "flag": "--pentester-max-turns",
+    "label": "Pentester max turns",
+    "type": "number",
+    "default": 50,
+    "choices": [],
+    "help": "Per-subagent turn budget for pentesters, independent of --max-turns."
+  },
+  {
+    "key": "subagent_deadline",
+    "flag": "--subagent-deadline",
+    "label": "Subagent deadline",
+    "type": "number",
+    "default": 1200,
+    "choices": [],
+    "help": "Hard wall-clock ceiling (seconds) for ONE subagent's whole run, checked between turns. --llm-timeout only bounds a single backend call."
+  },
+  {
+    "key": "max_subagents",
+    "flag": "--max-subagents",
+    "label": "Max subagents",
+    "type": "number",
+    "default": 100,
+    "choices": [],
+    "help": "Max CONCURRENT subagents in orchestrated mode (c) — how many run at once."
+  },
+  {
+    "key": "max_total_subagents",
+    "flag": "--max-total-subagents",
+    "label": "Max total subagents",
+    "type": "number",
+    "default": 0,
+    "choices": [],
+    "help": "Hard cap on the TOTAL subagents (pentesters + validators) dispatched over the whole run (orchestrated mode c). 0 = unlimited. Cost-control knob."
+  },
+  {
+    "key": "container",
+    "flag": "--container/--no-container",
+    "label": "Container",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Run tool calls inside the Docker sandbox (image: zero-sandbox). ON by default (secure). Falls back to host execution if Docker is unavailable; --no-container forces host execution."
+  },
+  {
+    "key": "container_image",
+    "flag": "--container-image",
+    "label": "Container image",
+    "type": "text",
+    "default": "zero-sandbox:latest",
+    "choices": [],
+    "help": "Sandbox image tag."
+  },
+  {
+    "key": "host_network",
+    "flag": "--host-network",
+    "label": "Host network",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Run the sandbox on the host network (needed for Burp on 127.0.0.1)."
+  },
+  {
+    "key": "session_resume",
+    "flag": "--session-resume/--no-session-resume",
+    "label": "Session resume",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Keep one persistent `claude` session per actor and send only each new turn via --resume (claude holds + caches the history) instead of re-shipping the whole transcript every call. Big token saver; claude-backend only."
+  },
+  {
+    "key": "burp_dir",
+    "flag": "--burp-dir",
+    "label": "Burp dir",
+    "type": "text",
+    "default": null,
+    "choices": [],
+    "help": "Host directory mounted ro at /work/burp inside the sandbox."
+  },
+  {
+    "key": "files_root",
+    "flag": "--files-root",
+    "label": "Files root",
+    "type": "text",
+    "default": "zero_files",
+    "choices": [],
+    "help": "Root folder the read-only fs tools (list_dir/grep/read_file) are jailed to; resolved against cwd, created if missing, mounted at /zero_files in the sandbox."
+  },
+  {
+    "key": "container_cpus",
+    "flag": "--container-cpus",
+    "label": "Container cpus",
+    "type": "number",
+    "default": 4,
+    "choices": [],
+    "help": "CPU cap for the sandbox."
+  },
+  {
+    "key": "container_memory",
+    "flag": "--container-memory",
+    "label": "Container memory",
+    "type": "text",
+    "default": "4g",
+    "choices": [],
+    "help": "Memory cap for the sandbox."
+  },
+  {
+    "key": "remote_all_tools",
+    "flag": "--remote-all-tools/--no-remote-all-tools",
+    "label": "Remote all tools",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Proxy EVERY tool through the sandbox (not just python_exec). ON by default so binary tools (sqlmap, nmap, …) are sandboxed too."
+  },
+  {
+    "key": "rate_limit",
+    "flag": "--rate-limit",
+    "label": "Rate limit",
+    "type": "text",
+    "default": "100/min",
+    "choices": [],
+    "help": "Per-host rate cap, '<int>/sec' or '<int>/min'. Set to '0/sec' to disable."
+  },
+  {
+    "key": "thought_display",
+    "flag": "--thought-display",
+    "label": "Thought display",
+    "type": "select",
+    "default": "condensed",
+    "choices": [
+      "condensed",
+      "full",
+      "off"
+    ],
+    "help": "How much of the agent's reasoning shows in the chat: condensed (one line), full, or off. The complete thought is always kept in thinking.log."
+  },
+  {
+    "key": "model",
+    "flag": "--model",
+    "label": "Model",
+    "type": "text",
+    "default": "claude-opus-5[1m]",
+    "choices": [],
+    "help": "Model for every LLM call (orchestrator + subagents + validators). For Claude, use an alias ('opus', 'sonnet') or full id; 'claude-opus-5[1m]' is Opus 5 with the 1M-context window. Codex ignores this Claude default and uses its configured default model unless you pass a Codex model id. Pass '' to use the selected backend's account default."
+  },
+  {
+    "key": "context_window",
+    "flag": "--context-window",
+    "label": "Context window",
+    "type": "number",
+    "default": null,
+    "choices": [],
+    "help": "Context-window size for the UI's per-agent 'ctx used/window (%)' display. Default: resolved per backend at startup — Codex reads its real model window (~272k) at runtime; Claude infers 1M for a '[1m]' model, else 200k."
+  },
+  {
+    "key": "llm_log",
+    "flag": "--llm-log/--no-llm-log",
+    "label": "Llm log",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Trace the FULL model I/O (argv + system prompt + stdin in, stdout/stderr out) to one file per agent under ./.pentest/llm/<actor>.log. ON by default; pass --no-llm-log to disable. ($ZERO_LLM_LOG_DIR overrides the location.)"
+  },
+  {
+    "key": "ralph",
+    "flag": "--ralph",
+    "label": "Ralph",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Ralph mode: an analyzer/analyzer_validator build a PRD of pentest tasks, then zero loops bounded orchestrated passes over it (each works the top-priority task, records progress, snapshots+resets .pentest/). Wraps mode c. Run with --yolo (and --auto-approve exploit --i-understand for unattended exploitation)."
+  },
+  {
+    "key": "ralph_iterations",
+    "flag": "--ralph-iterations",
+    "label": "Ralph iterations",
+    "type": "number",
+    "default": 5,
+    "choices": [],
+    "help": "Ralph: number of loop iterations (stops early when all PRD tasks complete). With --ralph-resume these are ADDITIONAL iterations on top of the prior run."
+  },
+  {
+    "key": "ralph_resume",
+    "flag": "--ralph-resume",
+    "label": "Ralph resume",
+    "type": "boolean",
+    "default": false,
+    "choices": [],
+    "help": "Ralph: resume the prior run from ./.ralph/ — load the existing prd.json (keeping completed/pending task state) instead of re-planning, skip the PRD discussion + approval, and continue iteration numbering from the last backup. Confirmed findings and progress.txt already persist."
+  },
+  {
+    "key": "ralph_approve_prd",
+    "flag": "--ralph-approve-prd/--no-ralph-approve-prd",
+    "label": "Ralph approve prd",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Ralph: pause for operator approval of the PRD after the analyzer↔validator discussion, before the loop. The loop iterations always run unattended."
+  },
+  {
+    "key": "ralph_discussion_rounds",
+    "flag": "--ralph-discussion-rounds",
+    "label": "Ralph discussion rounds",
+    "type": "number",
+    "default": 4,
+    "choices": [],
+    "help": "Ralph: max analyzer↔analyzer_validator review rounds before the PRD is accepted as-is (reused for both the epic and task phases)."
+  },
+  {
+    "key": "ralph_epics",
+    "flag": "--ralph-epics/--no-ralph-epics",
+    "label": "Ralph epics",
+    "type": "boolean",
+    "default": true,
+    "choices": [],
+    "help": "Ralph: two-phase planning — first agree a set of EPICS that partition the attack surface, then decompose each into atomic tasks (every epic gets >=1 task, checked by the validator). --no-ralph-epics uses single-phase task planning."
+  },
+  {
+    "key": "analyzer_validator_max_turns",
+    "flag": "--analyzer-validator-max-turns",
+    "label": "Analyzer validator max turns",
+    "type": "number",
+    "default": 6,
+    "choices": [],
+    "help": "Ralph: turn budget for the analyzer_validator (PRD review + completion check)."
+  }
+]

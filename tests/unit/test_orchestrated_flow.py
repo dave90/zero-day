@@ -956,10 +956,11 @@ def test_default_execution_mode_is_orchestrated():
     cfg = OrchestratorConfig(cwd=Path("."))
     assert cfg.backend == "codex"
     assert cfg.execution_mode == "c"
-    assert cfg.max_concurrent_subagents == 10
-    assert cfg.max_turns == 10  # orchestrator turn budget (turn awareness)
+    assert cfg.max_concurrent_subagents == 100
+    assert cfg.max_turns == 50  # orchestrator turn budget (turn awareness)
     assert cfg.llm_timeout_seconds == 900  # shared per-call timeout (orchestrator + subagents)
-    assert cfg.pentester_max_turns == 14   # pentesters don't inherit the big max_turns
+    assert cfg.pentester_max_turns == 50   # independent per-pentester turn budget
+    assert cfg.validator_max_turns == 50   # independent per-validator turn budget
     assert cfg.subagent_deadline_seconds == 1200  # total wall-clock cap per subagent
     assert cfg.thought_display == "condensed"  # one-line thought in chat by default
 

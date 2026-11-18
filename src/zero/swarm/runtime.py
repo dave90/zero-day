@@ -18,6 +18,7 @@ from zero.ui.events import (
     SessionSummary,
     Status,
     SwarmPhase,
+    RuntimeState,
 )
 
 if TYPE_CHECKING:
@@ -90,10 +91,12 @@ class SwarmRuntime:
         while not self._stopping:
             if not goal:
                 goal = await self.services.user_queue.get()
+                self.services.adopt_user_run(goal)
             await self.run_cycle(goal)
             goal = None
 
     async def run_cycle(self, goal: str) -> str:
+        await self.services._emit(RuntimeState(lifecycle="active", activity="thinking"))
         initial_cycle = self._cycle_count == 0
         findings_before = self._findings_fingerprint()
         cycle_id = self.store.start_cycle(goal, [i.worker_id for i in self.identities])
@@ -181,6 +184,7 @@ class SwarmRuntime:
         await self.services._emit(AgentTextDelta(text=f"\n{summary}\n"))
         await self.services._emit(AgentTextEnd())
         self._phase = "ready"
+        await self.services._emit(RuntimeState(lifecycle="idle", activity="idle"))
         await self.services._emit(Status(turn=0, mode="swarm"))
         self._cycle_count += 1
         return summary

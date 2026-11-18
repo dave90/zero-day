@@ -1,7 +1,7 @@
 """SubagentManager — concurrent pentester/validator subagents (M8).
 
 The Orchestrator dispatches focused subagents; this manager runs them as
-independent asyncio tasks, capped by a semaphore (default 10), tracks live
+independent asyncio tasks, capped by a semaphore (default 100), tracks live
 state for the status panel, records every attack attempt for the final
 report, and surfaces completed results through a queue that the orchestrator
 drains via `await_subagents`.

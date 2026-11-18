@@ -48,13 +48,13 @@ def main() -> None:
 )
 @click.option(
     "--execution-mode",
-    type=click.Choice(["a", "b", "c"]),
+    type=click.Choice(["a", "c"]),
     default="c",
     show_default=True,
     help=(
         "Execution mode: c=orchestrated (DEFAULT) — a senior-pentester orchestrator"
-        " dispatches concurrent pentester/validator subagents; a=single agent;"
-        " b=MCP delegated. Tool calls prompt for approval unless you pass"
+        " dispatches concurrent pentester/validator subagents; a=single agent."
+        " Tool calls prompt for approval unless you pass"
         " --auto-approve/--yolo (use --yolo for unattended runs)."
     ),
 )
@@ -91,7 +91,7 @@ def main() -> None:
 @click.option(
     "--max-turns",
     type=int,
-    default=10,
+    default=50,
     show_default=True,
     help="Orchestrator turn budget. It is told its turns-remaining and stops"
     " opening new attack ideas as the budget runs out.",
@@ -99,7 +99,7 @@ def main() -> None:
 @click.option(
     "--validator-max-turns",
     type=int,
-    default=40,
+    default=50,
     show_default=True,
     help="Validator investigation steps (its own turn budget, separate from --max-turns).",
 )
@@ -124,10 +124,9 @@ def main() -> None:
 @click.option(
     "--pentester-max-turns",
     type=int,
-    default=14,
+    default=50,
     show_default=True,
-    help="Per-subagent turn budget for pentesters (no longer inherits --max-turns,"
-    " so one attack idea can't run 40+ turns).",
+    help="Per-subagent turn budget for pentesters, independent of --max-turns.",
 )
 @click.option(
     "--subagent-deadline",
@@ -140,7 +139,7 @@ def main() -> None:
 @click.option(
     "--max-subagents",
     type=int,
-    default=10,
+    default=100,
     show_default=True,
     help="Max CONCURRENT subagents in orchestrated mode (c) — how many run at once.",
 )

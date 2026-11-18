@@ -1,0 +1,13 @@
+.local/
+server/.venv/
+__pycache__/
+.pytest_cache/
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+web/test-results/
+web/playwright-report/
+
+# Local implementation review records and generated screenshots.
+tests/manual/2026-11-14.md
+tests/manual/evidence/

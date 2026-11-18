@@ -66,8 +66,7 @@ append a `TargetSpec` (verify the image is pullable first).
 - **Execution modes** (`--execution-mode`, default **`c`**):
   - `c` orchestrated — a senior-pentester **Orchestrator** recons directly and
     dispatches concurrent **pentester** + **validator** subagents.
-  - `a` single Pentest agent with background validators; `b` MCP-delegated
-    (Claude Code runs its own loop, regardless of `--backend`).
+  - `a` single Pentest agent with background validators.
 - **Backends:** `--backend codex` is the default; `--backend claude` is also
   supported for modes `a`/`c`. Both support persistent per-actor CLI sessions.
 - **Agent loop** (`agents/base.py`): one step per turn. The LLM returns a flat,
@@ -77,9 +76,10 @@ append a `TargetSpec` (verify the image is pullable first).
 - **Subagents** (`orchestrator/subagents.py`, `tools/dispatch.py`): dispatched via
   `dispatch_pentester` / `dispatch_validator` / `await_subagents` / `finalize`
   (orchestrator-only tools, never in `default_registry`). Bounded by
-  `--pentester-max-turns` (14), `--subagent-deadline` (1200s, checked between turns),
+  `--pentester-max-turns` (50), `--validator-max-turns` (50),
+  `--subagent-deadline` (1200s, checked between turns),
   `--llm-timeout` (900s per model CLI call — shared with the orchestrator's own
-  backend), `--max-subagents` (10 concurrent), and `--max-total-subagents`
+  backend), `--max-subagents` (100 concurrent), and `--max-total-subagents`
   (0 = unlimited total for a subagent manager).
 - **Validation handoff** (`orchestrator/router.py`): only a Validator subagent
   confirms/rejects a finding; the orchestrator can't self-confirm.
@@ -102,11 +102,11 @@ append a `TargetSpec` (verify the image is pullable first).
 | Path | What |
 |---|---|
 | `src/zero/cli.py` | Click CLI: `run` / `init` / `reset` / `replay` and all flags. |
-| `src/zero/orchestrator/orchestrator.py` | The core loop (all 3 modes), subagent runners, validation, UI event emit. Big file — start here. |
+| `src/zero/orchestrator/orchestrator.py` | The runtime loops, subagent runners, validation, UI event emit. Big file — start here. |
 | `src/zero/orchestrator/subagents.py` | `SubagentManager` (concurrency, await, results). `SUMMARY_MAX_CHARS`. |
 | `src/zero/orchestrator/{approval,ask_user_governor,rate_limit,router,context,audit,thinking}.py` | Gate, ask-user policy, per-host rate limit, validator handoff, `pentest.md` loader, logs. |
 | `src/zero/agents/` | `base.py` (AgentLoop), pentest/validator/orchestrator and Ralph analyzer/reviewer builders + `prompts/*.md`. |
-| `src/zero/llm/` | `CodexCLIBackend` (default), `ClaudeCodeBackend` (both Mode A), `ClaudeCodeBackendModeB` (MCP), `echo`/`replay` fixtures, `mcp_*`. |
+| `src/zero/llm/` | `CodexCLIBackend` (default), `ClaudeCodeBackend`, and `echo`/`replay` fixtures. |
 | `src/zero/ralph/` | Outer planning/iteration driver, PRD task model, progress journal, evidence dossiers, snapshots/resume. |
 | `src/zero/tools/` | One file per tool + `registry.py` (`default_registry`), `base.py` (`Tool`, `RiskLevel`), `remote.py` (RPC proxy), `dispatch.py`. |
 | `src/zero/container/` | `manager.py` (docker run/stop), `rpc.py` (host RPC client). Server is baked into the image (`docker/`). |
@@ -185,8 +185,7 @@ append a `TargetSpec` (verify the image is pullable first).
 - **Scope is advisory, not a hard gate.** There is no `violates_scope → BLOCK`;
   `--scope-host` only blocklists hosts for `web_fetch`. (Roadmap in architecture.md §9.)
 - **Production backends are `codex` (default) and `claude`.** `echo`/`replay`
-  are internal fixtures, not choices for `zero run --backend`. Mode `b` uses the
-  Claude MCP adapter regardless of that setting.
+  are internal fixtures, not choices for `zero run --backend`.
 - **Container is ON by default** and falls back to host execution if startup
   fails. Host-exec approval policy then applies. `--no-container` forces host.
 - **The UI is inline** (no alternate screen, no overlays); approvals/asks render in

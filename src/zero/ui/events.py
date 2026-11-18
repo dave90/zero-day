@@ -38,6 +38,8 @@ class TodoUpdate:
     items: list[dict] = field(default_factory=list)
     label: str = ""
 
+    actor_id: str = ""
+
 
 @dataclass
 class ReasoningSummary:
@@ -77,6 +79,8 @@ class ToolProposal:
     # The UI hides labelled (subagent) tool traffic from the chat.
     label: str = ""
 
+    actor_id: str = ""
+
 
 @dataclass
 class ApprovalPrompt:
@@ -92,6 +96,11 @@ class ApprovalPrompt:
     label: str = ""
     # Short "why" for the call (the agent's thought), shown in the prompt.
     reason: str = ""
+    host_exec: bool = False
+    execution_location: str = "unknown"
+    session_grant_allowed: bool = False
+
+    actor_id: str = ""
 
 
 @dataclass
@@ -107,6 +116,8 @@ class ToolRunning:
     label: str = ""              # subagent attribution (empty for the top-level agent)
     timeout_seconds: int = 0     # the tool's wall-clock cap, if known (for "12s/300s")
 
+    actor_id: str = ""
+
 
 @dataclass
 class ToolObservation:
@@ -120,6 +131,8 @@ class ToolObservation:
     truncated: bool = False
     label: str = ""   # subagent attribution; UI hides labelled traffic from chat
 
+    actor_id: str = ""
+
 
 @dataclass
 class AskUser:
@@ -131,6 +144,9 @@ class AskUser:
     free_form: bool = True
     blocking: bool = True
     ask_id: str = ""
+    agent: str = "pentest"
+
+    actor_id: str = ""
 
 
 @dataclass
@@ -299,8 +315,54 @@ class SessionEnd:
     kind: Literal["session_end"] = "session_end"
 
 
+@dataclass
+class RuntimeFailure:
+    """An unrecoverable runtime task failed; frontends must surface the error."""
+
+    kind: Literal["runtime_error"] = "runtime_error"
+    error: str = ""
+
+
+@dataclass
+class RuntimeState:
+    """Frontend-neutral lifecycle and effective execution configuration."""
+
+    kind: Literal["runtime_state"] = "runtime_state"
+    lifecycle: str = "active"
+    activity: str = "idle"
+    backend: str = ""
+    model: str = ""
+    execution_location: str = ""
+    warning: str = ""
+    model_log_dir: str = ""
+    llm_log_enabled: bool | None = None
+    context_window: int | None = None
+
+
+@dataclass
+class InteractionResolved:
+    """An operator wait ended (including cancellation); stale replies are invalid."""
+
+    kind: Literal["interaction_resolved"] = "interaction_resolved"
+    request_id: str = ""
+
+
+@dataclass
+class PlanCheckpoint:
+    """A reviewed Ralph plan awaits a revision-specific operator decision."""
+
+    kind: Literal["plan_checkpoint"] = "plan_checkpoint"
+    request_id: str = ""
+    revision: str = ""
+    plan: dict[str, Any] = field(default_factory=dict)
+
+
 UIEvent = (
-    AgentTextDelta
+    RuntimeFailure
+    | RuntimeState
+    | InteractionResolved
+    | PlanCheckpoint
+    | AgentTextDelta
     | AgentTextEnd
     | UserText
     | ToolProposal
